@@ -46,6 +46,12 @@ Requirements and boundaries:
 
 ## Installation
 
+Install with Go:
+
+```bash
+go install github.com/Veincc/JSpider/cmd/jspider@latest
+```
+
 Build from source:
 
 ```bash
