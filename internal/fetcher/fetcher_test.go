@@ -1,0 +1,245 @@
+package fetcher
+
+import (
+	"compress/gzip"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/Veincc/JSpider/internal/config"
+	"github.com/Veincc/JSpider/internal/logging"
+)
+
+func newTestFetcher(t *testing.T, ts *httptest.Server) *Fetcher {
+	t.Helper()
+	cfg := &config.Config{
+		Timeout:   5,
+		MaxSizeMB: 1,
+		UserAgent: "Test/1.0",
+		Verbose:   false,
+	}
+	log := logging.New(false, t.TempDir())
+	t.Cleanup(func() { log.Close() })
+	return New(cfg, log)
+}
+
+func TestFetch_CacheHit(t *testing.T) {
+	var count int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&count, 1)
+		w.Write([]byte("hello"))
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+
+	r1 := f.Fetch(ts.URL + "/test")
+	r2 := f.Fetch(ts.URL + "/test")
+
+	if r1.Err != nil {
+		t.Fatalf("Fetch 1 error: %v", r1.Err)
+	}
+	if r2.Err != nil {
+		t.Fatalf("Fetch 2 error: %v", r2.Err)
+	}
+	if atomic.LoadInt32(&count) != 1 {
+		t.Errorf("Expected 1 HTTP request, got %d", count)
+	}
+	if string(r1.Body) != "hello" {
+		t.Errorf("Body: got %q, want %q", r1.Body, "hello")
+	}
+}
+
+func TestFetch_Singleflight(t *testing.T) {
+	var httpCount int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&httpCount, 1)
+		w.Write([]byte("data"))
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+
+	// Launch 10 concurrent fetches for the same URL
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := f.Fetch(ts.URL + "/same")
+			if r == nil {
+				t.Error("Got nil result")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Only 1 HTTP request should have been made (singleflight)
+	if c := atomic.LoadInt32(&httpCount); c != 1 {
+		t.Errorf("Expected 1 HTTP request, got %d", c)
+	}
+}
+
+func TestFetchJS_NoCachePollution(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte("<html>not js</html>"))
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+
+	// FetchJS should set Err for non-JS content
+	r1 := f.FetchJS(ts.URL + "/page")
+	if r1.Err == nil {
+		t.Fatal("Expected error for non-JS content")
+	}
+
+	// Fetch should return the cached result WITHOUT the Err
+	r2 := f.Fetch(ts.URL + "/page")
+	if r2.Err != nil {
+		t.Errorf("Fetch should not have Err (cache pollution): %v", r2.Err)
+	}
+	if string(r2.Body) != "<html>not js</html>" {
+		t.Errorf("Body mismatch: %q", r2.Body)
+	}
+}
+
+func TestFetchJS_CacheNotModified(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte("var x=1;"))
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+
+	r1 := f.FetchJS(ts.URL + "/app.js")
+	if r1.Err != nil {
+		t.Fatalf("FetchJS error: %v", r1.Err)
+	}
+
+	// Modify the result (should not affect cache)
+	r1.Body = []byte("modified")
+	r1.Err = fmt.Errorf("injected error")
+
+	// Fetch again should get original
+	r2 := f.Fetch(ts.URL + "/app.js")
+	if string(r2.Body) != "var x=1;" {
+		t.Errorf("Cache was modified: %q", r2.Body)
+	}
+	if r2.Err != nil {
+		t.Errorf("Cache Err was modified: %v", r2.Err)
+	}
+}
+
+func TestFetch_DecompressionSizeLimit(t *testing.T) {
+	// Create gzip that decompresses to > 1MB
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "application/javascript")
+		// Build gzip in buffer first to ensure all data is flushed
+		var buf strings.Builder
+		gz := gzip.NewWriter(&buf)
+		data := strings.Repeat("x", 2*1024*1024) // 2MB
+		gz.Write([]byte(data))
+		gz.Close()
+		w.Write([]byte(buf.String()))
+	}))
+	defer ts.Close()
+
+	cfg := &config.Config{
+		Timeout:   5,
+		MaxSizeMB: 1, // 1MB limit
+		UserAgent: "Test/1.0",
+		Verbose:   false,
+	}
+	log := logging.New(false, t.TempDir())
+	defer log.Close()
+	f := New(cfg, log)
+
+	r := f.Fetch(ts.URL + "/big.js")
+	if r.Err == nil {
+		t.Fatal("Expected error for oversized decompressed content")
+	}
+	if _, ok := r.Err.(*ErrDecompressTooLarge); !ok {
+		t.Errorf("Expected ErrDecompressTooLarge, got: %v (%T)", r.Err, r.Err)
+	}
+}
+
+func TestFetch_Non200Status(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ok":
+			w.WriteHeader(200)
+			w.Write([]byte("ok"))
+		case "/notfound":
+			w.WriteHeader(404)
+			w.Write([]byte("not found"))
+		case "/nocontent":
+			w.WriteHeader(204)
+		}
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+
+	// Fetch preserves body for non-200
+	r404 := f.Fetch(ts.URL + "/notfound")
+	if r404.StatusCode != 404 {
+		t.Errorf("StatusCode: got %d, want 404", r404.StatusCode)
+	}
+	if r404.Err != nil {
+		t.Errorf("Fetch should not set Err for non-200: %v", r404.Err)
+	}
+
+	// FetchJS sets Err for non-200
+	r404js := f.FetchJS(ts.URL + "/notfound")
+	if r404js.Err == nil {
+		t.Error("FetchJS should set Err for 404")
+	}
+
+	// FetchJS sets Err for 204
+	r204js := f.FetchJS(ts.URL + "/nocontent")
+	if r204js.Err == nil {
+		t.Error("FetchJS should set Err for 204")
+	}
+}
+
+func TestFetch_PlainTextLikeJS(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("function hello() { return 'world'; }"))
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+
+	r := f.FetchJS(ts.URL + "/script")
+	if r.Err != nil {
+		t.Fatalf("FetchJS error: %v", r.Err)
+	}
+	if !r.IsJS {
+		t.Error("Expected IsJS=true for content that looks like JS")
+	}
+}
+
+func TestFetch_PlainTextNotJS(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("Hello, this is just plain text content."))
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+
+	r := f.FetchJS(ts.URL + "/text")
+	if r.Err == nil {
+		t.Error("Expected error for non-JS text/plain content")
+	}
+}

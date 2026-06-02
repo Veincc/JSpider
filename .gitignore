@@ -1,0 +1,35 @@
+# Build artifacts
+/jspider
+/cmd/jspider/jspider
+*.test
+
+# Output directories and scan artifacts
+/output/
+/outputs/
+/result/
+/results/
+/reports/
+/test-output/
+/test-results/
+/tmp/
+/temp/
+
+# Coverage and profiling
+coverage.out
+coverage.html
+*.coverprofile
+*.prof
+
+# Logs
+*.log
+analysis_errors.log
+
+# Editor, OS, and local environment files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+.env
+.env.*
