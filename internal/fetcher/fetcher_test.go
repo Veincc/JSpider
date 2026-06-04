@@ -243,3 +243,44 @@ func TestFetch_PlainTextNotJS(t *testing.T) {
 		t.Error("Expected error for non-JS text/plain content")
 	}
 }
+
+func TestFetch_TLSVerificationDefault(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte("const ok = true;"))
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, nil)
+
+	r := f.Fetch(ts.URL + "/app.js")
+	if r.Err == nil {
+		t.Fatal("Expected TLS verification error for self-signed certificate")
+	}
+}
+
+func TestFetch_InsecureSkipVerifyAllowsSelfSigned(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.Write([]byte("const ok = true;"))
+	}))
+	defer ts.Close()
+
+	cfg := &config.Config{
+		Timeout:            5,
+		MaxSizeMB:          1,
+		UserAgent:          "Test/1.0",
+		InsecureSkipVerify: true,
+	}
+	log := logging.New(false, t.TempDir())
+	defer log.Close()
+	f := New(cfg, log)
+
+	r := f.Fetch(ts.URL + "/app.js")
+	if r.Err != nil {
+		t.Fatalf("Fetch error with InsecureSkipVerify enabled: %v", r.Err)
+	}
+	if string(r.Body) != "const ok = true;" {
+		t.Errorf("Body: got %q", r.Body)
+	}
+}

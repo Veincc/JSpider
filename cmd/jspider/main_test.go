@@ -537,6 +537,14 @@ func TestHeadlessFlagTrue(t *testing.T) {
 	}
 }
 
+func TestBuildHeadlessConfigInsecureSkipVerify(t *testing.T) {
+	cfg := &config.Config{Timeout: 5, InsecureSkipVerify: true}
+	hlCfg := buildHeadlessConfig(cfg, "https://example.com")
+	if !hlCfg.InsecureSkipVerify {
+		t.Error("Headless config should inherit InsecureSkipVerify")
+	}
+}
+
 func TestHybridMergeDedup(t *testing.T) {
 	// Test that static + headless assets are properly deduplicated
 	outDir := t.TempDir()
