@@ -116,3 +116,10 @@ func TestHeadlessCanBeSet(t *testing.T) {
 		t.Error("Config.Headless should be true after setting")
 	}
 }
+
+func TestInsecureSkipVerifyDefaultFalse(t *testing.T) {
+	cfg := &Config{}
+	if cfg.InsecureSkipVerify {
+		t.Errorf("zero-value Config.InsecureSkipVerify = %v, want false", cfg.InsecureSkipVerify)
+	}
+}

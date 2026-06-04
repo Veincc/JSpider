@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"crypto/sha256"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,16 +13,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/andybalholm/brotli"
 	"github.com/Veincc/JSpider/internal/config"
 	"github.com/Veincc/JSpider/internal/logging"
 	"github.com/Veincc/JSpider/internal/urlutil"
+	"github.com/andybalholm/brotli"
 )
 
 // ErrDecompressTooLarge indicates decompressed content exceeded size limit
 type ErrDecompressTooLarge struct {
-	Size    int64
-	Limit   int64
+	Size  int64
+	Limit int64
 }
 
 func (e *ErrDecompressTooLarge) Error() string {
@@ -57,17 +58,24 @@ type Fetcher struct {
 	log     *logging.Logger
 	client  *http.Client
 	mu      sync.Mutex
-	cache   map[string]*Result          // Completed results cache
-	pending map[string]*inflight        // In-flight requests (singleflight)
+	cache   map[string]*Result   // Completed results cache
+	pending map[string]*inflight // In-flight requests (singleflight)
 }
 
 func New(cfg *config.Config, log *logging.Logger) *Fetcher {
+	client := &http.Client{
+		Timeout: time.Duration(cfg.Timeout) * time.Second,
+	}
+	if cfg.InsecureSkipVerify {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		client.Transport = transport
+	}
+
 	return &Fetcher{
 		cfg:     cfg,
 		log:     log,
-		client: &http.Client{
-			Timeout: time.Duration(cfg.Timeout) * time.Second,
-		},
+		client:  client,
 		cache:   make(map[string]*Result),
 		pending: make(map[string]*inflight),
 	}

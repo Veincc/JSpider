@@ -35,12 +35,13 @@ type fetchRes struct {
 
 func buildHeadlessConfig(cfg *config.Config, entryURL string) *headless.Config {
 	return &headless.Config{
-		EntryURL:   entryURL,
-		Timeout:    time.Duration(cfg.Timeout) * time.Second,
-		SameOrigin: cfg.SameOrigin,
-		AllowCDN:   cfg.AllowCDN,
-		MaxClicks:  20,
-		Verbose:    cfg.Verbose,
+		EntryURL:           entryURL,
+		Timeout:            time.Duration(cfg.Timeout) * time.Second,
+		SameOrigin:         cfg.SameOrigin,
+		AllowCDN:           cfg.AllowCDN,
+		MaxClicks:          20,
+		Verbose:            cfg.Verbose,
+		InsecureSkipVerify: cfg.InsecureSkipVerify,
 	}
 }
 

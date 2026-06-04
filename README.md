@@ -7,7 +7,7 @@ The default mode is static analysis. The optional `--headless` flag adds Chrome/
 ## Core Capabilities
 
 - Extracts entry JavaScript from `<script src>`, `modulepreload`, script preloads, prefetches, and selected inline script references.
-- Downloads JavaScript with configurable timeout, worker count, per-file size limit, custom headers, cookies, and User-Agent.
+- Downloads JavaScript with configurable timeout, worker count, per-file size limit, custom headers, cookies, User-Agent, and optional TLS certificate verification bypass.
 - Handles gzip, deflate, and Brotli responses with decompressed-size protection.
 - Identifies JavaScript by URL path, Content-Type, and conservative content sniffing for extensionless resources.
 - Analyzes JavaScript for dynamic `import(...)`, route-to-chunk hints, source maps, and framework-specific patterns.
@@ -129,6 +129,7 @@ jspider -u https://example.com -c cdn.example.com,static.example.net
 | `-H <headers>` | none | Extra headers as `Header1=Value1;Header2=Value2`. |
 | `-b` | `false` | Beautify saved JavaScript with `js-beautify` when installed. |
 | `-v` | `false` | Enable verbose logs. |
+| `--insecure-skip-verify` | `false` | Skip TLS certificate verification for HTTPS requests and headless Chrome. Use only for authorized testing of hosts with self-signed or otherwise invalid certificates. |
 
 ## Output Files
 
@@ -178,6 +179,12 @@ Disable same-origin filtering:
 jspider -u https://example.com --same-origin=false
 ```
 
+Analyze an authorized host with an invalid or self-signed TLS certificate:
+
+```bash
+jspider -u https://example.com --insecure-skip-verify
+```
+
 ## How It Works
 
 1. Parse CLI options and normalize entry URLs.
@@ -194,7 +201,7 @@ jspider -u https://example.com --same-origin=false
 ## Limits And Known Boundaries
 
 - Static analysis cannot see scripts created only after page execution.
-- `--headless` discovery is best-effort and bounded by timeout, browser availability, site behavior, and safe interaction rules.
+- `--headless` discovery is best-effort and bounded by timeout, browser availability, site behavior, certificate validation, and safe interaction rules.
 - JavaScript parsing combines framework heuristics, regex extraction, and AST analysis; minified or obfuscated bundles may still hide relationships.
 - Dynamic import expressions with variables, template expressions, import maps, or bare module specifiers may be recorded without a resolved URL.
 - Same-origin matching is scheme and host exact for the entry origin. Allowed CDN entries match the specified domain and its subdomains.

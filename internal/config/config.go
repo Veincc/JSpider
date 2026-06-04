@@ -9,23 +9,24 @@ import (
 )
 
 type Config struct {
-	URL            string
-	URLList        string
-	OutDir         string
-	Headless       bool // enable headless browser JS discovery
-	MaxJS          int
-	MaxDepth       int
-	MaxSizeMB      int
-	Workers        int
-	Beautify       bool
-	SameOrigin     bool
-	AllowCDN       []string
-	FetchSourcemap bool
-	Timeout        int
-	UserAgent      string
-	Cookies        string
-	Headers        map[string]string
-	Verbose        bool
+	URL                string
+	URLList            string
+	OutDir             string
+	Headless           bool // enable headless browser JS discovery
+	MaxJS              int
+	MaxDepth           int
+	MaxSizeMB          int
+	Workers            int
+	Beautify           bool
+	SameOrigin         bool
+	AllowCDN           []string
+	FetchSourcemap     bool
+	Timeout            int
+	UserAgent          string
+	Cookies            string
+	Headers            map[string]string
+	Verbose            bool
+	InsecureSkipVerify bool
 }
 
 func Parse() *Config {
@@ -61,6 +62,7 @@ func Parse() *Config {
 	flag.StringVar(&headersStr, "H", "", "Extra headers (Header1=Value1;Header2=Value2)")
 	flag.BoolVar(&cfg.Beautify, "b", false, "Beautify JS with js-beautify (must be installed)")
 	flag.BoolVar(&cfg.Verbose, "v", false, "Print verbose logs")
+	flag.BoolVar(&cfg.InsecureSkipVerify, "insecure-skip-verify", false, "Skip TLS certificate verification for HTTPS requests and headless Chrome")
 
 	flag.Parse()
 
