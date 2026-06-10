@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,12 +10,12 @@ import (
 	"time"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
-	"github.com/Veincc/JSpider/internal/beautify"
 	"github.com/Veincc/JSpider/internal/config"
 	"github.com/Veincc/JSpider/internal/fetcher"
 	"github.com/Veincc/JSpider/internal/headless"
 	"github.com/Veincc/JSpider/internal/html"
 	"github.com/Veincc/JSpider/internal/logging"
+	"github.com/Veincc/JSpider/internal/preprocess"
 	"github.com/Veincc/JSpider/internal/store"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
@@ -42,82 +42,125 @@ func buildHeadlessConfig(cfg *config.Config, entryURL string) *headless.Config {
 		MaxClicks:          20,
 		Verbose:            cfg.Verbose,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		Proxy:              cfg.Proxy,
 	}
 }
 
 func main() {
 	cfg := config.Parse()
-
-	if err := os.MkdirAll(cfg.OutDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create output directory: %v\n", err)
+	if err := run(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func run(cfg *config.Config) error {
+	proxy, err := config.NormalizeProxy(cfg.Proxy)
+	if err != nil {
+		return err
+	}
+	cfg.Proxy = proxy
+
+	if err := os.MkdirAll(cfg.OutDir, 0755); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
+	cleanupLegacyOutputs(cfg.OutDir)
 
 	log := logging.New(cfg.Verbose, cfg.OutDir)
 	defer log.Close()
 
-	f := fetcher.New(cfg, log)
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		return fmt.Errorf("configure HTTP client: %w", err)
+	}
 	s := store.New(cfg.OutDir)
 	a := analyzer.NewAnalyzer(log)
 	htmlEx := html.NewExtractor()
 
-	// Check for js-beautify
-	if cfg.Beautify {
-		if !beautify.IsAvailable() {
-			log.Warn("js-beautify not installed, beautify disabled (npm install -g js-beautify)")
-			cfg.Beautify = false
-		} else {
-			log.Info("js-beautify enabled, JS files will be beautified")
-		}
-	}
-
 	// Check browser availability when headless mode is requested
 	if cfg.Headless {
 		if err := headless.CheckBrowserAvailable(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		log.Info("Headless discovery enabled: Chrome/Chromium found")
 	}
 
 	urls := cfg.URLs()
 	if len(urls) == 0 {
-		log.Error("No URLs to analyze")
-		os.Exit(1)
+		return errors.New("no URLs to analyze")
 	}
 
 	log.Info("JSpider started: %d entry URLs, workers %d, output dir %s", len(urls), cfg.Workers, cfg.OutDir)
 
-	// Global deduplication state
-	queued := make(map[string]bool)
-	processed := make(map[string]bool)
+	initializedSites := make(map[string]bool)
+	processors := make(map[string]*preprocess.Processor)
+	defer func() {
+		for _, processor := range processors {
+			_ = processor.Close()
+		}
+	}()
 	totalAnalyzed := 0
 
 	for i, entryURL := range urls {
+		site := urlutil.SanitizeDomain(entryURL)
+		siteDir := filepath.Join(cfg.OutDir, site)
+		if !initializedSites[site] {
+			if err := os.RemoveAll(siteDir); err != nil {
+				return fmt.Errorf("reset site output %s: %w", site, err)
+			}
+			if err := os.MkdirAll(siteDir, 0755); err != nil {
+				return fmt.Errorf("create site output %s: %w", site, err)
+			}
+			initializedSites[site] = true
+		}
+
+		var prep *preprocess.Processor
+		if cfg.AuditPrep {
+			prep = processors[site]
+			if prep == nil {
+				var err error
+				prep, err = preprocess.New(siteDir, func(rawURL string) ([]byte, error) {
+					result := f.Fetch(rawURL)
+					if result.Err != nil {
+						return nil, result.Err
+					}
+					if result.StatusCode != 200 {
+						return nil, fmt.Errorf("HTTP %d", result.StatusCode)
+					}
+					return result.Body, nil
+				})
+				if err != nil {
+					return err
+				}
+				processors[site] = prep
+				log.Info("Audit preparation enabled: output will be written to %s", filepath.Join(siteDir, "audit"))
+			}
+		}
+
+		queued := make(map[string]bool)
+		processed := make(map[string]bool)
 		log.Info("[%d/%d] Analyzing: %s", i+1, len(urls), entryURL)
-		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, entryURL, queued, processed, &totalAnalyzed)
+		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, entryURL, queued, processed, &totalAnalyzed)
 		log.Info("[%d/%d] Done: %s (analyzed %d JS)", i+1, len(urls), entryURL, analyzed)
 	}
 
-	// Source map processing
-	if cfg.FetchSourcemap {
-		fetchSourceMaps(cfg, s, f, a, log)
+	for _, prep := range processors {
+		if err := prep.Save(); err != nil {
+			return fmt.Errorf("save audit manifest: %w", err)
+		}
+		if err := prep.Close(); err != nil {
+			return fmt.Errorf("close audit-prep worker: %w", err)
+		}
 	}
 
-	// Save results
-	log.Info("Saving analysis results...")
-	if err := s.SaveAll(); err != nil {
-		log.Error("Failed to save results: %v", err)
-		os.Exit(1)
-	}
-
-	printSummary(s, totalAnalyzed, cfg.OutDir, log)
+	printSummary(s, totalAnalyzed, log)
+	return nil
 }
 
 // analyzeEntry analyzes a single entry URL and returns the number of JS files analyzed.
 // It always runs static HTML extraction, and additionally runs headless browser
 // discovery if cfg.Headless is enabled, merging and deduplicating the results.
-func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, entryURL string, queued, processed map[string]bool, totalAnalyzed *int) int {
+func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, entryURL string, queued, processed map[string]bool, totalAnalyzed *int) int {
 	entryDomain := urlutil.SanitizeDomain(entryURL)
 
 	// 1. Static HTML extraction (always)
@@ -130,7 +173,10 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 
 	htmlContent := string(htmlResult.Body)
 	log.Info("Entry HTML size: %d bytes", len(htmlContent))
-	s.SaveRaw(entryDomain, "entry.html", htmlResult.Body)
+	if err := s.SaveEntry(entryDomain, htmlResult.Body); err != nil {
+		log.LogError("save entry HTML", "URL=%s error=%v", entryURL, err)
+		return 0
+	}
 
 	staticAssets := htmlEx.ExtractEntryJS(htmlContent, entryURL)
 	log.Info("Static extraction found %d JS assets", len(staticAssets))
@@ -205,12 +251,15 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 
 		// Serially analyze each result
 		for res := range results {
-			analyzeResult(cfg, s, a, log, res, entryURL, queued, processed, &queue, &analyzed, totalAnalyzed)
+			analyzeResultWithPreprocess(cfg, s, a, log, prep, res, entryURL, queued, processed, &queue, &analyzed, totalAnalyzed)
 		}
 	}
 
 	// Mark undownloaded entry JS as candidate
 	for _, asset := range entryAssets {
+		if cfg.SameOrigin && !urlutil.IsAllowedDomain(asset.URL, cfg.AllowCDN, entryURL) {
+			continue
+		}
 		if !processed[asset.URL] {
 			s.AddJS(&analyzer.JSAsset{
 				URL:        asset.URL,
@@ -266,6 +315,11 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 
 // analyzeResult analyzes a single download result
 func analyzeResult(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
+	analyzeResultWithPreprocess(cfg, s, a, log, nil, res, entryURL, queued, processed, queue, analyzed, totalAnalyzed)
+}
+
+// analyzeResultWithPreprocess analyzes a single download result with optional audit-prep preprocessing.
+func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
 	item := res.req
 
 	if processed[item.url] {
@@ -288,20 +342,20 @@ func analyzeResult(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log
 		return
 	}
 
-	// Beautify processing
-	saveData := res.result.Body
-	if cfg.Beautify {
-		if beautified, err := beautify.Beautify(res.result.Body); err == nil {
-			saveData = beautified
-		} else {
-			log.Verbose("Beautify failed %s: %v, saving original version", item.url, err)
+	analysisData := res.result.Body
+	entrySite := urlutil.SanitizeDomain(entryURL)
+
+	if cfg.AuditPrep && prep != nil {
+		prepResult := prep.Process(entryURL, item.url, res.result.Body)
+		analysisData = prepResult.AnalysisBody
+		if prepResult.Failed {
+			log.Warn("Audit preparation failed for %s: %s", item.url, prepResult.Error)
+		}
+	} else {
+		if _, _, err := s.SaveJS(entrySite, item.url, res.result.Body); err != nil {
+			log.LogError("save JavaScript", "URL=%s error=%v", item.url, err)
 		}
 	}
-
-	// Save to domain directory
-	filename := urlutil.SanitizeFilename(item.url)
-	domain := urlutil.SanitizeDomain(item.url)
-	s.SaveRaw(domain, filename+".js", saveData)
 
 	*analyzed++
 	*totalAnalyzed++
@@ -315,45 +369,10 @@ func analyzeResult(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log
 		Size: res.result.Size, Hash: res.result.Hash,
 	})
 
-	// Analyze JS
-	result := a.AnalyzeJS(string(res.result.Body), item.url, item.from, item.depth)
-
-	// Write analysis results to store
-	for _, imp := range result.Imports {
-		s.AddDynamicImport(imp)
-	}
-	for _, route := range result.Routes {
-		s.AddRoute(route)
-	}
-	for _, sm := range result.Sourcemaps {
-		s.AddSourcemap(sm)
-	}
-	if result.FrameworkInfo != nil {
-		s.AddFramework(*result.FrameworkInfo)
-	}
-
-	// Also add resolved URLs from dynamic imports to NewURLs (supplementing framework analyzer gaps)
-	newURLSet := make(map[string]bool)
-	for _, u := range result.NewURLs {
-		newURLSet[u.URL] = true
-	}
-	for _, imp := range result.Imports {
-		if imp.ResolvedURL != "" && !newURLSet[imp.ResolvedURL] {
-			newURLSet[imp.ResolvedURL] = true
-			result.NewURLs = append(result.NewURLs, analyzer.JSAsset{
-				URL:        imp.ResolvedURL,
-				FromURL:    item.url,
-				Type:       analyzer.TypeLazyChunkJS,
-				Framework:  result.Framework,
-				Source:     imp.Source,
-				Confidence: imp.Confidence,
-				Status:     analyzer.StatusCandidate,
-			})
-		}
-	}
+	discovered := a.DiscoverJS(string(analysisData), item.url)
 
 	// Add newly discovered JS URLs to the next batch queue
-	for _, newAsset := range result.NewURLs {
+	for _, newAsset := range discovered {
 		// For static analysis, require IsJSPath. For dynamic sources, allow broader fetch.
 		fromDynamic := newAsset.Source == analyzer.SourceHeadlessNetwork ||
 			newAsset.Source == analyzer.SourceHeadlessDOM ||
@@ -381,77 +400,6 @@ func analyzeResult(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log
 	}
 }
 
-// fetchSourceMaps downloads and parses discovered source maps
-func fetchSourceMaps(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, log *logging.Logger) {
-	sms := s.GetSourcemaps()
-	if len(sms) == 0 {
-		return
-	}
-	log.Info("Processing %d source maps...", len(sms))
-
-	smAnalyzer := analyzer.NewSourceMapAnalyzer(nil)
-	// Get regex analyzer from analyzer for ExtractFromSourcesContent
-	regex := analyzer.NewRegexAnalyzer()
-	smAnalyzer = analyzer.NewSourceMapAnalyzer(regex)
-
-	for _, sm := range sms {
-		if sm.Status != "found" {
-			continue
-		}
-
-		// Parse map URL (may be relative)
-		mapURL := sm.MapURL
-		if mapURL == "" {
-			continue
-		}
-
-		log.Verbose("Downloading source map: %s", mapURL)
-		mapResult := f.Fetch(mapURL)
-		if mapResult.Err != nil {
-			log.LogError("download sourcemap", "URL=%s error=%v", mapURL, mapResult.Err)
-			s.UpdateSourcemapStatus(mapURL, "fetch_error", 0, false)
-			continue
-		}
-
-		// Save source map file
-		filename := urlutil.SanitizeFilename(mapURL)
-		domain := urlutil.SanitizeDomain(mapURL)
-		s.SaveRaw(domain, filename+".map", mapResult.Body)
-
-		// Parse source map
-		parsed := smAnalyzer.ParseSourceMap(mapResult.Body, mapURL, sm.FromJS)
-		s.UpdateSourcemapStatus(mapURL, parsed.Status, parsed.SourceCount, parsed.HasSourcesContent)
-
-		// If sourcesContent exists, extract additional information
-		if parsed.HasSourcesContent {
-			var rawMap struct {
-				SourcesContent []string `json:"sourcesContent"`
-			}
-			if err := json.Unmarshal(mapResult.Body, &rawMap); err == nil && len(rawMap.SourcesContent) > 0 {
-				extraImports, extraRoutes := smAnalyzer.ExtractFromSourcesContent(rawMap.SourcesContent, sm.FromJS)
-				for _, imp := range extraImports {
-					s.AddDynamicImport(imp)
-				}
-				for _, route := range extraRoutes {
-					s.AddRoute(route)
-				}
-				log.Verbose("  Extracted from sourcesContent: %d imports, %d routes", len(extraImports), len(extraRoutes))
-			}
-		}
-
-		// Update source map info with full information
-		info := analyzer.SourceMapInfo{
-			FromJS:            sm.FromJS,
-			MapURL:            mapURL,
-			Status:            parsed.Status,
-			HasSourcesContent: parsed.HasSourcesContent,
-			SourceCount:       parsed.SourceCount,
-			Sources:           parsed.Sources,
-		}
-		s.AddSourcemap(info)
-	}
-}
-
 func addToQueue(url string, depth int, from string, queued, processed map[string]bool, queue *[]fetchReq) {
 	if queued[url] || processed[url] {
 		return
@@ -464,12 +412,25 @@ func shouldEnqueue(confidence, status string) bool {
 	return confidence == analyzer.ConfHigh || confidence == analyzer.ConfMedium
 }
 
-func printSummary(s *store.Store, totalAnalyzed int, outDir string, log *logging.Logger) {
+func printSummary(s *store.Store, totalAnalyzed int, log *logging.Logger) {
 	confirmed := s.GetConfirmedURLs()
 	candidates := s.GetCandidateURLs()
 	log.Info("Analysis complete!")
 	log.Info("  Confirmed JS: %d", len(confirmed))
 	log.Info("  Candidate JS: %d", len(candidates))
 	log.Info("  Total analyzed: %d", totalAnalyzed)
-	log.Info("JS list saved to: %s", filepath.Join(outDir, "js.txt"))
+}
+
+func cleanupLegacyOutputs(outDir string) {
+	for _, name := range []string{
+		"analysis_errors.log",
+		"js.txt",
+		"dynamic_imports.json",
+		"route_chunk_map.json",
+		"sourcemaps.txt",
+		"framework_detect.json",
+		"audit_bundle",
+	} {
+		_ = os.RemoveAll(filepath.Join(outDir, name))
+	}
 }

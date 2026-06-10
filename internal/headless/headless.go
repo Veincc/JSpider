@@ -76,6 +76,8 @@ type Config struct {
 	Verbose bool
 	// InsecureSkipVerify skips TLS certificate verification in Chrome.
 	InsecureSkipVerify bool
+	// Proxy is the proxy server used by Chrome.
+	Proxy string
 }
 
 // networkCapture holds JS URLs captured from network events.
@@ -215,6 +217,9 @@ func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer
 	)
 	if cfg.InsecureSkipVerify {
 		opts = append(opts, chromedp.Flag("ignore-certificate-errors", true))
+	}
+	if cfg.Proxy != "" {
+		opts = append(opts, chromedp.ProxyServer(cfg.Proxy))
 	}
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, opts...)

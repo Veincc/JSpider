@@ -2,645 +2,379 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/Veincc/JSpider/internal/analyzer"
 	"github.com/Veincc/JSpider/internal/config"
-	"github.com/Veincc/JSpider/internal/fetcher"
-	"github.com/Veincc/JSpider/internal/html"
-	"github.com/Veincc/JSpider/internal/logging"
-	"github.com/Veincc/JSpider/internal/store"
+	"github.com/Veincc/JSpider/internal/preprocess"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
-func setupTestServer(t *testing.T) *httptest.Server {
-	t.Helper()
-	mux := http.NewServeMux()
+func TestNormalModeOnlySavesEntryAndRecursiveJavaScript(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/":                `<script src="/assets/app.js"></script>`,
+		"/assets/app.js":   `import("./chunk.js");`,
+		"/assets/chunk.js": `console.log("chunk");`,
+	})
+	defer server.Close()
 
-	// index.html includes /assets/main.js
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	if err := run(cfg); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	assertPathExists(t, filepath.Join(siteDir, "entry.html"))
+	if count := countFiles(t, filepath.Join(siteDir, "js")); count != 2 {
+		t.Fatalf("saved JavaScript files = %d, want 2", count)
+	}
+	assertPathMissing(t, filepath.Join(siteDir, "audit"))
+	assertNoLegacyReports(t, outDir)
+}
+
+func TestAuditModeUsesSourceMapsThenFallsBackToReadableBundle(t *testing.T) {
+	if err := preprocess.CheckNodeRuntime(); err != nil {
+		t.Skip(err)
+	}
+
+	server := newSiteServer(t, map[string]string{
+		"/": `<script src="/app.js"></script>`,
+		"/app.js": `import("./chunk.js");
+//# sourceMappingURL=app.js.map`,
+		"/app.js.map": `{
+			"version":3,
+			"sources":["src/main.ts","webpack:///node_modules/lib/index.js"],
+			"sourcesContent":["export const main = true;","vendor"]
+		}`,
+		"/chunk.js": `const value=atob("L2FwaS9jaHVuaw==");console.log(value);`,
+	})
+	defer server.Close()
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	cfg.AuditPrep = true
+	if err := run(cfg); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	assertPathExists(t, filepath.Join(siteDir, "entry.html"))
+	assertPathMissing(t, filepath.Join(siteDir, "js"))
+	assertPathExists(t, filepath.Join(siteDir, "audit", "sources", "src", "main.ts"))
+	if count := countFiles(t, filepath.Join(siteDir, "audit", "bundles")); count != 1 {
+		t.Fatalf("processed bundles = %d, want 1", count)
+	}
+	assertPathMissing(t, filepath.Join(siteDir, "audit", "indexes"))
+	assertPathMissing(t, filepath.Join(siteDir, "audit", "slices"))
+	assertPathMissing(t, filepath.Join(siteDir, "audit", "transform_log.json"))
+
+	manifest := readManifest(t, filepath.Join(siteDir, "audit", "manifest.json"))
+	if len(manifest.Files) != 2 {
+		t.Fatalf("manifest files = %d, want 2", len(manifest.Files))
+	}
+	statuses := make(map[string]string)
+	for _, file := range manifest.Files {
+		statuses[file.JSURL] = file.Status
+	}
+	if statuses[server.URL+"/app.js"] != "sourcemap" {
+		t.Fatalf("app.js status = %q", statuses[server.URL+"/app.js"])
+	}
+	if statuses[server.URL+"/chunk.js"] != "processed" {
+		t.Fatalf("chunk.js status = %q", statuses[server.URL+"/chunk.js"])
+	}
+	assertNoLegacyReports(t, outDir)
+}
+
+func TestAuditFailureSavesOriginalOnlyInFailures(t *testing.T) {
+	if err := preprocess.CheckNodeRuntime(); err != nil {
+		t.Skip(err)
+	}
+
+	server := newSiteServer(t, map[string]string{
+		"/":          `<script src="/broken.js"></script>`,
+		"/broken.js": `function broken(`,
+	})
+	defer server.Close()
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	cfg.AuditPrep = true
+	if err := run(cfg); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	auditDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL), "audit")
+	if count := countFiles(t, filepath.Join(auditDir, "failures")); count != 1 {
+		t.Fatalf("failure files = %d, want 1", count)
+	}
+	assertPathMissing(t, filepath.Join(auditDir, "bundles"))
+	manifest := readManifest(t, filepath.Join(auditDir, "manifest.json"))
+	if len(manifest.Files) != 1 || manifest.Files[0].Status != "failed" {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+}
+
+func TestAllowedCDNJavaScriptBelongsToEntrySite(t *testing.T) {
+	assetServer := newSiteServer(t, map[string]string{
+		"/cdn.js": `console.log("cdn");`,
+	})
+	defer assetServer.Close()
+
+	entryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte(`<!DOCTYPE html>
-<html>
-<head><title>Test</title></head>
-<body>
-<script src="/assets/main.js"></script>
-</body>
-</html>`))
-	})
-
-	// main.js contains import() and sourceMappingURL
-	mux.HandleFunc("/assets/main.js", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/javascript")
-		w.Write([]byte(`// main.js
-function loadChunk() {
-  return import("./chunk.js");
-}
-loadChunk();
-//# sourceMappingURL=main.js.map
-`))
-	})
-
-	// chunk.js is downloadable
-	mux.HandleFunc("/assets/chunk.js", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/javascript")
-		w.Write([]byte(`// chunk.js
-export function hello() {
-  return "world";
-}
-`))
-	})
-
-	// main.js.map source map
-	mux.HandleFunc("/assets/main.js.map", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		sourceMap := map[string]interface{}{
-			"version":        3,
-			"file":           "main.js",
-			"sources":        []string{"src/main.ts"},
-			"sourcesContent": []string{"function loadChunk() {\n  return import('./chunk.js');\n}\nloadChunk();\n"},
-			"mappings":       "AAAA",
-		}
-		data, _ := json.Marshal(sourceMap)
-		w.Write(data)
-	})
-
-	return httptest.NewServer(mux)
-}
-
-func TestEndToEnd(t *testing.T) {
-	ts := setupTestServer(t)
-	defer ts.Close()
-
-	// Create temp output directory
-	outDir := t.TempDir()
-
-	cfg := &config.Config{
-		URL:            ts.URL + "/",
-		OutDir:         outDir,
-		MaxJS:          100,
-		MaxDepth:       3,
-		MaxSizeMB:      10,
-		Workers:        2,
-		SameOrigin:     true,
-		FetchSourcemap: true,
-		Timeout:        5,
-		UserAgent:      "JSpider-Test/1.0",
-		Verbose:        true,
-	}
-
-	log := logging.New(cfg.Verbose, cfg.OutDir)
-	defer log.Close()
-
-	f := fetcher.New(cfg, log)
-	s := store.New(cfg.OutDir)
-	a := analyzer.NewAnalyzer(log)
-	htmlEx := html.NewExtractor()
-
-	// Simulate main flow
-	entryURL := cfg.URL
-
-	// 1. Download entry HTML
-	htmlResult := f.Fetch(entryURL)
-	if htmlResult.Err != nil {
-		t.Fatalf("Failed to download entry HTML: %v", htmlResult.Err)
-	}
-
-	htmlContent := string(htmlResult.Body)
-	entryDomain := "127_0_0_1"
-	s.SaveRaw(entryDomain, "entry.html", htmlResult.Body)
-
-	// 2. Extract entry JS
-	entryAssets := htmlEx.ExtractEntryJS(htmlContent, entryURL)
-	if len(entryAssets) == 0 {
-		t.Fatal("No entry JS found")
-	}
-	t.Logf("Found %d entry JS files", len(entryAssets))
-
-	// 3. Download and analyze entry JS (full crawl loop)
-	queued := make(map[string]bool)
-	processed := make(map[string]bool)
-	var queue []fetchReq
-
-	for _, asset := range entryAssets {
-		addToQueue(asset.URL, 0, entryURL, queued, processed, &queue)
-	}
-
-	totalAnalyzed := 0
-	for len(queue) > 0 {
-		if cfg.MaxJS > 0 && totalAnalyzed >= cfg.MaxJS {
-			break
-		}
-		results := fetchBatch(cfg, f, log, queue)
-		queue = nil
-		analyzed := 0
-		for res := range results {
-			analyzeResult(cfg, s, a, log, res, entryURL, queued, processed, &queue, &analyzed, &totalAnalyzed)
-		}
-	}
-
-	// 4. Process source maps
-	fetchSourceMaps(cfg, s, f, a, log)
-
-	// 5. Save results
-	if err := s.SaveAll(); err != nil {
-		t.Fatalf("Failed to save results: %v", err)
-	}
-
-	// Verify output files
-	assertFileExists(t, outDir+"/js.txt")
-	assertFileExists(t, outDir+"/dynamic_imports.json")
-	assertFileExists(t, outDir+"/sourcemaps.txt")
-	assertFileExists(t, outDir+"/framework_detect.json")
-
-	// Verify js.txt contains all confirmed URLs
-	jsTxtData, err := os.ReadFile(filepath.Join(outDir, "js.txt"))
-	if err != nil {
-		t.Fatalf("Failed to read js.txt: %v", err)
-	}
-	jsTxtContent := string(jsTxtData)
-	if len(jsTxtContent) == 0 {
-		t.Error("js.txt should not be empty")
-	}
-
-	// Verify confirmed JS contains main.js
-	confirmed := s.GetConfirmedURLs()
-	found := false
-	for _, u := range confirmed {
-		if u == ts.URL+"/assets/main.js" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("main.js missing from confirmed, got: %v", confirmed)
-	}
-
-	// Verify dynamic_imports contains chunk.js
-	imports := s.GetDynamicImports()
-	hasChunkImport := false
-	for _, imp := range imports {
-		if imp.ResolvedURL == ts.URL+"/assets/chunk.js" {
-			hasChunkImport = true
-			break
-		}
-	}
-	if !hasChunkImport {
-		t.Errorf("chunk.js import missing from dynamic_imports, got: %v", imports)
-	}
-
-	// Verify sourcemaps
-	sourcemaps := s.GetSourcemaps()
-	hasParsedMap := false
-	for _, sm := range sourcemaps {
-		if sm.Status == "parsed" && sm.HasSourcesContent {
-			hasParsedMap = true
-			break
-		}
-	}
-	if !hasParsedMap {
-		t.Errorf("Parsed source map missing from sourcemaps, got: %v", sourcemaps)
-	}
-
-	// Verify JS files exist in output directory
-	jsDir := filepath.Join(outDir, entryDomain)
-	entries, _ := os.ReadDir(jsDir)
-	jsCount := 0
-	for _, e := range entries {
-		if filepath.Ext(e.Name()) == ".js" {
-			jsCount++
-		}
-	}
-	if jsCount < 2 { // main.js + chunk.js
-		t.Errorf("Not enough JS files, got %d", jsCount)
-	}
-
-	t.Logf("Test passed: analyzed %d JS files, confirmed=%d, imports=%d, sourcemaps=%d",
-		totalAnalyzed, len(confirmed), len(imports), len(sourcemaps))
-}
-
-func TestMaxDepthLimit(t *testing.T) {
-	// Test MaxDepth limit
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/":
-			w.Header().Set("Content-Type", "text/html")
-			w.Write([]byte(`<script src="/a.js"></script>`))
-		case "/a.js":
-			w.Header().Set("Content-Type", "application/javascript")
-			w.Write([]byte(`import("./b.js");`))
-		case "/b.js":
-			w.Header().Set("Content-Type", "application/javascript")
-			w.Write([]byte(`import("./c.js");`))
-		case "/c.js":
-			w.Header().Set("Content-Type", "application/javascript")
-			w.Write([]byte(`console.log("c");`))
-		default:
-			http.NotFound(w, r)
-		}
+		fmt.Fprintf(w, `<script src="%s/cdn.js"></script>`, assetServer.URL)
 	}))
-	defer ts.Close()
+	defer entryServer.Close()
+
+	entryURL := strings.Replace(entryServer.URL, "127.0.0.1", "localhost", 1) + "/"
+	outDir := t.TempDir()
+	cfg := testConfig(entryURL, outDir)
+	cfg.AllowCDN = []string{"127.0.0.1"}
+	if err := run(cfg); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	entrySite := filepath.Join(outDir, "localhost", "js")
+	if count := countFiles(t, entrySite); count != 1 {
+		t.Fatalf("entry-site JavaScript files = %d, want 1", count)
+	}
+	assertPathMissing(t, filepath.Join(outDir, "127_0_0_1"))
+}
+
+func TestMultipleEntrySitesAreIsolated(t *testing.T) {
+	first := newSiteServer(t, map[string]string{
+		"/":         `<script src="/first.js"></script>`,
+		"/first.js": `console.log("first");`,
+	})
+	defer first.Close()
+	second := newSiteServer(t, map[string]string{
+		"/":          `<script src="/second.js"></script>`,
+		"/second.js": `console.log("second");`,
+	})
+	defer second.Close()
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	secondURL := strings.Replace(second.URL, "127.0.0.1", "localhost", 1) + "/"
+	if err := os.WriteFile(listPath, []byte(secondURL+"\n"), 0644); err != nil {
+		t.Fatalf("write URL list: %v", err)
+	}
 
 	outDir := t.TempDir()
+	cfg := testConfig(first.URL+"/", outDir)
+	cfg.URLList = listPath
+	if err := run(cfg); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+
+	if count := countFiles(t, filepath.Join(outDir, "127_0_0_1", "js")); count != 1 {
+		t.Fatalf("first site JavaScript files = %d, want 1", count)
+	}
+	if count := countFiles(t, filepath.Join(outDir, "localhost", "js")); count != 1 {
+		t.Fatalf("second site JavaScript files = %d, want 1", count)
+	}
+}
+
+func TestRunRemovesLegacyAndPreviousModeOutputs(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/":       `<script src="/app.js"></script>`,
+		"/app.js": `console.log("app");`,
+	})
+	defer server.Close()
+
+	outDir := t.TempDir()
+	site := urlutil.SanitizeDomain(server.URL)
+	for _, stale := range []string{
+		"js.txt",
+		"dynamic_imports.json",
+		"route_chunk_map.json",
+		"sourcemaps.txt",
+		"framework_detect.json",
+		"analysis_errors.log",
+		"audit_bundle/manifest.json",
+		filepath.Join(site, "audit", "manifest.json"),
+	} {
+		path := filepath.Join(outDir, stale)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatalf("MkdirAll stale path: %v", err)
+		}
+		if err := os.WriteFile(path, []byte("stale"), 0644); err != nil {
+			t.Fatalf("write stale path: %v", err)
+		}
+	}
+
+	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	assertNoLegacyReports(t, outDir)
+	assertPathMissing(t, filepath.Join(outDir, site, "audit"))
+}
+
+func TestCLIAndDocumentationRemoveLegacyFlagsAndReports(t *testing.T) {
+	configSource, err := os.ReadFile(filepath.Join("..", "..", "internal", "config", "config.go"))
+	if err != nil {
+		t.Fatalf("read config.go: %v", err)
+	}
+	configText := string(configSource)
+	for _, removed := range []string{
+		`"m"`,
+		`"b"`,
+		`"insecure-skip-verify"`,
+		"FetchSourcemap",
+		"AuditPrepAlias",
+	} {
+		if strings.Contains(configText, removed) {
+			t.Fatalf("config still contains removed CLI behavior %q", removed)
+		}
+	}
+
+	readme, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README.md: %v", err)
+	}
+	readmeText := string(readme)
+	for _, removed := range []string{
+		"js.txt",
+		"dynamic_imports.json",
+		"route_chunk_map.json",
+		"framework_detect.json",
+		"indexes/",
+		"slices/",
+		"transform_log.json",
+		"`-m`",
+		"`-b`",
+		"`--insecure-skip-verify`",
+	} {
+		if strings.Contains(readmeText, removed) {
+			t.Fatalf("README still contains removed output or flag %q", removed)
+		}
+	}
+	for _, required := range []string{"`--insecure`", "`--proxy <url>`", "| `-d <depth>` | `10`", "| `-s <mb>` | unlimited"} {
+		if !strings.Contains(readmeText, required) {
+			t.Fatalf("README is missing %q", required)
+		}
+	}
+}
+
+func TestBuildHeadlessConfigIncludesNetworkOptions(t *testing.T) {
 	cfg := &config.Config{
-		URL:        ts.URL + "/",
+		Timeout:            21,
+		SameOrigin:         true,
+		AllowCDN:           []string{"cdn.example.com"},
+		Verbose:            true,
+		InsecureSkipVerify: true,
+		Proxy:              "socks5://127.0.0.1:1080",
+	}
+
+	got := buildHeadlessConfig(cfg, "https://example.com")
+	if got.Timeout.String() != "21s" {
+		t.Fatalf("Timeout = %s, want 21s", got.Timeout)
+	}
+	if !got.InsecureSkipVerify {
+		t.Fatal("InsecureSkipVerify = false, want true")
+	}
+	if got.Proxy != cfg.Proxy {
+		t.Fatalf("Proxy = %q, want %q", got.Proxy, cfg.Proxy)
+	}
+}
+
+func testConfig(entryURL, outDir string) *config.Config {
+	return &config.Config{
+		URL:        entryURL,
 		OutDir:     outDir,
 		MaxJS:      100,
-		MaxDepth:   1, // Only allow depth 0 and 1
-		MaxSizeMB:  10,
-		Workers:    1,
+		MaxDepth:   config.DefaultMaxDepth,
+		MaxSizeMB:  config.DefaultMaxSizeMB,
+		Workers:    2,
 		SameOrigin: true,
 		Timeout:    5,
-		UserAgent:  "Test/1.0",
-		Verbose:    false,
+		UserAgent:  "JSpider-Test/1.0",
 	}
-
-	log := logging.New(false, outDir)
-	defer log.Close()
-	f := fetcher.New(cfg, log)
-	s := store.New(outDir)
-	a := analyzer.NewAnalyzer(log)
-	htmlEx := html.NewExtractor()
-
-	entryURL := cfg.URL
-	htmlResult := f.Fetch(entryURL)
-	if htmlResult.Err != nil {
-		t.Fatalf("HTML fetch error: %v", htmlResult.Err)
-	}
-	htmlContent := string(htmlResult.Body)
-	entryAssets := htmlEx.ExtractEntryJS(htmlContent, entryURL)
-
-	queued := make(map[string]bool)
-	processed := make(map[string]bool)
-	var queue []fetchReq
-	for _, asset := range entryAssets {
-		addToQueue(asset.URL, 0, entryURL, queued, processed, &queue)
-	}
-
-	totalAnalyzed := 0
-	for len(queue) > 0 {
-		if cfg.MaxJS > 0 && totalAnalyzed >= cfg.MaxJS {
-			break
-		}
-		results := fetchBatch(cfg, f, log, queue)
-		queue = nil
-		analyzed := 0
-		for res := range results {
-			analyzeResult(cfg, s, a, log, res, entryURL, queued, processed, &queue, &analyzed, &totalAnalyzed)
-		}
-	}
-
-	// a.js depth 0, b.js depth 1, c.js depth 2 (should be skipped)
-	confirmed := s.GetConfirmedURLs()
-	confirmedSet := make(map[string]bool)
-	for _, u := range confirmed {
-		confirmedSet[u] = true
-	}
-
-	if !confirmedSet[ts.URL+"/a.js"] {
-		t.Error("a.js should be analyzed (depth 0)")
-	}
-	// b.js depth 1, MaxDepth=1, should be analyzed
-	if !confirmedSet[ts.URL+"/b.js"] {
-		t.Error("b.js should be analyzed (depth 1 <= MaxDepth=1)")
-	}
-	if confirmedSet[ts.URL+"/c.js"] {
-		t.Error("c.js should not be analyzed (depth 2 > MaxDepth=1)")
-	}
-
-	t.Logf("MaxDepth test: confirmed=%d, totalAnalyzed=%d", len(confirmed), totalAnalyzed)
 }
 
-func TestStoreSaveAllCreatesDir(t *testing.T) {
-	// Test SaveAll auto-creates output directory
-	outDir := filepath.Join(t.TempDir(), "nonexistent", "deep", "path")
-	s := store.New(outDir)
-
-	// Add some data
-	s.AddJS(&analyzer.JSAsset{
-		URL:    "https://example.com/test.js",
-		Status: analyzer.StatusConfirmed,
-	})
-
-	if err := s.SaveAll(); err != nil {
-		t.Fatalf("SaveAll should auto-create the directory, got error: %v", err)
-	}
-
-	// Verify file exists
-	assertFileExists(t, outDir+"/js.txt")
-}
-
-func assertFileExists(t *testing.T, path string) {
+func newSiteServer(t *testing.T, routes map[string]string) *httptest.Server {
 	t.Helper()
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		t.Errorf("File does not exist: %s", path)
-	}
-}
-
-func TestMaxJS_PrecisionLimit(t *testing.T) {
-	// Test that MaxJS is a hard limit, not a soft one
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/":
-			w.Header().Set("Content-Type", "text/html")
-			w.Write([]byte(`<script src="/a.js"></script><script src="/b.js"></script><script src="/c.js"></script>`))
-		case "/a.js", "/b.js", "/c.js":
-			w.Header().Set("Content-Type", "application/javascript")
-			w.Write([]byte(`console.log("ok");`))
-		default:
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := routes[r.URL.Path]
+		if !ok {
 			http.NotFound(w, r)
+			return
 		}
-	}))
-	defer ts.Close()
-
-	outDir := t.TempDir()
-	cfg := &config.Config{
-		URL:        ts.URL + "/",
-		OutDir:     outDir,
-		MaxJS:      2, // Only allow 2
-		MaxDepth:   3,
-		MaxSizeMB:  10,
-		Workers:    3,
-		SameOrigin: true,
-		Timeout:    5,
-		UserAgent:  "Test/1.0",
-		Verbose:    false,
-	}
-
-	log := logging.New(false, outDir)
-	defer log.Close()
-	f := fetcher.New(cfg, log)
-	s := store.New(outDir)
-	a := analyzer.NewAnalyzer(log)
-	htmlEx := html.NewExtractor()
-
-	queued := make(map[string]bool)
-	processed := make(map[string]bool)
-	entryAssets := htmlEx.ExtractEntryJS(`<script src="/a.js"></script><script src="/b.js"></script><script src="/c.js"></script>`, ts.URL+"/")
-
-	var queue []fetchReq
-	for _, asset := range entryAssets {
-		addToQueue(asset.URL, 0, ts.URL+"/", queued, processed, &queue)
-	}
-
-	totalAnalyzed := 0
-	for len(queue) > 0 {
-		if cfg.MaxJS > 0 && totalAnalyzed >= cfg.MaxJS {
-			break
-		}
-		results := fetchBatch(cfg, f, log, queue)
-		queue = nil
-		analyzed := 0
-		for res := range results {
-			analyzeResult(cfg, s, a, log, res, ts.URL+"/", queued, processed, &queue, &analyzed, &totalAnalyzed)
-		}
-	}
-
-	if totalAnalyzed > 2 {
-		t.Errorf("MaxJS=2 but analyzed %d", totalAnalyzed)
-	}
-}
-
-func TestCircularImport(t *testing.T) {
-	// A imports B, B imports A - should not loop forever
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/":
+		if strings.HasSuffix(r.URL.Path, ".map") {
+			w.Header().Set("Content-Type", "application/json")
+		} else if strings.HasSuffix(r.URL.Path, ".js") {
+			w.Header().Set("Content-Type", "application/javascript")
+		} else {
 			w.Header().Set("Content-Type", "text/html")
-			w.Write([]byte(`<script src="/a.js"></script>`))
-		case "/a.js":
-			w.Header().Set("Content-Type", "application/javascript")
-			w.Write([]byte(`import("./b.js");`))
-		case "/b.js":
-			w.Header().Set("Content-Type", "application/javascript")
-			w.Write([]byte(`import("./a.js");`))
-		default:
-			http.NotFound(w, r)
 		}
+		_, _ = w.Write([]byte(body))
 	}))
-	defer ts.Close()
-
-	outDir := t.TempDir()
-	cfg := &config.Config{
-		URL:        ts.URL + "/",
-		OutDir:     outDir,
-		MaxJS:      100,
-		MaxDepth:   5,
-		MaxSizeMB:  10,
-		Workers:    1,
-		SameOrigin: true,
-		Timeout:    5,
-		UserAgent:  "Test/1.0",
-		Verbose:    false,
-	}
-
-	log := logging.New(false, outDir)
-	defer log.Close()
-	f := fetcher.New(cfg, log)
-	s := store.New(outDir)
-	a := analyzer.NewAnalyzer(log)
-	htmlEx := html.NewExtractor()
-
-	entryURL := cfg.URL
-	htmlResult := f.Fetch(entryURL)
-	htmlContent := string(htmlResult.Body)
-	entryAssets := htmlEx.ExtractEntryJS(htmlContent, entryURL)
-
-	queued := make(map[string]bool)
-	processed := make(map[string]bool)
-	var queue []fetchReq
-	for _, asset := range entryAssets {
-		addToQueue(asset.URL, 0, entryURL, queued, processed, &queue)
-	}
-
-	totalAnalyzed := 0
-	for len(queue) > 0 {
-		if cfg.MaxJS > 0 && totalAnalyzed >= cfg.MaxJS {
-			break
-		}
-		results := fetchBatch(cfg, f, log, queue)
-		queue = nil
-		analyzed := 0
-		for res := range results {
-			analyzeResult(cfg, s, a, log, res, entryURL, queued, processed, &queue, &analyzed, &totalAnalyzed)
-		}
-	}
-
-	// Should process a.js and b.js exactly once each
-	if totalAnalyzed != 2 {
-		t.Errorf("Expected 2 analyzed (circular), got %d", totalAnalyzed)
-	}
-
-	confirmed := s.GetConfirmedURLs()
-	if len(confirmed) != 2 {
-		t.Errorf("Expected 2 confirmed, got %d: %v", len(confirmed), confirmed)
-	}
 }
 
-func TestEntryJS_SameOriginFilter(t *testing.T) {
-	outDir := t.TempDir()
-	cfg := &config.Config{
-		OutDir:     outDir,
-		MaxJS:      10,
-		MaxDepth:   2,
-		MaxSizeMB:  10,
-		Workers:    1,
-		SameOrigin: true,
-		Timeout:    5,
-		UserAgent:  "Test/1.0",
-	}
-
-	log := logging.New(false, outDir)
-	defer log.Close()
-
-	s := store.New(outDir)
-	htmlEx := html.NewExtractor()
-	entryURL := "https://example.com/"
-	htmlContent := `<script src="/app.js"></script><script src="https://cdn.example.com/lib.js"></script>`
-
-	entryAssets := htmlEx.ExtractEntryJS(htmlContent, entryURL)
-	queued := make(map[string]bool)
-	processed := make(map[string]bool)
-	var queue []fetchReq
-
-	for i := range entryAssets {
-		if cfg.SameOrigin && !urlutil.IsAllowedDomain(entryAssets[i].URL, cfg.AllowCDN, entryURL) {
-			continue
-		}
-		entryAssets[i].Depth = 0
-		entryAssets[i].FromURL = entryURL
-		s.AddJS(&entryAssets[i])
-		addToQueue(entryAssets[i].URL, 0, entryURL, queued, processed, &queue)
-	}
-
-	confirmed := s.GetCandidateURLs()
-	if len(confirmed) != 1 || confirmed[0] != "https://example.com/app.js" {
-		t.Fatalf("same-origin filter mismatch, got %v", confirmed)
-	}
-}
-
-func TestHeadlessDefaultFalse(t *testing.T) {
-	cfg := &config.Config{}
-	if cfg.Headless {
-		t.Errorf("default Config.Headless = %v, want false", cfg.Headless)
-	}
-}
-
-func TestHeadlessFlagTrue(t *testing.T) {
-	cfg := &config.Config{Headless: true}
-	if !cfg.Headless {
-		t.Error("Config.Headless should be true when set")
-	}
-}
-
-func TestBuildHeadlessConfigInsecureSkipVerify(t *testing.T) {
-	cfg := &config.Config{Timeout: 5, InsecureSkipVerify: true}
-	hlCfg := buildHeadlessConfig(cfg, "https://example.com")
-	if !hlCfg.InsecureSkipVerify {
-		t.Error("Headless config should inherit InsecureSkipVerify")
-	}
-}
-
-func TestHybridMergeDedup(t *testing.T) {
-	// Test that static + headless assets are properly deduplicated
-	outDir := t.TempDir()
-	s := store.New(outDir)
-
-	// Simulate static finding a.js and b.js
-	s.AddJS(&analyzer.JSAsset{
-		URL: "https://example.com/a.js", Status: analyzer.StatusCandidate,
-		Source: analyzer.SourceHTMLScript, Confidence: analyzer.ConfHigh,
-	})
-	s.AddJS(&analyzer.JSAsset{
-		URL: "https://example.com/b.js", Status: analyzer.StatusCandidate,
-		Source: analyzer.SourceHTMLScript, Confidence: analyzer.ConfHigh,
-	})
-
-	// Simulate headless finding b.js (overlap) and c.js (new)
-	s.AddJS(&analyzer.JSAsset{
-		URL: "https://example.com/b.js", Status: analyzer.StatusCandidate,
-		Source: analyzer.SourceHeadlessNetwork, Confidence: analyzer.ConfHigh,
-	})
-	s.AddJS(&analyzer.JSAsset{
-		URL: "https://example.com/c.js", Status: analyzer.StatusCandidate,
-		Source: analyzer.SourceHeadlessNetwork, Confidence: analyzer.ConfHigh,
-	})
-
-	if err := s.SaveAll(); err != nil {
-		t.Fatalf("SaveAll failed: %v", err)
-	}
-
-	// js.txt should have 3 unique URLs (a, b, c), not 4
-	data, err := os.ReadFile(filepath.Join(outDir, "js.txt"))
+func readManifest(t *testing.T, path string) preprocess.Manifest {
+	t.Helper()
+	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("ReadFile js.txt: %v", err)
+		t.Fatalf("read manifest: %v", err)
 	}
-
-	lines := splitLines(string(data))
-	if len(lines) != 3 {
-		t.Errorf("Expected 3 deduped URLs in js.txt, got %d: %v", len(lines), lines)
+	var manifest preprocess.Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
 	}
+	return manifest
+}
 
-	// b.js should still be present (merged, not lost)
-	found := false
-	for _, line := range lines {
-		if line == "https://example.com/b.js" {
-			found = true
-			break
+func countFiles(t *testing.T, root string) int {
+	t.Helper()
+	count := 0
+	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
+		if !entry.IsDir() {
+			count++
+		}
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return 0
 	}
-	if !found {
-		t.Error("b.js should be in js.txt (merged from static + headless)")
+	if err != nil {
+		t.Fatalf("WalkDir %s: %v", root, err)
+	}
+	return count
+}
+
+func assertNoLegacyReports(t *testing.T, outDir string) {
+	t.Helper()
+	for _, name := range []string{
+		"analysis_errors.log",
+		"js.txt",
+		"dynamic_imports.json",
+		"route_chunk_map.json",
+		"sourcemaps.txt",
+		"framework_detect.json",
+		"audit_bundle",
+	} {
+		assertPathMissing(t, filepath.Join(outDir, name))
 	}
 }
 
-func splitLines(s string) []string {
-	var lines []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '\n' {
-			line := s[start:i]
-			if line != "" {
-				lines = append(lines, line)
-			}
-			start = i + 1
-		}
+func assertPathExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected %s: %v", path, err)
 	}
-	if start < len(s) {
-		line := s[start:]
-		if line != "" {
-			lines = append(lines, line)
-		}
-	}
-	return lines
 }
 
-func TestMultiEntry_DoesNotDowngradeConfirmed(t *testing.T) {
-	outDir := t.TempDir()
-	s := store.New(outDir)
-
-	s.AddJS(&analyzer.JSAsset{
-		URL:        "https://example.com/app.js",
-		Status:     analyzer.StatusConfirmed,
-		Confidence: analyzer.ConfHigh,
-		Type:       analyzer.TypeEntryJS,
-		Source:     analyzer.SourceHTMLScript,
-	})
-
-	s.AddJS(&analyzer.JSAsset{
-		URL:        "https://example.com/app.js",
-		Status:     analyzer.StatusCandidate,
-		Confidence: analyzer.ConfMedium,
-		Type:       analyzer.TypeEntryJS,
-		Source:     analyzer.SourceHTMLScript,
-	})
-
-	confirmed := s.GetConfirmedURLs()
-	if len(confirmed) != 1 || confirmed[0] != "https://example.com/app.js" {
-		t.Fatalf("confirmed asset was downgraded, got %v", confirmed)
+func assertPathMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be absent, stat error = %v", path, err)
 	}
 }

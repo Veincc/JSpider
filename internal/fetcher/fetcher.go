@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -62,13 +63,26 @@ type Fetcher struct {
 	pending map[string]*inflight // In-flight requests (singleflight)
 }
 
-func New(cfg *config.Config, log *logging.Logger) *Fetcher {
+func New(cfg *config.Config, log *logging.Logger) (*Fetcher, error) {
 	client := &http.Client{
 		Timeout: time.Duration(cfg.Timeout) * time.Second,
 	}
-	if cfg.InsecureSkipVerify {
+	if cfg.InsecureSkipVerify || cfg.Proxy != "" {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		if cfg.InsecureSkipVerify {
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		if cfg.Proxy != "" {
+			normalized, err := config.NormalizeProxy(cfg.Proxy)
+			if err != nil {
+				return nil, err
+			}
+			proxyURL, err := url.Parse(normalized)
+			if err != nil {
+				return nil, fmt.Errorf("parse proxy URL: %w", err)
+			}
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
 		client.Transport = transport
 	}
 
@@ -78,7 +92,7 @@ func New(cfg *config.Config, log *logging.Logger) *Fetcher {
 		client:  client,
 		cache:   make(map[string]*Result),
 		pending: make(map[string]*inflight),
-	}
+	}, nil
 }
 
 // Fetch downloads URL content with caching and singleflight deduplication
@@ -143,16 +157,13 @@ func (f *Fetcher) doFetch(rawURL string) *Result {
 	}
 	defer resp.Body.Close()
 
-	// Limit compressed body read size
-	maxSize := int64(f.cfg.MaxSizeMB) * 1024 * 1024
-	limitedReader := io.LimitReader(resp.Body, maxSize+1)
-
-	compressedBody, err := io.ReadAll(limitedReader)
+	maxSize := maxSizeBytes(f.cfg.MaxSizeMB)
+	compressedBody, err := readBounded(resp.Body, maxSize)
 	if err != nil {
 		return &Result{URL: rawURL, StatusCode: resp.StatusCode, Err: err}
 	}
 
-	if int64(len(compressedBody)) > maxSize {
+	if maxSize > 0 && int64(len(compressedBody)) > maxSize {
 		return &Result{
 			URL:        rawURL,
 			StatusCode: resp.StatusCode,
@@ -214,16 +225,28 @@ func decompressBounded(data []byte, encoding string, maxSize int64) ([]byte, err
 		return data, nil
 	}
 
-	// Limit decompressed size
-	limited := io.LimitReader(reader, maxSize+1)
-	result, err := io.ReadAll(limited)
+	result, err := readBounded(reader, maxSize)
 	if err != nil {
 		return data, err
 	}
-	if int64(len(result)) > maxSize {
+	if maxSize > 0 && int64(len(result)) > maxSize {
 		return data, &ErrDecompressTooLarge{Size: int64(len(result)), Limit: maxSize}
 	}
 	return result, nil
+}
+
+func maxSizeBytes(maxSizeMB int) int64 {
+	if maxSizeMB <= 0 {
+		return 0
+	}
+	return int64(maxSizeMB) * 1024 * 1024
+}
+
+func readBounded(reader io.Reader, maxSize int64) ([]byte, error) {
+	if maxSize <= 0 {
+		return io.ReadAll(reader)
+	}
+	return io.ReadAll(io.LimitReader(reader, maxSize+1))
 }
 
 // FetchJS downloads a JS resource with status validation.

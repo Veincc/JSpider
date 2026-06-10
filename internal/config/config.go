@@ -4,8 +4,14 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
+)
+
+const (
+	DefaultMaxDepth  = 10
+	DefaultMaxSizeMB = 0
 )
 
 type Config struct {
@@ -17,16 +23,16 @@ type Config struct {
 	MaxDepth           int
 	MaxSizeMB          int
 	Workers            int
-	Beautify           bool
+	AuditPrep          bool
 	SameOrigin         bool
 	AllowCDN           []string
-	FetchSourcemap     bool
 	Timeout            int
 	UserAgent          string
 	Cookies            string
 	Headers            map[string]string
 	Verbose            bool
 	InsecureSkipVerify bool
+	Proxy              string
 }
 
 func Parse() *Config {
@@ -39,10 +45,28 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL>                    Static analysis (default)\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL> --headless         Static + headless browser discovery\n")
+		fmt.Fprintf(os.Stderr, "  jspider -u <URL> --headless --audit-prep\n")
 		fmt.Fprintf(os.Stderr, "  jspider -l <file>                   Analyze a URL list file\n")
-		fmt.Fprintf(os.Stderr, "  jspider -u <URL> -m -w 10 -o result Full parameter example\n\n")
+		fmt.Fprintf(os.Stderr, "  jspider -u <URL> -w 10 -o result    Full parameter example\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
-		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "  -u <url>              Start URL\n")
+		fmt.Fprintf(os.Stderr, "  -l <file>             URL list file, one URL per line\n")
+		fmt.Fprintf(os.Stderr, "  -o <dir>              Output directory (default: output)\n")
+		fmt.Fprintf(os.Stderr, "  --headless            Enable headless browser JS discovery (requires Chrome/Chromium)\n")
+		fmt.Fprintf(os.Stderr, "  --audit-prep          Recover source map sources or generate readable JavaScript (requires Node.js 18+ runtime)\n")
+		fmt.Fprintf(os.Stderr, "  -n <count>            Max JS files to analyze (0=unlimited)\n")
+		fmt.Fprintf(os.Stderr, "  -d <depth>            Max recursion depth (default: 10)\n")
+		fmt.Fprintf(os.Stderr, "  -s <mb>               Max download size per resource in MB (0=unlimited, default: unlimited)\n")
+		fmt.Fprintf(os.Stderr, "  -w <workers>          Concurrent download workers (default: 5)\n")
+		fmt.Fprintf(os.Stderr, "  --same-origin         Only analyze same-origin JS (default: true)\n")
+		fmt.Fprintf(os.Stderr, "  -c <domains>          Allowed CDN domains, comma-separated\n")
+		fmt.Fprintf(os.Stderr, "  --proxy <url>         HTTP, HTTPS, or SOCKS5 proxy used by requests and headless Chrome\n")
+		fmt.Fprintf(os.Stderr, "  -t <seconds>          HTTP timeout in seconds (default: 15)\n")
+		fmt.Fprintf(os.Stderr, "  -a <ua>               Custom User-Agent\n")
+		fmt.Fprintf(os.Stderr, "  -k <cookie>           Optional cookie string\n")
+		fmt.Fprintf(os.Stderr, "  -H <headers>          Extra headers (Header1=Value1;Header2=Value2)\n")
+		fmt.Fprintf(os.Stderr, "  -v                    Print verbose logs\n")
+		fmt.Fprintf(os.Stderr, "  --insecure            Skip TLS certificate verification for requests and headless Chrome\n")
 	}
 
 	flag.StringVar(&cfg.URL, "u", "", "Start URL")
@@ -50,22 +74,21 @@ func Parse() *Config {
 	flag.StringVar(&cfg.OutDir, "o", "output", "Output directory")
 	flag.BoolVar(&cfg.Headless, "headless", false, "Enable headless browser JS discovery (requires Chrome/Chromium)")
 	flag.IntVar(&cfg.MaxJS, "n", 0, "Max JS files to analyze (0=unlimited)")
-	flag.IntVar(&cfg.MaxDepth, "d", 6, "Max recursion depth")
-	flag.IntVar(&cfg.MaxSizeMB, "s", 10, "Max download size per JS in MB")
+	flag.IntVar(&cfg.MaxDepth, "d", DefaultMaxDepth, "Max recursion depth")
+	flag.IntVar(&cfg.MaxSizeMB, "s", DefaultMaxSizeMB, "Max download size per resource in MB (0=unlimited)")
 	flag.IntVar(&cfg.Workers, "w", 5, "Concurrent download workers")
+	flag.BoolVar(&cfg.AuditPrep, "audit-prep", false, "Recover source map sources or generate readable JavaScript (requires Node.js 18+ runtime)")
 	flag.BoolVar(&cfg.SameOrigin, "same-origin", true, "Only analyze same-origin JS")
 	flag.StringVar(&allowCDNStr, "c", "", "Allowed CDN domains (comma-separated)")
-	flag.BoolVar(&cfg.FetchSourcemap, "m", false, "Download and parse source maps")
+	flag.StringVar(&cfg.Proxy, "proxy", "", "HTTP, HTTPS, or SOCKS5 proxy URL")
 	flag.IntVar(&cfg.Timeout, "t", 15, "HTTP timeout in seconds")
 	flag.StringVar(&cfg.UserAgent, "a", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Custom User-Agent")
 	flag.StringVar(&cfg.Cookies, "k", "", "Optional cookie string")
 	flag.StringVar(&headersStr, "H", "", "Extra headers (Header1=Value1;Header2=Value2)")
-	flag.BoolVar(&cfg.Beautify, "b", false, "Beautify JS with js-beautify (must be installed)")
 	flag.BoolVar(&cfg.Verbose, "v", false, "Print verbose logs")
-	flag.BoolVar(&cfg.InsecureSkipVerify, "insecure-skip-verify", false, "Skip TLS certificate verification for HTTPS requests and headless Chrome")
+	flag.BoolVar(&cfg.InsecureSkipVerify, "insecure", false, "Skip TLS certificate verification for requests and headless Chrome")
 
 	flag.Parse()
-
 	if cfg.URL == "" && cfg.URLList == "" {
 		fmt.Fprintln(os.Stderr, "Error: provide at least one of -u or -l")
 		flag.Usage()
@@ -92,6 +115,39 @@ func Parse() *Config {
 	}
 
 	return cfg
+}
+
+// NormalizeProxy validates a proxy value and adds an HTTP scheme when omitted.
+func NormalizeProxy(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+
+	proxyURL, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	switch strings.ToLower(proxyURL.Scheme) {
+	case "http", "https", "socks5":
+	default:
+		return "", fmt.Errorf("unsupported proxy scheme %q", proxyURL.Scheme)
+	}
+	if proxyURL.Host == "" {
+		return "", fmt.Errorf("invalid proxy URL: missing host")
+	}
+	if proxyURL.RawQuery != "" || proxyURL.Fragment != "" {
+		return "", fmt.Errorf("invalid proxy URL: query strings and fragments are not supported")
+	}
+	if proxyURL.Path != "" && proxyURL.Path != "/" {
+		return "", fmt.Errorf("invalid proxy URL: paths are not supported")
+	}
+	proxyURL.Path = ""
+
+	return proxyURL.String(), nil
 }
 
 // URLs returns the list of URLs to analyze (merges -u and -l)

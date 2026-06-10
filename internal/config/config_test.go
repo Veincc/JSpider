@@ -117,9 +117,69 @@ func TestHeadlessCanBeSet(t *testing.T) {
 	}
 }
 
+func TestAuditPrepDefaultFalse(t *testing.T) {
+	cfg := &Config{}
+	if cfg.AuditPrep {
+		t.Errorf("zero-value Config.AuditPrep = %v, want false", cfg.AuditPrep)
+	}
+}
+
+func TestAuditPrepCanBeSet(t *testing.T) {
+	cfg := &Config{AuditPrep: true}
+	if !cfg.AuditPrep {
+		t.Error("Config.AuditPrep should be true after setting")
+	}
+}
+
 func TestInsecureSkipVerifyDefaultFalse(t *testing.T) {
 	cfg := &Config{}
 	if cfg.InsecureSkipVerify {
 		t.Errorf("zero-value Config.InsecureSkipVerify = %v, want false", cfg.InsecureSkipVerify)
+	}
+}
+
+func TestDefaultLimits(t *testing.T) {
+	if DefaultMaxDepth != 10 {
+		t.Fatalf("DefaultMaxDepth = %d, want 10", DefaultMaxDepth)
+	}
+	if DefaultMaxSizeMB != 0 {
+		t.Fatalf("DefaultMaxSizeMB = %d, want 0", DefaultMaxSizeMB)
+	}
+}
+
+func TestNormalizeProxy(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty", input: "", want: ""},
+		{name: "default HTTP scheme", input: "127.0.0.1:8080", want: "http://127.0.0.1:8080"},
+		{name: "HTTP", input: "http://proxy.example:8080", want: "http://proxy.example:8080"},
+		{name: "HTTPS", input: "https://proxy.example:8443", want: "https://proxy.example:8443"},
+		{name: "SOCKS5", input: "socks5://127.0.0.1:1080", want: "socks5://127.0.0.1:1080"},
+		{name: "unsupported scheme", input: "ftp://proxy.example:21", wantErr: true},
+		{name: "missing host", input: "http://", wantErr: true},
+		{name: "path rejected", input: "http://proxy.example/path", wantErr: true},
+		{name: "query rejected", input: "http://proxy.example?x=1", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NormalizeProxy(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("NormalizeProxy(%q) returned no error", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("NormalizeProxy(%q) error = %v", tt.input, err)
+			}
+			if got != tt.want {
+				t.Fatalf("NormalizeProxy(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }

@@ -1,233 +1,150 @@
 # JSpider
 
-JSpider is a command-line tool for discovering JavaScript assets from modern web applications. It starts from one or more entry URLs, extracts JavaScript references from HTML, downloads confirmed JavaScript resources, analyzes them for additional chunks and route-related imports, and writes deterministic output files for review.
+JSpider discovers and downloads JavaScript used by modern web applications.
 
-The default mode is static analysis. The optional `--headless` flag adds Chrome/Chromium-based browser discovery for applications that load scripts after page execution.
+It has two modes:
 
-## Core Capabilities
-
-- Extracts entry JavaScript from `<script src>`, `modulepreload`, script preloads, prefetches, and selected inline script references.
-- Downloads JavaScript with configurable timeout, worker count, per-file size limit, custom headers, cookies, User-Agent, and optional TLS certificate verification bypass.
-- Handles gzip, deflate, and Brotli responses with decompressed-size protection.
-- Identifies JavaScript by URL path, Content-Type, and conservative content sniffing for extensionless resources.
-- Analyzes JavaScript for dynamic `import(...)`, route-to-chunk hints, source maps, and framework-specific patterns.
-- Includes analyzers for common Vite, Webpack, Next.js, Nuxt, Angular, and generic bundled JavaScript patterns.
-- Deduplicates URLs globally across entry points and writes stable, sorted result files.
-
-## Static Analysis Default
-
-Static analysis is always enabled and is the default behavior:
-
-```bash
-jspider -u https://example.com
-```
-
-In this mode JSpider downloads the entry HTML, extracts JavaScript references visible in the HTML, downloads JavaScript resources that pass the configured origin policy, and recursively analyzes discovered JavaScript up to the configured depth and count limits.
-
-Static analysis does not execute page JavaScript. It is safer and more predictable than browser-assisted discovery, but it may miss scripts that are injected only after client-side rendering, interaction, or API responses.
-
-## Headless Discovery
-
-Use `--headless` to add Chrome/Chromium-based discovery:
-
-```bash
-jspider -u https://example.com --headless
-```
-
-When enabled, JSpider starts a headless Chrome/Chromium session, observes script network requests and JavaScript Content-Type responses, extracts script references from the rendered DOM, scrolls the page, and performs a limited number of cautious clicks on same-origin, non-dangerous elements.
-
-Requirements and boundaries:
-
-- Chrome or Chromium must be installed and available in `PATH`.
-- Discovery is bounded by the configured timeout and may return partial results when pages load slowly.
-- Some applications require authentication, feature flags, anti-bot checks, consent flows, or user interaction that JSpider cannot safely complete.
-- Browser execution can trigger page-side requests and limited same-origin clicks. Use it only against systems where you have authorization.
-- JSpider deliberately skips elements that look state-changing, such as logout, delete, submit, save, pay, purchase, unsubscribe, approve, accept, or confirm actions. This is a safety guard, not a guarantee.
+- Normal mode recursively downloads JavaScript and saves the original files.
+- Audit preparation mode recovers application source code from source maps when possible, otherwise it generates a readable statically simplified bundle.
 
 ## Installation
 
-Install with Go:
+Install the latest version:
 
 ```bash
 go install github.com/Veincc/JSpider/cmd/jspider@latest
 ```
 
-Build from source:
+Or build from the repository:
 
 ```bash
 go build -o jspider ./cmd/jspider
 ```
 
-Run the built binary:
+Normal mode is Go-only. Audit preparation requires Node.js 18 or newer in `PATH`. The Node helper and its dependencies are embedded in the JSpider binary; users do not need to run `npm install`.
 
-```bash
-./jspider -u https://example.com
-```
-
-Or run directly with Go:
-
-```bash
-go run ./cmd/jspider -u https://example.com
-```
-
-Optional beautification requires `js-beautify`:
-
-```bash
-npm install -g js-beautify
-```
-
-## Quick Start
-
-Analyze one site with default static analysis:
+## Normal Mode
 
 ```bash
 jspider -u https://example.com
 ```
 
-Write output to a custom directory:
+Normal mode:
 
-```bash
-jspider -u https://example.com -o results
+1. Downloads the entry HTML.
+2. Finds JavaScript referenced by the page.
+3. Downloads each JavaScript file.
+4. Extracts additional import and chunk URLs needed to continue discovery.
+5. Recursively downloads those files.
+6. Saves only the entry HTML and deduplicated original JavaScript.
+
+Output:
+
+```text
+output/
+  example_com/
+    entry.html
+    js/
+      app-a1b2c3d4.js
+      chunk-e5f6a7b8.js
 ```
 
-Analyze multiple URLs from a file:
+Normal mode does not generate analysis reports, source map output, formatted copies, or audit artifacts.
+
+## Audit Preparation
 
 ```bash
-jspider -l urls.txt
+jspider -u https://example.com --audit-prep
 ```
 
-Enable browser-assisted discovery:
+Audit preparation performs the same recursive JavaScript discovery, but changes how downloaded code is saved.
+
+For each JavaScript bundle, JSpider:
+
+1. Uses its `sourceMappingURL` when present, including inline source maps.
+2. If no source map is declared, tries the adjacent `<bundle-url>.map`.
+3. If the map contains application `sourcesContent`, exports those source files.
+4. Excludes obvious dependency and bundler runtime sources such as `node_modules`, Webpack runtime code, and Vite virtual modules.
+5. If no usable application source is available, parses and regenerates the bundle as readable JavaScript while safely restoring simple static strings and wrappers.
+6. If parsing fails, saves the original bundle under `failures/`.
+
+JSpider does not execute target JavaScript, decoded strings, `eval`, `Function`, navigation, network calls, or browser-side behavior during preprocessing.
+
+Output:
+
+```text
+output/
+  example_com/
+    entry.html
+    audit/
+      sources/
+        src/
+          app.ts
+      bundles/
+        chunk-e5f6a7b8.js
+      failures/
+        broken-f1e2d3c4.js
+      manifest.json
+```
+
+Only directories that contain files are created. Successful source map recovery does not also save the compressed bundle. Generated readable bundles do not also save the original compressed file. Raw source maps are not saved.
+
+The manifest records:
+
+- Entry URL.
+- JavaScript URL.
+- Result status: `sourcemap`, `processed`, or `failed`.
+- Source map URL and source map status.
+- Final output paths.
+- Processing error when applicable.
+
+## Headless Discovery
 
 ```bash
 jspider -u https://example.com --headless
+jspider -u https://example.com --headless --audit-prep
 ```
 
-Allow a known CDN while keeping same-origin filtering enabled:
+`--headless` uses Chrome or Chromium to supplement static discovery with scripts observed at runtime. It is optional in both modes.
 
-```bash
-jspider -u https://example.com -c cdn.example.com,static.example.net
-```
+Browser discovery can trigger page-side requests and limited safe-looking interactions. Use it only against systems where you have authorization.
 
-## CLI Options
+## Options
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `-u <url>` | none | Start URL. URLs without a scheme default to `https://`. |
-| `-l <file>` | none | URL list file, one URL per line. Blank lines and `#` comments are ignored. |
+| `-u <url>` | none | Entry URL. |
+| `-l <file>` | none | File containing one entry URL per line. |
 | `-o <dir>` | `output` | Output directory. |
-| `--headless` | `false` | Enable Chrome/Chromium-based discovery in addition to static analysis. |
-| `-n <count>` | `0` | Maximum JavaScript files to analyze. `0` means unlimited. |
-| `-d <depth>` | `6` | Maximum recursive discovery depth. |
-| `-s <mb>` | `10` | Maximum compressed and decompressed download size per resource, in MB. |
+| `--audit-prep` | `false` | Recover source map sources or generate readable JavaScript. |
+| `--headless` | `false` | Add Chrome or Chromium browser discovery. |
+| `-n <count>` | unlimited | Maximum JavaScript files processed across the run. |
+| `-d <depth>` | `10` | Maximum recursive discovery depth. |
+| `-s <mb>` | unlimited | Maximum compressed and decompressed resource size; `0` disables the limit. |
 | `-w <workers>` | `5` | Concurrent download workers. |
-| `--same-origin` | `true` | Restrict analysis to the entry origin plus domains allowed with `-c`. Use `--same-origin=false` to disable. |
-| `-c <domains>` | none | Comma-separated allowed CDN or static asset domains. Subdomains are allowed. |
-| `-m` | `false` | Download and parse discovered source maps. |
-| `-t <seconds>` | `15` | HTTP request timeout and `--headless` discovery budget. |
+| `--same-origin` | `true` | Restrict discovery to the entry origin and allowed CDN domains. |
+| `-c <domains>` | none | Comma-separated allowed CDN domains. |
+| `--proxy <url>` | none | HTTP, HTTPS, or SOCKS5 proxy used by requests and headless Chrome. |
+| `-t <seconds>` | `15` | HTTP timeout. |
 | `-a <ua>` | Chrome-like UA | Custom User-Agent. |
-| `-k <cookie>` | none | Optional Cookie header value. |
+| `-k <cookie>` | none | Cookie header value. |
 | `-H <headers>` | none | Extra headers as `Header1=Value1;Header2=Value2`. |
-| `-b` | `false` | Beautify saved JavaScript with `js-beautify` when installed. |
-| `-v` | `false` | Enable verbose logs. |
-| `--insecure-skip-verify` | `false` | Skip TLS certificate verification for HTTPS requests and headless Chrome. Use only for authorized testing of hosts with self-signed or otherwise invalid certificates. |
+| `-v` | `false` | Print verbose logs. |
+| `--insecure` | `false` | Disable TLS certificate verification. Use only for authorized testing. |
 
-## Output Files
+At least one of `-u` or `-l` is required.
 
-JSpider writes results under the configured output directory:
+## Output Rules
 
-| Path | Description |
-| --- | --- |
-| `js.txt` | Sorted list of confirmed and candidate JavaScript URLs. |
-| `dynamic_imports.json` | Extracted dynamic import records, including resolved URLs when available. |
-| `route_chunk_map.json` | Route and component hints associated with lazy chunks. |
-| `sourcemaps.txt` | Source map discovery and parsing status. |
-| `framework_detect.json` | Framework detection results and supporting reasons. |
-| `analysis_errors.log` | Download and analysis errors captured during execution. |
-| `<domain>/entry.html` | Raw entry HTML saved per entry domain. |
-| `<domain>/*.js` | Downloaded JavaScript bodies, optionally beautified. |
-| `<domain>/*.map` | Downloaded source maps when `-m` is enabled. |
+- Files discovered through an allowed CDN are stored under the entry site's directory.
+- Identical JavaScript content is saved once per entry site.
+- Multiple entry sites receive separate self-contained directories.
+- Starting a new run resets each affected site directory so normal and audit outputs do not mix.
+- Legacy top-level report files and the old audit directory are removed when a run starts.
 
-## Examples
+## Development
 
-Static analysis with a hard JavaScript count limit:
-
-```bash
-jspider -u https://example.com -n 100
-```
-
-Use cookies and a custom header:
-
-```bash
-jspider -u https://example.com -k "session=SESSION_VALUE" -H "X-Test=1;Accept-Language=en-US"
-```
-
-Increase recursion depth and workers:
-
-```bash
-jspider -u https://example.com -d 8 -w 10
-```
-
-Fetch source maps and beautify saved JavaScript:
-
-```bash
-jspider -u https://example.com -m -b
-```
-
-Disable same-origin filtering:
-
-```bash
-jspider -u https://example.com --same-origin=false
-```
-
-Analyze an authorized host with an invalid or self-signed TLS certificate:
-
-```bash
-jspider -u https://example.com --insecure-skip-verify
-```
-
-## How It Works
-
-1. Parse CLI options and normalize entry URLs.
-2. Download entry HTML and save it under the output directory.
-3. Extract static JavaScript references from HTML tags and inline script strings.
-4. Optionally run `--headless` discovery and merge browser-discovered assets.
-5. Apply same-origin and allowed-CDN policy.
-6. Download JavaScript resources concurrently with caching and in-flight request deduplication.
-7. Validate HTTP status, size limits, decompression limits, and JavaScript identity.
-8. Save JavaScript bodies and analyze imports, chunks, routes, frameworks, and source maps.
-9. Queue newly discovered JavaScript until depth or count limits are reached.
-10. Write deterministic result files.
-
-## Limits And Known Boundaries
-
-- Static analysis cannot see scripts created only after page execution.
-- `--headless` discovery is best-effort and bounded by timeout, browser availability, site behavior, certificate validation, and safe interaction rules.
-- JavaScript parsing combines framework heuristics, regex extraction, and AST analysis; minified or obfuscated bundles may still hide relationships.
-- Dynamic import expressions with variables, template expressions, import maps, or bare module specifiers may be recorded without a resolved URL.
-- Same-origin matching is scheme and host exact for the entry origin. Allowed CDN entries match the specified domain and its subdomains.
-- Content sniffing is intentionally conservative. Extensionless JavaScript can be missed if it lacks recognizable JavaScript indicators.
-- Duplicate content is saved once by content hash, even if multiple URLs return identical bodies.
-- JSpider does not authenticate, solve challenges, bypass access controls, or guarantee complete asset coverage.
-
-## Authorized Use
-
-Use JSpider only on applications and infrastructure you own or are explicitly authorized to assess. The tool downloads resources, may send authenticated headers or cookies when configured, and can run a browser session with limited interaction when `--headless` is enabled. You are responsible for complying with applicable laws, contracts, rules of engagement, and site policies.
-
-## Development And Testing
-
-Run the test suite:
-
-```bash
-go test ./...
-```
-
-Build the CLI:
-
-```bash
-go build -o jspider ./cmd/jspider
-```
-
-Optional checks before release:
+Run the Go checks:
 
 ```bash
 go test ./...
@@ -235,8 +152,12 @@ go build ./...
 go vet ./...
 ```
 
-The headless integration test is opt-in because it requires Chrome/Chromium and network/browser behavior:
+Rebuild the embedded audit helper after editing `tools/js-audit-prep/src/worker.js`:
 
 ```bash
-JSPIDER_HEADLESS_TEST=1 go test ./internal/headless
+cd tools/js-audit-prep
+npm ci
+npm run build
 ```
+
+The build writes the bundled helper to `internal/preprocess/audit-prep.cjs`.

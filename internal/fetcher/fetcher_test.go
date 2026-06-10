@@ -3,6 +3,7 @@ package fetcher
 import (
 	"compress/gzip"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,7 +25,11 @@ func newTestFetcher(t *testing.T, ts *httptest.Server) *Fetcher {
 	}
 	log := logging.New(false, t.TempDir())
 	t.Cleanup(func() { log.Close() })
-	return New(cfg, log)
+	f, err := New(cfg, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return f
 }
 
 func TestFetch_CacheHit(t *testing.T) {
@@ -161,7 +166,10 @@ func TestFetch_DecompressionSizeLimit(t *testing.T) {
 	}
 	log := logging.New(false, t.TempDir())
 	defer log.Close()
-	f := New(cfg, log)
+	f, err := New(cfg, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
 
 	r := f.Fetch(ts.URL + "/big.js")
 	if r.Err == nil {
@@ -274,7 +282,10 @@ func TestFetch_InsecureSkipVerifyAllowsSelfSigned(t *testing.T) {
 	}
 	log := logging.New(false, t.TempDir())
 	defer log.Close()
-	f := New(cfg, log)
+	f, err := New(cfg, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
 
 	r := f.Fetch(ts.URL + "/app.js")
 	if r.Err != nil {
@@ -282,5 +293,85 @@ func TestFetch_InsecureSkipVerifyAllowsSelfSigned(t *testing.T) {
 	}
 	if string(r.Body) != "const ok = true;" {
 		t.Errorf("Body: got %q", r.Body)
+	}
+}
+
+func TestFetch_UnlimitedSize(t *testing.T) {
+	body := strings.Repeat("x", 2*1024*1024)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = io.WriteString(w, body)
+	}))
+	defer ts.Close()
+
+	cfg := &config.Config{
+		Timeout:   5,
+		MaxSizeMB: 0,
+		UserAgent: "Test/1.0",
+	}
+	log := logging.New(false, t.TempDir())
+	defer log.Close()
+	f, err := New(cfg, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	result := f.Fetch(ts.URL + "/large.js")
+	if result.Err != nil {
+		t.Fatalf("Fetch() error = %v", result.Err)
+	}
+	if len(result.Body) != len(body) {
+		t.Fatalf("body length = %d, want %d", len(result.Body), len(body))
+	}
+}
+
+func TestFetch_UsesConfiguredProxy(t *testing.T) {
+	var proxyRequests int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&proxyRequests, 1)
+		if !r.URL.IsAbs() {
+			t.Errorf("proxy request URL is not absolute: %s", r.URL)
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = io.WriteString(w, "const proxied = true;")
+	}))
+	defer proxy.Close()
+
+	cfg := &config.Config{
+		Timeout:   5,
+		MaxSizeMB: 0,
+		UserAgent: "Test/1.0",
+		Proxy:     proxy.URL,
+	}
+	log := logging.New(false, t.TempDir())
+	defer log.Close()
+	f, err := New(cfg, log)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	result := f.Fetch("http://target.invalid/app.js")
+	if result.Err != nil {
+		t.Fatalf("Fetch() error = %v", result.Err)
+	}
+	if got := atomic.LoadInt32(&proxyRequests); got != 1 {
+		t.Fatalf("proxy request count = %d, want 1", got)
+	}
+	if string(result.Body) != "const proxied = true;" {
+		t.Fatalf("body = %q", result.Body)
+	}
+}
+
+func TestNewRejectsInvalidProxy(t *testing.T) {
+	cfg := &config.Config{
+		Timeout:   5,
+		UserAgent: "Test/1.0",
+		Proxy:     "ftp://proxy.example:21",
+	}
+	log := logging.New(false, t.TempDir())
+	defer log.Close()
+
+	if _, err := New(cfg, log); err == nil {
+		t.Fatal("New() returned no error for an unsupported proxy scheme")
 	}
 }

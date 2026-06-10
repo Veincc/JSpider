@@ -36,6 +36,21 @@ func NewAnalyzer(log *logging.Logger) *Analyzer {
 	}
 }
 
+// DiscoverJS returns only JavaScript resources needed to continue the crawl.
+func (a *Analyzer) DiscoverJS(jsContent string, jsURL string) []JSAsset {
+	result := a.AnalyzeJS(jsContent, jsURL, "", 0)
+	seen := make(map[string]bool)
+	assets := make([]JSAsset, 0, len(result.NewURLs))
+	for _, asset := range result.NewURLs {
+		if asset.URL == "" || seen[asset.URL] {
+			continue
+		}
+		seen[asset.URL] = true
+		assets = append(assets, asset)
+	}
+	return assets
+}
+
 // AnalyzeJS analyzes a single JS file
 func (a *Analyzer) AnalyzeJS(jsContent string, jsURL string, fromURL string, depth int) *AnalysisResult {
 	// 1. Framework detection

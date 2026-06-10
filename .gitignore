@@ -2,6 +2,7 @@
 /jspider
 /cmd/jspider/jspider
 *.test
+/tools/js-audit-prep/node_modules/
 
 # Output directories and scan artifacts
 /output/
