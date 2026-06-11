@@ -1,11 +1,17 @@
 # JSpider
 
-JSpider discovers and downloads JavaScript used by modern web applications.
+JSpider is a command-line tool for recursively discovering and downloading JavaScript used by modern web applications.
 
-It has two modes:
+Starting from one or more entry URLs, JSpider:
 
-- Normal mode recursively downloads JavaScript and saves the original files.
-- Audit preparation mode recovers application source code from source maps when possible, otherwise it generates a readable statically simplified bundle.
+1. Downloads the entry HTML.
+2. Extracts referenced JavaScript.
+3. Downloads each JavaScript file.
+4. Discovers additional imports, chunks, and JavaScript URLs.
+5. Continues recursively until the queue is empty or a configured limit is reached.
+6. Saves the entry HTML and deduplicated JavaScript files.
+
+Optional flags can add browser-assisted discovery or prepare downloaded code for static security review.
 
 ## Installation
 
@@ -21,22 +27,13 @@ Or build from the repository:
 go build -o jspider ./cmd/jspider
 ```
 
-Normal mode is Go-only. Audit preparation requires Node.js 18 or newer in `PATH`. The Node helper and its dependencies are embedded in the JSpider binary; users do not need to run `npm install`.
+The standard crawler is Go-only. The optional `--audit-prep` feature requires Node.js 18 or newer in `PATH`. Its helper and dependencies are embedded in the JSpider binary, so users do not need to run `npm install`.
 
-## Normal Mode
+## Quick Start
 
 ```bash
 jspider -u https://example.com
 ```
-
-Normal mode:
-
-1. Downloads the entry HTML.
-2. Finds JavaScript referenced by the page.
-3. Downloads each JavaScript file.
-4. Extracts additional import and chunk URLs needed to continue discovery.
-5. Recursively downloads those files.
-6. Saves only the entry HTML and deduplicated original JavaScript.
 
 Output:
 
@@ -49,15 +46,35 @@ output/
       chunk-e5f6a7b8.js
 ```
 
-Normal mode does not generate analysis reports, source map output, formatted copies, or audit artifacts.
+Analyze multiple entry URLs:
+
+```bash
+jspider -l urls.txt
+```
+
+Allow known CDN domains:
+
+```bash
+jspider -u https://example.com -c cdn.example.com,static.example.net
+```
+
+Use an HTTP, HTTPS, or SOCKS5 proxy:
+
+```bash
+jspider -u https://example.com --proxy http://127.0.0.1:8080
+```
+
+By default, JSpider saves only the entry HTML and downloaded JavaScript. It does not generate analysis reports, source map files, or formatted copies.
 
 ## Audit Preparation
+
+Use `--audit-prep` when the downloaded JavaScript will be reviewed by a security auditor or analysis agent:
 
 ```bash
 jspider -u https://example.com --audit-prep
 ```
 
-Audit preparation performs the same recursive JavaScript discovery, but changes how downloaded code is saved.
+This option keeps the same recursive discovery process but changes the saved JavaScript output.
 
 For each JavaScript bundle, JSpider:
 
@@ -105,7 +122,7 @@ jspider -u https://example.com --headless
 jspider -u https://example.com --headless --audit-prep
 ```
 
-`--headless` uses Chrome or Chromium to supplement static discovery with scripts observed at runtime. It is optional in both modes.
+`--headless` uses Chrome or Chromium to supplement static discovery with scripts observed at runtime.
 
 Browser discovery can trigger page-side requests and limited safe-looking interactions. Use it only against systems where you have authorization.
 
@@ -143,7 +160,7 @@ The previous `--insecure-skip-verify` option remains accepted as a deprecated co
 - Files discovered through an allowed CDN are stored under the entry site's directory.
 - Identical JavaScript content is saved once per entry site.
 - Multiple entry sites receive separate self-contained directories.
-- Starting a new run resets each affected site directory so normal and audit outputs do not mix.
+- Starting a new run resets each affected site directory so previous crawler and audit-preparation outputs do not mix.
 - Legacy top-level report files and the old audit directory are removed when a run starts.
 
 ## Development
