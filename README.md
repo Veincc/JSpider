@@ -134,6 +134,10 @@ Browser discovery can trigger page-side requests and limited safe-looking intera
 
 At least one of `-u` or `-l` is required.
 
+Resources are read into memory. The default `-s 0` is unlimited; set an explicit size limit when scanning untrusted or potentially large endpoints.
+
+The previous `--insecure-skip-verify` option remains accepted as a deprecated compatibility alias for `--insecure`.
+
 ## Output Rules
 
 - Files discovered through an allowed CDN are stored under the entry site's directory.

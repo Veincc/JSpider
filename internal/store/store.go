@@ -3,15 +3,13 @@ package store
 import (
 	"crypto/sha256"
 	"fmt"
-	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
+	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
 type Store struct {
@@ -59,7 +57,7 @@ func mergeJSAsset(existing, incoming *analyzer.JSAsset) *analyzer.JSAsset {
 	if incoming.Source != "" && merged.Source == analyzer.SourceRegexCandidate {
 		merged.Source = incoming.Source
 	}
-	if incoming.Depth < merged.Depth || merged.Depth == 0 {
+	if incoming.Depth < merged.Depth {
 		merged.Depth = incoming.Depth
 	}
 	if incoming.ContentType != "" {
@@ -113,21 +111,20 @@ func (s *Store) SaveJS(site, sourceURL string, data []byte) (string, bool, error
 	key := site + "\x00" + hash
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if existing, ok := s.contentHashes[key]; ok {
-		s.mu.Unlock()
 		return existing, false, nil
 	}
-	rel := filepath.ToSlash(filepath.Join(site, "js", artifactFilename(sourceURL, ".js")))
-	s.contentHashes[key] = rel
-	s.mu.Unlock()
+	rel := filepath.ToSlash(filepath.Join(site, "js", urlutil.ArtifactFilename(sourceURL, ".js", "script")))
 
 	fullPath := filepath.Join(s.outDir, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		return "", false, err
 	}
-	if err := os.WriteFile(fullPath, data, 0644); err != nil {
+	if err := writeFileAtomic(fullPath, data, 0644); err != nil {
 		return "", false, err
 	}
+	s.contentHashes[key] = rel
 	return rel, true, nil
 }
 
@@ -136,44 +133,24 @@ func contentHash(data []byte) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
-func artifactFilename(sourceURL, fallbackExt string) string {
-	base := "script"
-	if parsed, err := url.Parse(sourceURL); err == nil {
-		if candidate := path.Base(parsed.Path); candidate != "" && candidate != "." && candidate != "/" {
-			base = candidate
-		}
+func writeFileAtomic(filename string, data []byte, mode os.FileMode) error {
+	file, err := os.CreateTemp(filepath.Dir(filename), "."+filepath.Base(filename)+".tmp-*")
+	if err != nil {
+		return err
 	}
-	ext := path.Ext(base)
-	if ext == "" {
-		ext = fallbackExt
-	}
-	stem := strings.TrimSuffix(base, path.Ext(base))
-	stem = sanitizeName(stem)
-	if stem == "" {
-		stem = "script"
-	}
-	if len(stem) > 64 {
-		stem = stem[:64]
-	}
-	sum := sha256.Sum256([]byte(sourceURL))
-	return fmt.Sprintf("%s-%x%s", stem, sum[:4], ext)
-}
+	tempName := file.Name()
+	defer os.Remove(tempName)
 
-func sanitizeName(value string) string {
-	var b strings.Builder
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r == '-', r == '_', r == '.':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
+	if err := file.Chmod(mode); err != nil {
+		_ = file.Close()
+		return err
 	}
-	return strings.Trim(b.String(), "._")
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, filename)
 }

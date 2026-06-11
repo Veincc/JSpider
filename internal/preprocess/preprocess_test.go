@@ -44,6 +44,24 @@ func TestExternalSourceMapRecoversApplicationSources(t *testing.T) {
 	assertMissing(t, filepath.Join(siteDir, "audit", "failures"))
 }
 
+func TestExtractSourceMapReferenceAllowsAsterisk(t *testing.T) {
+	source := `console.log(1);
+//# sourceMappingURL=https://cdn.example/assets/v2*beta/app.js.map`
+	want := "https://cdn.example/assets/v2*beta/app.js.map"
+	if got := extractSourceMapReference(source); got != want {
+		t.Fatalf("extractSourceMapReference() = %q, want %q", got, want)
+	}
+}
+
+func TestExtractSourceMapReferenceTrimsBlockComment(t *testing.T) {
+	source := `console.log(1);
+/*# sourceMappingURL=maps/app*beta.js.map */`
+	want := "maps/app*beta.js.map"
+	if got := extractSourceMapReference(source); got != want {
+		t.Fatalf("extractSourceMapReference() = %q, want %q", got, want)
+	}
+}
+
 func TestInlineAndIndexedSourceMaps(t *testing.T) {
 	if err := CheckNodeRuntime(); err != nil {
 		t.Skip(err)

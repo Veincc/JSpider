@@ -33,6 +33,23 @@ type fetchRes struct {
 	result *fetcher.Result
 }
 
+type crawlState struct {
+	queued    map[string]bool
+	processed map[string]bool
+}
+
+func crawlStateForSite(states map[string]*crawlState, site string) *crawlState {
+	state := states[site]
+	if state == nil {
+		state = &crawlState{
+			queued:    make(map[string]bool),
+			processed: make(map[string]bool),
+		}
+		states[site] = state
+	}
+	return state
+}
+
 func buildHeadlessConfig(cfg *config.Config, entryURL string) *headless.Config {
 	return &headless.Config{
 		EntryURL:           entryURL,
@@ -55,12 +72,6 @@ func main() {
 }
 
 func run(cfg *config.Config) error {
-	proxy, err := config.NormalizeProxy(cfg.Proxy)
-	if err != nil {
-		return err
-	}
-	cfg.Proxy = proxy
-
 	if err := os.MkdirAll(cfg.OutDir, 0755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
@@ -94,6 +105,7 @@ func run(cfg *config.Config) error {
 
 	initializedSites := make(map[string]bool)
 	processors := make(map[string]*preprocess.Processor)
+	states := make(map[string]*crawlState)
 	defer func() {
 		for _, processor := range processors {
 			_ = processor.Close()
@@ -137,17 +149,17 @@ func run(cfg *config.Config) error {
 			}
 		}
 
-		queued := make(map[string]bool)
-		processed := make(map[string]bool)
+		state := crawlStateForSite(states, site)
 		log.Info("[%d/%d] Analyzing: %s", i+1, len(urls), entryURL)
-		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, entryURL, queued, processed, &totalAnalyzed)
+		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, entryURL, state.queued, state.processed, &totalAnalyzed)
 		log.Info("[%d/%d] Done: %s (analyzed %d JS)", i+1, len(urls), entryURL, analyzed)
 	}
 
-	for _, prep := range processors {
+	for site, prep := range processors {
 		if err := prep.Save(); err != nil {
 			return fmt.Errorf("save audit manifest: %w", err)
 		}
+		delete(processors, site)
 		if err := prep.Close(); err != nil {
 			return fmt.Errorf("close audit-prep worker: %w", err)
 		}

@@ -39,6 +39,7 @@ func Parse() *Config {
 	cfg := &Config{}
 	var allowCDNStr string
 	var headersStr string
+	var deprecatedInsecure bool
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "JSpider - Frontend JS Asset Discovery Tool\n\n")
@@ -87,8 +88,13 @@ func Parse() *Config {
 	flag.StringVar(&headersStr, "H", "", "Extra headers (Header1=Value1;Header2=Value2)")
 	flag.BoolVar(&cfg.Verbose, "v", false, "Print verbose logs")
 	flag.BoolVar(&cfg.InsecureSkipVerify, "insecure", false, "Skip TLS certificate verification for requests and headless Chrome")
+	flag.BoolVar(&deprecatedInsecure, "insecure-skip-verify", false, "Deprecated alias for --insecure")
 
 	flag.Parse()
+	if deprecatedInsecure {
+		cfg.InsecureSkipVerify = true
+		fmt.Fprintln(os.Stderr, "Warning: --insecure-skip-verify is deprecated; use --insecure")
+	}
 	if cfg.URL == "" && cfg.URLList == "" {
 		fmt.Fprintln(os.Stderr, "Error: provide at least one of -u or -l")
 		flag.Usage()

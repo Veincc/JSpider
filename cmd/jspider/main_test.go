@@ -10,8 +10,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Veincc/JSpider/internal/analyzer"
 	"github.com/Veincc/JSpider/internal/config"
+	"github.com/Veincc/JSpider/internal/fetcher"
+	"github.com/Veincc/JSpider/internal/logging"
 	"github.com/Veincc/JSpider/internal/preprocess"
+	"github.com/Veincc/JSpider/internal/store"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
@@ -215,6 +219,92 @@ func TestRunRemovesLegacyAndPreviousModeOutputs(t *testing.T) {
 	assertPathMissing(t, filepath.Join(outDir, site, "audit"))
 }
 
+func TestMaxJSPrecisionLimit(t *testing.T) {
+	cfg, s, a, log := analysisHarness(t)
+	cfg.MaxJS = 2
+	queued := make(map[string]bool)
+	processed := make(map[string]bool)
+	var queue []fetchReq
+	analyzed := 0
+	total := 0
+
+	for _, name := range []string{"a.js", "b.js", "c.js"} {
+		analyzeResult(cfg, s, a, log, successfulFetch(name, `console.log("ok");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
+	}
+
+	if total != 2 {
+		t.Fatalf("total analyzed = %d, want 2", total)
+	}
+	if got := len(s.GetConfirmedURLs()); got != 2 {
+		t.Fatalf("confirmed JavaScript = %d, want 2", got)
+	}
+}
+
+func TestMaxDepthLimit(t *testing.T) {
+	cfg, s, a, log := analysisHarness(t)
+	cfg.MaxDepth = 1
+	queued := map[string]bool{"https://example.com/a.js": true}
+	processed := make(map[string]bool)
+	var queue []fetchReq
+	analyzed := 0
+	total := 0
+
+	result := successfulFetch("a.js", `import("./b.js");`)
+	result.req.depth = 1
+	analyzeResult(cfg, s, a, log, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
+
+	if len(queue) != 0 {
+		t.Fatalf("queued items = %d, want 0 beyond depth limit", len(queue))
+	}
+	if total != 1 {
+		t.Fatalf("total analyzed = %d, want 1", total)
+	}
+}
+
+func TestCircularImportIsProcessedOnce(t *testing.T) {
+	cfg, s, a, log := analysisHarness(t)
+	cfg.MaxDepth = 5
+	queued := map[string]bool{"https://example.com/a.js": true}
+	processed := make(map[string]bool)
+	var queue []fetchReq
+	analyzed := 0
+	total := 0
+
+	analyzeResult(cfg, s, a, log, successfulFetch("a.js", `import("./b.js");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
+	if len(queue) != 1 || queue[0].url != "https://example.com/b.js" {
+		t.Fatalf("queue after a.js = %+v", queue)
+	}
+
+	next := queue[0]
+	queue = nil
+	result := successfulFetch("b.js", `import("./a.js");`)
+	result.req = next
+	analyzeResult(cfg, s, a, log, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
+
+	if len(queue) != 0 {
+		t.Fatalf("queue after circular import = %+v, want empty", queue)
+	}
+	if total != 2 {
+		t.Fatalf("total analyzed = %d, want 2", total)
+	}
+}
+
+func TestCrawlStateIsSharedWithinSiteOnly(t *testing.T) {
+	states := make(map[string]*crawlState)
+	first := crawlStateForSite(states, "example_com")
+	first.processed["https://cdn.example/app.js"] = true
+
+	sameSite := crawlStateForSite(states, "example_com")
+	if !sameSite.processed["https://cdn.example/app.js"] {
+		t.Fatal("same-site entries did not share processed state")
+	}
+
+	otherSite := crawlStateForSite(states, "other_com")
+	if otherSite.processed["https://cdn.example/app.js"] {
+		t.Fatal("different sites unexpectedly shared processed state")
+	}
+}
+
 func TestCLIAndDocumentationRemoveLegacyFlagsAndReports(t *testing.T) {
 	configSource, err := os.ReadFile(filepath.Join("..", "..", "internal", "config", "config.go"))
 	if err != nil {
@@ -224,7 +314,6 @@ func TestCLIAndDocumentationRemoveLegacyFlagsAndReports(t *testing.T) {
 	for _, removed := range []string{
 		`"m"`,
 		`"b"`,
-		`"insecure-skip-verify"`,
 		"FetchSourcemap",
 		"AuditPrepAlias",
 	} {
@@ -248,13 +337,18 @@ func TestCLIAndDocumentationRemoveLegacyFlagsAndReports(t *testing.T) {
 		"transform_log.json",
 		"`-m`",
 		"`-b`",
-		"`--insecure-skip-verify`",
 	} {
 		if strings.Contains(readmeText, removed) {
 			t.Fatalf("README still contains removed output or flag %q", removed)
 		}
 	}
-	for _, required := range []string{"`--insecure`", "`--proxy <url>`", "| `-d <depth>` | `10`", "| `-s <mb>` | unlimited"} {
+	for _, required := range []string{
+		"`--insecure`",
+		"`--insecure-skip-verify`",
+		"`--proxy <url>`",
+		"| `-d <depth>` | `10`",
+		"| `-s <mb>` | unlimited",
+	} {
 		if !strings.Contains(readmeText, required) {
 			t.Fatalf("README is missing %q", required)
 		}
@@ -280,6 +374,29 @@ func TestBuildHeadlessConfigIncludesNetworkOptions(t *testing.T) {
 	}
 	if got.Proxy != cfg.Proxy {
 		t.Fatalf("Proxy = %q, want %q", got.Proxy, cfg.Proxy)
+	}
+}
+
+func analysisHarness(t *testing.T) (*config.Config, *store.Store, *analyzer.Analyzer, *logging.Logger) {
+	t.Helper()
+	outDir := t.TempDir()
+	cfg := testConfig("https://example.com/", outDir)
+	log := logging.New(false, outDir)
+	t.Cleanup(func() { log.Close() })
+	return cfg, store.New(outDir), analyzer.NewAnalyzer(log), log
+}
+
+func successfulFetch(name, body string) fetchRes {
+	rawURL := "https://example.com/" + name
+	return fetchRes{
+		req: fetchReq{url: rawURL, depth: 0, from: "https://example.com/"},
+		result: &fetcher.Result{
+			URL:         rawURL,
+			StatusCode:  200,
+			ContentType: "application/javascript",
+			Body:        []byte(body),
+			IsJS:        true,
+		},
 	}
 }
 

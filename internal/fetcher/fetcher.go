@@ -77,6 +77,7 @@ func New(cfg *config.Config, log *logging.Logger) (*Fetcher, error) {
 			if err != nil {
 				return nil, err
 			}
+			cfg.Proxy = normalized
 			proxyURL, err := url.Parse(normalized)
 			if err != nil {
 				return nil, fmt.Errorf("parse proxy URL: %w", err)

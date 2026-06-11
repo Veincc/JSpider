@@ -29,7 +29,7 @@ var workerBundle []byte
 const NodeRuntimeError = "--audit-prep requires Node.js runtime"
 const NodeVersionError = "--audit-prep requires Node.js 18 or newer"
 
-var sourceMapDirective = regexp.MustCompile(`(?m)(?://|/\*)[#@]\s*sourceMappingURL\s*=\s*([^\s*]+)`)
+var sourceMapDirective = regexp.MustCompile(`//[#@]\s*sourceMappingURL\s*=\s*(\S+)|(?s:/\*[#@]\s*sourceMappingURL\s*=\s*(.*?)\s*\*/)`)
 
 type FetchFunc func(rawURL string) ([]byte, error)
 
@@ -302,7 +302,11 @@ func extractSourceMapReference(source string) string {
 	if len(matches) == 0 {
 		return ""
 	}
-	return strings.TrimSpace(matches[len(matches)-1][1])
+	last := matches[len(matches)-1]
+	if last[1] != "" {
+		return strings.TrimSpace(last[1])
+	}
+	return strings.TrimSpace(last[2])
 }
 
 func adjacentMapURL(jsURL string) string {
@@ -434,7 +438,7 @@ func safeApplicationSourcePath(name string) string {
 	parts := strings.Split(clean, "/")
 	safeParts := make([]string, 0, len(parts))
 	for _, part := range parts {
-		part = sanitizePathPart(part)
+		part = urlutil.SanitizePathPart(part)
 		if part != "" && part != "." && part != ".." {
 			safeParts = append(safeParts, part)
 		}
@@ -445,31 +449,12 @@ func safeApplicationSourcePath(name string) string {
 	return path.Join(safeParts...)
 }
 
-func sanitizePathPart(value string) string {
-	var b strings.Builder
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r == '-', r == '_', r == '.':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	return strings.Trim(b.String(), "._")
-}
-
 func (p *Processor) writeSource(name string, data []byte) (string, error) {
 	return p.writeContent(filepath.ToSlash(filepath.Join("sources", filepath.FromSlash(name))), data)
 }
 
 func (p *Processor) writeGenerated(dir, sourceURL, fallbackExt string, data []byte) (string, error) {
-	return p.writeContent(filepath.ToSlash(filepath.Join(dir, artifactFilename(sourceURL, fallbackExt))), data)
+	return p.writeContent(filepath.ToSlash(filepath.Join(dir, urlutil.ArtifactFilename(sourceURL, fallbackExt, "bundle"))), data)
 }
 
 func (p *Processor) writeContent(preferredRel string, data []byte) (string, error) {
@@ -639,28 +624,6 @@ func (p *Processor) stderrString() string {
 	p.stderrMu.Lock()
 	defer p.stderrMu.Unlock()
 	return p.stderr.String()
-}
-
-func artifactFilename(sourceURL, fallbackExt string) string {
-	base := "bundle"
-	if parsed, err := url.Parse(sourceURL); err == nil {
-		if candidate := path.Base(parsed.Path); candidate != "" && candidate != "." && candidate != "/" {
-			base = candidate
-		}
-	}
-	ext := path.Ext(base)
-	if ext == "" {
-		ext = fallbackExt
-	}
-	stem := sanitizePathPart(strings.TrimSuffix(base, path.Ext(base)))
-	if stem == "" {
-		stem = "bundle"
-	}
-	if len(stem) > 64 {
-		stem = stem[:64]
-	}
-	sum := sha256.Sum256([]byte(sourceURL))
-	return fmt.Sprintf("%s-%x%s", stem, sum[:4], ext)
 }
 
 func fullHash(data []byte) string {
