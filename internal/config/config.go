@@ -19,6 +19,7 @@ type Config struct {
 	URLList            string
 	OutDir             string
 	Headless           bool // enable headless browser JS discovery
+	APIDiscovery       bool // enable static/runtime API discovery; implies headless
 	MaxJS              int
 	MaxDepth           int
 	MaxSizeMB          int
@@ -46,6 +47,7 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL>                    Static analysis (default)\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL> --headless         Static + headless browser discovery\n")
+		fmt.Fprintf(os.Stderr, "  jspider -u <URL> --api-discovery    Static API extraction + browser API observation\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL> --headless --audit-prep\n")
 		fmt.Fprintf(os.Stderr, "  jspider -l <file>                   Analyze a URL list file\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL> -w 10 -o result    Full parameter example\n\n")
@@ -54,6 +56,7 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "  -l <file>             URL list file, one URL per line\n")
 		fmt.Fprintf(os.Stderr, "  -o <dir>              Output directory (default: output)\n")
 		fmt.Fprintf(os.Stderr, "  --headless            Enable headless browser JS discovery (requires Chrome/Chromium)\n")
+		fmt.Fprintf(os.Stderr, "  --api-discovery       Extract static APIs and use Chrome to click safe elements and observe XHR/fetch/EventSource requests (requires CGO and Chrome/Chromium; implies --headless)\n")
 		fmt.Fprintf(os.Stderr, "  --audit-prep          Recover source map sources or generate readable JavaScript (requires Node.js 18+ runtime)\n")
 		fmt.Fprintf(os.Stderr, "  -n <count>            Max JS files to analyze (0=unlimited)\n")
 		fmt.Fprintf(os.Stderr, "  -d <depth>            Max recursion depth (default: 10)\n")
@@ -74,6 +77,7 @@ func Parse() *Config {
 	flag.StringVar(&cfg.URLList, "l", "", "URL list file (one URL per line)")
 	flag.StringVar(&cfg.OutDir, "o", "output", "Output directory")
 	flag.BoolVar(&cfg.Headless, "headless", false, "Enable headless browser JS discovery (requires Chrome/Chromium)")
+	flag.BoolVar(&cfg.APIDiscovery, "api-discovery", false, "Extract static APIs and observe browser API requests (requires CGO and Chrome/Chromium; implies --headless)")
 	flag.IntVar(&cfg.MaxJS, "n", 0, "Max JS files to analyze (0=unlimited)")
 	flag.IntVar(&cfg.MaxDepth, "d", DefaultMaxDepth, "Max recursion depth")
 	flag.IntVar(&cfg.MaxSizeMB, "s", DefaultMaxSizeMB, "Max download size per resource in MB (0=unlimited)")
@@ -91,6 +95,7 @@ func Parse() *Config {
 	flag.BoolVar(&deprecatedInsecure, "insecure-skip-verify", false, "Deprecated alias for --insecure")
 
 	flag.Parse()
+	ApplyModeImplications(cfg)
 	if deprecatedInsecure {
 		cfg.InsecureSkipVerify = true
 		fmt.Fprintln(os.Stderr, "Warning: --insecure-skip-verify is deprecated; use --insecure")
@@ -121,6 +126,12 @@ func Parse() *Config {
 	}
 
 	return cfg
+}
+
+func ApplyModeImplications(cfg *Config) {
+	if cfg.APIDiscovery {
+		cfg.Headless = true
+	}
 }
 
 // NormalizeProxy validates a proxy value and adds an HTTP scheme when omitted.

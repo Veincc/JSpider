@@ -11,7 +11,7 @@ Starting from one or more entry URLs, JSpider:
 5. Continues recursively until the queue is empty or a configured limit is reached.
 6. Saves the entry HTML and deduplicated JavaScript files.
 
-Optional flags can add browser-assisted discovery or prepare downloaded code for static security review.
+Optional flags can add browser-assisted discovery, correlate statically extracted APIs with browser requests, or prepare downloaded code for static security review.
 
 ## Installation
 
@@ -27,7 +27,15 @@ Or build from the repository:
 go build -o jspider ./cmd/jspider
 ```
 
-The standard crawler is Go-only. The optional `--audit-prep` feature requires Node.js 18 or newer in `PATH`. Its helper and dependencies are embedded in the JSpider binary, so users do not need to run `npm install`.
+The standard crawler and `--headless` mode are available in normal Go builds. The optional `--api-discovery` feature embeds jsluice and tree-sitter and therefore requires a CGO-enabled build:
+
+```bash
+CGO_ENABLED=1 go build -o jspider ./cmd/jspider
+```
+
+A `CGO_ENABLED=0` build still supports the existing static crawler and `--headless` JavaScript discovery. If `--api-discovery` is requested from that build, JSpider returns a clear CGO-enabled-build error.
+
+The optional `--audit-prep` feature requires Node.js 18 or newer in `PATH`. Its helper and dependencies are embedded in the JSpider binary, so users do not need to run `npm install`.
 
 ## Quick Start
 
@@ -65,6 +73,56 @@ jspider -u https://example.com --proxy http://127.0.0.1:8080
 ```
 
 By default, JSpider saves only the entry HTML and downloaded JavaScript. It does not generate analysis reports, source map files, or formatted copies.
+
+## Runtime API Discovery
+
+Use `--api-discovery` to extract API candidates from downloaded JavaScript with jsluice and correlate them with requests observed in Chrome:
+
+```bash
+jspider -u https://example.com --api-discovery
+jspider -u https://example.com --api-discovery --audit-prep
+```
+
+`--api-discovery` automatically enables the existing Headless/CDP flow; `--headless` does not automatically enable static API analysis. Chrome or Chromium must be available before the crawl starts.
+
+During API discovery JSpider:
+
+1. Completes Headless-assisted and recursive JavaScript discovery first, retaining each downloaded in-memory analysis body by source URL.
+2. Runs jsluice directly as a Go package across the complete collected JavaScript set, deterministically ordered by source URL.
+3. Removes obvious static-asset/import matches and syntax noise while preserving API-like path candidates; HTTP verbs are inferred from common minified wrapper names such as `.get`, `.postWithMsg`, and `.delete`.
+4. Enables CDP Network and Debugger domains before navigation.
+5. Records XHR, Fetch, and EventSource requests, including JavaScript initiator stacks when Chrome provides them.
+6. Records WebSocket connections separately without using them for HTTP prefix inference.
+7. Scrolls the page and clicks only the existing bounded set of safe-looking elements.
+8. Waits for XHR/Fetch activity to remain quiet for 750 ms after clicks, within the existing Headless timeout.
+9. Associates static paths with runtime paths using path-segment boundaries, methods, initiators, and parameter-name evidence.
+10. Preserves all confirmed runtime bases when more than one is supported by evidence.
+
+The browser uses the configured proxy, User-Agent, Cookie, extra headers, same-origin/CDN policy, and TLS setting. Page behavior may make requests to cross-origin APIs; those observed APIs can still be recorded and associated.
+
+JSpider does not replay requests or send additional probing requests. It never replays POST, PUT, PATCH, or DELETE requests and does not save response bodies. Browser-side page execution and safe clicks can still trigger application requests, so use this feature only on systems you are authorized to test.
+
+Sensitive request headers such as `Authorization`, `Cookie`, `Set-Cookie`, and proxy authorization are never written. Common credential and session fields are stored as `[REDACTED]`; other values are truncated.
+
+Output:
+
+```text
+output/
+  example_com/
+    runtime/
+      requests.jsonl
+    analysis/
+      static-endpoints.jsonl
+      endpoints.jsonl
+      runtime-bases.json
+```
+
+All API discovery records use schema `version: 1`. JSONL output is deterministically sorted. Files are atomically replaced with `0600` permissions.
+
+- `runtime/requests.jsonl` contains sanitized CDP requests, redirect hops, request phases, response status, failure state, and transfer size.
+- `analysis/static-endpoints.jsonl` contains jsluice results, including the original URI, method, parameters, type, source JavaScript URL, and source snippet.
+- `analysis/endpoints.jsonl` contains matched, `runtime_only`, and `static_only` endpoints plus resolved candidates derived from confirmed bases. Unobserved third-party URLs, query-only fragments, and document/example files are excluded from this correlated endpoint view; the raw jsluice evidence remains available in `static-endpoints.jsonl`.
+- `analysis/runtime-bases.json` contains candidate and confirmed origins, prefixes, runtime bases, evidence counts, and matched pairs.
 
 ## Audit Preparation
 
@@ -124,7 +182,7 @@ jspider -u https://example.com --headless --audit-prep
 
 `--headless` uses Chrome or Chromium to supplement static discovery with scripts observed at runtime.
 
-Browser discovery can trigger page-side requests and limited safe-looking interactions. Use it only against systems where you have authorization.
+Browser discovery can trigger page-side requests and limited safe-looking interactions. Use it only against systems where you have authorization. `--headless` alone preserves its previous JavaScript-discovery behavior and does not run jsluice or write API discovery reports.
 
 ## Options
 
@@ -135,6 +193,7 @@ Browser discovery can trigger page-side requests and limited safe-looking intera
 | `-o <dir>` | `output` | Output directory. |
 | `--audit-prep` | `false` | Recover source map sources or generate readable JavaScript. |
 | `--headless` | `false` | Add Chrome or Chromium browser discovery. |
+| `--api-discovery` | `false` | Extract static APIs and correlate them with browser XHR/Fetch/EventSource requests; safely clicks bounded elements, requires CGO and Chrome/Chromium, and implies `--headless`. |
 | `-n <count>` | unlimited | Maximum JavaScript files processed across the run. |
 | `-d <depth>` | `10` | Maximum recursive discovery depth. |
 | `-s <mb>` | unlimited | Maximum compressed and decompressed resource size; `0` disables the limit. |
@@ -161,6 +220,7 @@ The previous `--insecure-skip-verify` option remains accepted as a deprecated co
 - Identical JavaScript content is saved once per entry site.
 - Multiple entry sites receive separate self-contained directories.
 - Starting a new run resets each affected site directory so previous crawler and audit-preparation outputs do not mix.
+- API discovery outputs are written under each entry site's `runtime/` and `analysis/` directories.
 - Legacy top-level report files and the old audit directory are removed when a run starts.
 
 ## Development
@@ -168,8 +228,10 @@ The previous `--insecure-skip-verify` option remains accepted as a deprecated co
 Run the Go checks:
 
 ```bash
-go test ./...
-go build ./...
+CGO_ENABLED=1 go test ./...
+CGO_ENABLED=1 go build ./...
+CGO_ENABLED=0 go test ./...
+CGO_ENABLED=0 go build ./...
 go vet ./...
 ```
 

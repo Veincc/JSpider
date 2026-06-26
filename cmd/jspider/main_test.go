@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
@@ -151,6 +152,66 @@ func TestAllowedCDNJavaScriptBelongsToEntrySite(t *testing.T) {
 	assertPathMissing(t, filepath.Join(outDir, "127_0_0_1"))
 }
 
+func TestRedirectTargetMustRemainAllowedForEntry(t *testing.T) {
+	var internalHits int32
+	internalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&internalHits, 1)
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte(`console.log("metadata");`))
+	}))
+	defer internalServer.Close()
+
+	entryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<script src="/redirect.js"></script>`))
+		case "/redirect.js":
+			http.Redirect(w, r, internalServer.URL+"/metadata.js", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer entryServer.Close()
+
+	outDir := t.TempDir()
+	cfg := testConfig(entryServer.URL+"/", outDir)
+	if err := run(cfg); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&internalHits); got != 0 {
+		t.Fatalf("redirect target was fetched %d time(s), want 0", got)
+	}
+}
+
+func TestCookiesAreNotForwardedToCDNOrigins(t *testing.T) {
+	var cdnCookie atomic.Value
+	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cdnCookie.Store(r.Header.Get("Cookie"))
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte(`console.log("cdn");`))
+	}))
+	defer cdnServer.Close()
+
+	entryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprintf(w, `<script src="%s/cdn.js"></script>`, cdnServer.URL)
+	}))
+	defer entryServer.Close()
+
+	outDir := t.TempDir()
+	entryURL := strings.Replace(entryServer.URL, "127.0.0.1", "localhost", 1) + "/"
+	cfg := testConfig(entryURL, outDir)
+	cfg.AllowCDN = []string{"127.0.0.1"}
+	cfg.Cookies = "session=secret"
+	if err := run(cfg); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if got, _ := cdnCookie.Load().(string); got != "" {
+		t.Fatalf("CDN Cookie header = %q, want empty", got)
+	}
+}
+
 func TestMultipleEntrySitesAreIsolated(t *testing.T) {
 	first := newSiteServer(t, map[string]string{
 		"/":         `<script src="/first.js"></script>`,
@@ -229,7 +290,7 @@ func TestMaxJSPrecisionLimit(t *testing.T) {
 	total := 0
 
 	for _, name := range []string{"a.js", "b.js", "c.js"} {
-		analyzeResult(cfg, s, a, log, successfulFetch(name, `console.log("ok");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
+		analyzeResultForTest(cfg, s, a, log, successfulFetch(name, `console.log("ok");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
 	}
 
 	if total != 2 {
@@ -251,7 +312,7 @@ func TestMaxDepthLimit(t *testing.T) {
 
 	result := successfulFetch("a.js", `import("./b.js");`)
 	result.req.depth = 1
-	analyzeResult(cfg, s, a, log, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
+	analyzeResultForTest(cfg, s, a, log, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
 
 	if len(queue) != 0 {
 		t.Fatalf("queued items = %d, want 0 beyond depth limit", len(queue))
@@ -270,7 +331,7 @@ func TestCircularImportIsProcessedOnce(t *testing.T) {
 	analyzed := 0
 	total := 0
 
-	analyzeResult(cfg, s, a, log, successfulFetch("a.js", `import("./b.js");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
+	analyzeResultForTest(cfg, s, a, log, successfulFetch("a.js", `import("./b.js");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
 	if len(queue) != 1 || queue[0].url != "https://example.com/b.js" {
 		t.Fatalf("queue after a.js = %+v", queue)
 	}
@@ -279,7 +340,7 @@ func TestCircularImportIsProcessedOnce(t *testing.T) {
 	queue = nil
 	result := successfulFetch("b.js", `import("./a.js");`)
 	result.req = next
-	analyzeResult(cfg, s, a, log, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
+	analyzeResultForTest(cfg, s, a, log, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
 
 	if len(queue) != 0 {
 		t.Fatalf("queue after circular import = %+v, want empty", queue)
@@ -343,9 +404,14 @@ func TestCLIAndDocumentationRemoveLegacyFlagsAndReports(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
+		"`--api-discovery`",
 		"`--insecure`",
 		"`--insecure-skip-verify`",
 		"`--proxy <url>`",
+		"runtime/requests.jsonl",
+		"analysis/static-endpoints.jsonl",
+		"analysis/endpoints.jsonl",
+		"analysis/runtime-bases.json",
 		"| `-d <depth>` | `10`",
 		"| `-s <mb>` | unlimited",
 	} {
@@ -363,6 +429,10 @@ func TestBuildHeadlessConfigIncludesNetworkOptions(t *testing.T) {
 		Verbose:            true,
 		InsecureSkipVerify: true,
 		Proxy:              "socks5://127.0.0.1:1080",
+		APIDiscovery:       true,
+		UserAgent:          "JSpider-Test-UA",
+		Cookies:            "session=test",
+		Headers:            map[string]string{"X-Test": "yes"},
 	}
 
 	got := buildHeadlessConfig(cfg, "https://example.com")
@@ -374,6 +444,12 @@ func TestBuildHeadlessConfigIncludesNetworkOptions(t *testing.T) {
 	}
 	if got.Proxy != cfg.Proxy {
 		t.Fatalf("Proxy = %q, want %q", got.Proxy, cfg.Proxy)
+	}
+	if !got.CaptureAPI {
+		t.Fatal("CaptureAPI = false, want true")
+	}
+	if got.UserAgent != cfg.UserAgent || got.Cookies != cfg.Cookies || got.Headers["X-Test"] != "yes" {
+		t.Fatalf("browser request config = %+v", got)
 	}
 }
 
@@ -398,6 +474,10 @@ func successfulFetch(name, body string) fetchRes {
 			IsJS:        true,
 		},
 	}
+}
+
+func analyzeResultForTest(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
+	analyzeResultWithPreprocess(cfg, s, a, log, nil, nil, res, entryURL, queued, processed, queue, analyzed, totalAnalyzed)
 }
 
 func testConfig(entryURL, outDir string) *config.Config {

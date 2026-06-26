@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
@@ -63,9 +64,12 @@ type Fetcher struct {
 	pending map[string]*inflight // In-flight requests (singleflight)
 }
 
+type redirectPolicyKey struct{}
+
 func New(cfg *config.Config, log *logging.Logger) (*Fetcher, error) {
 	client := &http.Client{
-		Timeout: time.Duration(cfg.Timeout) * time.Second,
+		Timeout:       time.Duration(cfg.Timeout) * time.Second,
+		CheckRedirect: redirectChecker(cfg),
 	}
 	if cfg.InsecureSkipVerify || cfg.Proxy != "" {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -98,16 +102,31 @@ func New(cfg *config.Config, log *logging.Logger) (*Fetcher, error) {
 
 // Fetch downloads URL content with caching and singleflight deduplication
 func (f *Fetcher) Fetch(rawURL string) *Result {
+	return f.fetch(rawURL, rawURL)
+}
+
+// FetchForEntry downloads URL content using entryURL as the same-origin policy
+// anchor for redirects and credential scoping.
+func (f *Fetcher) FetchForEntry(rawURL, entryURL string) *Result {
+	if entryURL == "" {
+		entryURL = rawURL
+	}
+	return f.fetch(rawURL, entryURL)
+}
+
+func (f *Fetcher) fetch(rawURL, entryURL string) *Result {
+	cacheKey := fetchCacheKey(rawURL, entryURL)
+
 	f.mu.Lock()
 
 	// 1. Check completed cache
-	if cached, ok := f.cache[rawURL]; ok {
+	if cached, ok := f.cache[cacheKey]; ok {
 		f.mu.Unlock()
 		return cached
 	}
 
 	// 2. Check for in-flight request
-	if inf, ok := f.pending[rawURL]; ok {
+	if inf, ok := f.pending[cacheKey]; ok {
 		f.mu.Unlock()
 		// Wait for the request to complete
 		<-inf.done
@@ -116,37 +135,42 @@ func (f *Fetcher) Fetch(rawURL string) *Result {
 
 	// 3. Create new in-flight request
 	inf := &inflight{done: make(chan struct{})}
-	f.pending[rawURL] = inf
+	f.pending[cacheKey] = inf
 	f.mu.Unlock()
 
 	// 4. Perform download
-	result := f.doFetch(rawURL)
+	result := f.doFetch(rawURL, entryURL)
 
 	// 5. Store in cache and notify waiters
 	f.mu.Lock()
-	f.cache[rawURL] = result
+	f.cache[cacheKey] = result
 	inf.res = result
-	delete(f.pending, rawURL)
+	delete(f.pending, cacheKey)
 	f.mu.Unlock()
 	close(inf.done)
 
 	return result
 }
 
-func (f *Fetcher) doFetch(rawURL string) *Result {
+func (f *Fetcher) doFetch(rawURL, entryURL string) *Result {
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return &Result{URL: rawURL, Err: err}
 	}
+	req = req.WithContext(context.WithValue(req.Context(), redirectPolicyKey{}, entryURL))
 
 	req.Header.Set("User-Agent", f.cfg.UserAgent)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 
-	if f.cfg.Cookies != "" {
+	sendCookies := shouldSendCookies(rawURL, entryURL)
+	if f.cfg.Cookies != "" && sendCookies {
 		req.Header.Set("Cookie", f.cfg.Cookies)
 	}
 	for k, v := range f.cfg.Headers {
+		if strings.EqualFold(k, "Cookie") && !sendCookies {
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 
@@ -254,6 +278,17 @@ func readBounded(reader io.Reader, maxSize int64) ([]byte, error) {
 // Returns a copy of the Result so mutations do not pollute the cache.
 func (f *Fetcher) FetchJS(rawURL string) *Result {
 	result := f.Fetch(rawURL)
+	return validateJSResult(result, rawURL)
+}
+
+// FetchJSForEntry downloads a JS resource using entryURL as the same-origin
+// policy anchor for redirects and credential scoping.
+func (f *Fetcher) FetchJSForEntry(rawURL, entryURL string) *Result {
+	result := f.FetchForEntry(rawURL, entryURL)
+	return validateJSResult(result, rawURL)
+}
+
+func validateJSResult(result *Result, rawURL string) *Result {
 	if result.Err != nil {
 		return result.clone()
 	}
@@ -279,6 +314,47 @@ func (f *Fetcher) FetchJS(rawURL string) *Result {
 	return clone
 }
 
+func fetchCacheKey(rawURL, entryURL string) string {
+	if entryURL == "" || entryURL == rawURL {
+		return rawURL
+	}
+	return entryURL + "\x00" + rawURL
+}
+
+func redirectChecker(cfg *config.Config) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		entryURL := redirectEntryURL(req)
+		if entryURL == "" && len(via) > 0 {
+			entryURL = redirectEntryURL(via[0])
+			if entryURL == "" {
+				entryURL = via[0].URL.String()
+			}
+		}
+		if cfg.SameOrigin && !urlutil.IsAllowedDomain(req.URL.String(), cfg.AllowCDN, entryURL) {
+			return fmt.Errorf("redirect target not allowed by same-origin policy: %s", req.URL.Host)
+		}
+		return nil
+	}
+}
+
+func redirectEntryURL(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	entryURL, _ := req.Context().Value(redirectPolicyKey{}).(string)
+	return entryURL
+}
+
+func shouldSendCookies(rawURL, entryURL string) bool {
+	if entryURL == "" {
+		return true
+	}
+	return urlutil.IsSameOrigin(rawURL, entryURL)
+}
+
 // looksLikeJS checks if content looks like JS
 func looksLikeJS(data []byte) bool {
 	if len(data) < 10 {
@@ -296,11 +372,4 @@ func looksLikeJS(data []byte) bool {
 		}
 	}
 	return false
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

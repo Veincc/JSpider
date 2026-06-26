@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
+	"github.com/Veincc/JSpider/internal/fileutil"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
@@ -121,7 +122,7 @@ func (s *Store) SaveJS(site, sourceURL string, data []byte) (string, bool, error
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		return "", false, err
 	}
-	if err := writeFileAtomic(fullPath, data, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(fullPath, data, 0644); err != nil {
 		return "", false, err
 	}
 	s.contentHashes[key] = rel
@@ -131,26 +132,4 @@ func (s *Store) SaveJS(site, sourceURL string, data []byte) (string, bool, error
 func contentHash(data []byte) string {
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum[:])
-}
-
-func writeFileAtomic(filename string, data []byte, mode os.FileMode) error {
-	file, err := os.CreateTemp(filepath.Dir(filename), "."+filepath.Base(filename)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tempName := file.Name()
-	defer os.Remove(tempName)
-
-	if err := file.Chmod(mode); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tempName, filename)
 }

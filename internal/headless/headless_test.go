@@ -10,7 +10,46 @@ import (
 	"github.com/Veincc/JSpider/internal/analyzer"
 	"github.com/Veincc/JSpider/internal/logging"
 	"github.com/Veincc/JSpider/internal/urlutil"
+	"github.com/chromedp/chromedp"
 )
+
+func TestInitializeBrowserAllocatesBeforeUsingSetupTimeout(t *testing.T) {
+	type contextKey struct{}
+	browserCtx := context.WithValue(context.Background(), contextKey{}, "browser")
+	action := chromedp.ActionFunc(func(context.Context) error { return nil })
+
+	var calls []context.Context
+	runner := func(ctx context.Context, actions ...chromedp.Action) error {
+		calls = append(calls, ctx)
+		switch len(calls) {
+		case 1:
+			if ctx != browserCtx {
+				t.Fatal("first browser allocation did not use the long-lived browser context")
+			}
+			if len(actions) != 0 {
+				t.Fatalf("first browser allocation actions = %d, want 0", len(actions))
+			}
+		case 2:
+			if ctx == browserCtx {
+				t.Fatal("domain setup did not use a bounded child context")
+			}
+			if _, ok := ctx.Deadline(); !ok {
+				t.Fatal("domain setup context has no deadline")
+			}
+			if len(actions) != 1 {
+				t.Fatalf("domain setup actions = %d, want 1", len(actions))
+			}
+		}
+		return nil
+	}
+
+	if err := initializeBrowser(browserCtx, time.Second, []chromedp.Action{action}, runner); err != nil {
+		t.Fatalf("initializeBrowser() error = %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("runner calls = %d, want 2", len(calls))
+	}
+}
 
 func TestCheckBrowserAvailable_NoBrowser(t *testing.T) {
 	err := CheckBrowserAvailable()
@@ -188,6 +227,62 @@ func TestNetworkCaptureWaitForResponseBodies(t *testing.T) {
 		t.Fatal("waitForResponseBodies returned true while body was still pending")
 	}
 	capture.endResponseBody()
+}
+
+func TestPhaseBudgetReservesFinalResponseBodyDrain(t *testing.T) {
+	deadline := time.Now().Add(5 * time.Second)
+	budget := phaseBudget(deadline, 2*time.Second)
+	if budget <= 0 {
+		t.Fatalf("phaseBudget() = %s, want positive budget", budget)
+	}
+	if budget > 3*time.Second {
+		t.Fatalf("phaseBudget() = %s, want final drain reserve preserved", budget)
+	}
+	if got := phaseBudget(time.Now().Add(time.Second), 2*time.Second); got != 0 {
+		t.Fatalf("phaseBudget() with only reserve remaining = %s, want 0", got)
+	}
+}
+
+func TestFinalDrainBudgetAllowsShortDrainAfterOperationDeadline(t *testing.T) {
+	if got := finalDrainBudget(context.Background(), time.Now().Add(-time.Second), 2*time.Second); got != 2*time.Second {
+		t.Fatalf("finalDrainBudget() after operation deadline = %s, want 2s", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := finalDrainBudget(ctx, time.Now().Add(time.Second), 2*time.Second); got != 0 {
+		t.Fatalf("finalDrainBudget() after parent cancellation = %s, want 0", got)
+	}
+}
+
+func TestClickIdleTimeoutIsNonFatalUnlessContextDone(t *testing.T) {
+	if err := clickIdleTimeoutError(context.Background()); err != nil {
+		t.Fatalf("idle timeout on live context returned error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := clickIdleTimeoutError(ctx); err == nil {
+		t.Fatal("idle timeout on canceled context returned nil")
+	}
+}
+
+func TestDiscoverWithRuntimeDoesNotMutateCallerConfigDefaults(t *testing.T) {
+	originalCandidates := browserCandidates
+	browserCandidates = []string{"definitely-not-a-real-browser-for-jspider-test"}
+	t.Cleanup(func() { browserCandidates = originalCandidates })
+
+	log := logging.New(false, t.TempDir())
+	defer log.Close()
+
+	cfg := &Config{EntryURL: "https://example.com/"}
+	_, err := DiscoverWithRuntime(context.Background(), cfg, log)
+	if err == nil {
+		t.Fatal("DiscoverWithRuntime() unexpectedly found a browser")
+	}
+	if cfg.Timeout != 0 || cfg.MaxClicks != 0 {
+		t.Fatalf("caller config mutated to Timeout=%s MaxClicks=%d", cfg.Timeout, cfg.MaxClicks)
+	}
 }
 
 func TestResolveURL(t *testing.T) {

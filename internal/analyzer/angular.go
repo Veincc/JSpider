@@ -45,7 +45,7 @@ func (a *AngularAnalyzer) Analyze(jsContent string, fromJS string) *AnalysisResu
 	result.Imports = append(result.Imports, directImports...)
 
 	// Classify runtime/main/polyfills
-	a.classifyAssets(result, fromJS)
+	a.classifyAssets(result)
 
 	// Extract sourceMappingURL
 	if mapURL := a.regex.ExtractSourceMappingURL(jsContent, fromJS); mapURL != "" {
@@ -84,7 +84,7 @@ func (a *AngularAnalyzer) extractLazyRoutes(jsContent string, fromJS string) []R
 }
 
 // classifyAssets classifies Angular assets
-func (a *AngularAnalyzer) classifyAssets(result *AnalysisResult, fromJS string) {
+func (a *AngularAnalyzer) classifyAssets(result *AnalysisResult) {
 	for i := range result.NewURLs {
 		url := strings.ToLower(result.NewURLs[i].URL)
 		if strings.Contains(url, "runtime") {
@@ -95,7 +95,6 @@ func (a *AngularAnalyzer) classifyAssets(result *AnalysisResult, fromJS string) 
 			result.NewURLs[i].Type = TypeEntryJS
 		}
 	}
-	_ = fromJS
 }
 
 // IsAngular checks whether the JS was built by Angular

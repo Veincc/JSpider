@@ -64,7 +64,7 @@ func IsSameOrigin(u1, u2 string) bool {
 // GetOrigin returns the origin (scheme + host) of a URL.
 func GetOrigin(rawURL string) string {
 	u, err := url.Parse(rawURL)
-	if err != nil {
+	if err != nil || u.Scheme == "" || u.Host == "" {
 		return ""
 	}
 	return u.Scheme + "://" + u.Host

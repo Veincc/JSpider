@@ -2,6 +2,7 @@ package analyzer
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/Veincc/JSpider/internal/urlutil"
@@ -22,10 +23,10 @@ var (
 	componentRe = regexp.MustCompile(`(?:component|Component)\s*:\s*(?:\(\)\s*=>\s*)?(?:import\s*\(\s*["']([^"']+)["']\s*\))`)
 
 	// Vite signature patterns
-	viteMapDepsRe     = regexp.MustCompile(`__vite__mapDeps\s*\(\s*\[([0-9,\s]+)\]`)
-	viteMapDepsDefRe  = regexp.MustCompile(`__vite__mapDeps\s*=\s*(?:function\s*)?\(i\s*,\s*m\s*=\s*__vite__mapDeps\s*,\s*d\s*=\s*\(\s*m\.f\s*\|\|\s*\(\s*m\.f\s*=\s*(\[(?:[^\[\]]*|"(?:[^"\\]|\\.)*")*\])\s*\)\s*\)\s*\)\s*=>`)
-	vitePreloadRe     = regexp.MustCompile(`__vitePreload\s*\(\s*(?:\(\)\s*=>\s*)?import\s*\(\s*["']([^"']+)["']`)
-	viteAssetPathRe   = regexp.MustCompile(`(?:"([^"]+\.js)"\s*:\s*\(\)\s*=>\s*import|"\.\./[^"]*\.vue"\s*:\s*\(\)\s*=>)`)
+	viteMapDepsRe    = regexp.MustCompile(`__vite__mapDeps\s*\(\s*\[([0-9,\s]+)\]`)
+	viteMapDepsDefRe = regexp.MustCompile(`__vite__mapDeps\s*=\s*(?:function\s*)?\(i\s*,\s*m\s*=\s*__vite__mapDeps\s*,\s*d\s*=\s*\(\s*m\.f\s*\|\|\s*\(\s*m\.f\s*=\s*(\[(?:[^\[\]]*|"(?:[^"\\]|\\.)*")*\])\s*\)\s*\)\s*\)\s*=>`)
+	vitePreloadRe    = regexp.MustCompile(`__vitePreload\s*\(\s*(?:\(\)\s*=>\s*)?import\s*\(\s*["']([^"']+)["']`)
+	viteAssetPathRe  = regexp.MustCompile(`(?:"([^"]+\.js)"\s*:\s*\(\)\s*=>\s*import|"\.\./[^"]*\.vue"\s*:\s*\(\)\s*=>)`)
 
 	// Webpack signature patterns
 	webpackChunkRe    = regexp.MustCompile(`self\.webpackChunk\w*\s*\|\|\s*\[\]\)\.push\s*\(\s*\[\s*\[([0-9]+)`)
@@ -209,7 +210,7 @@ func (r *RegexAnalyzer) ExtractViteMapDeps(jsContent string, fromJS string) ([]D
 		// Resolve dependency files using indices
 		var resolvedDeps []string
 		for _, idx := range indices {
-			if idx < len(deps) {
+			if idx >= 0 && idx < len(deps) {
 				dep := deps[idx]
 				if !urlutil.IsCSSResource(dep) {
 					resolved, err := urlutil.ResolveJS(fromJS, dep)
@@ -495,11 +496,9 @@ func parseIndices(s string) []int {
 		if part == "" {
 			continue
 		}
-		val := 0
-		for _, c := range part {
-			if c >= '0' && c <= '9' {
-				val = val*10 + int(c-'0')
-			}
+		val, err := strconv.Atoi(part)
+		if err != nil || val < 0 {
+			continue
 		}
 		indices = append(indices, val)
 	}

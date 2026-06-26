@@ -117,6 +117,27 @@ func TestHeadlessCanBeSet(t *testing.T) {
 	}
 }
 
+func TestAPIDiscoveryImpliesHeadless(t *testing.T) {
+	cfg := &Config{APIDiscovery: true}
+	ApplyModeImplications(cfg)
+
+	if !cfg.Headless {
+		t.Fatal("APIDiscovery should imply Headless")
+	}
+	if !cfg.APIDiscovery {
+		t.Fatal("APIDiscovery should remain enabled")
+	}
+}
+
+func TestHeadlessAloneDoesNotEnableAPIDiscovery(t *testing.T) {
+	cfg := &Config{Headless: true}
+	ApplyModeImplications(cfg)
+
+	if cfg.APIDiscovery {
+		t.Fatal("Headless alone should not enable APIDiscovery")
+	}
+}
+
 func TestAuditPrepDefaultFalse(t *testing.T) {
 	cfg := &Config{}
 	if cfg.AuditPrep {

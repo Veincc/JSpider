@@ -7,11 +7,6 @@ import (
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
-// Resource path patterns in inline scripts.
-var inlineJSPathRe = strings.NewReplacer() // placeholder, kept for compat
-
-const inlineJSPattern = `((?:/|\.|\.\./)(?:assets|static|_next/static|_nuxt|chunks)[^"']+\.js)`
-
 type Extractor struct{}
 
 func NewExtractor() *Extractor {
@@ -514,12 +509,6 @@ func extractInlinePaths(body string, baseURL string) []string {
 				inQuote = 0
 			}
 		}
-	}
-
-	// Next.js build manifest detection
-	if strings.Contains(body, "__BUILD_MANIFEST") || strings.Contains(body, "_buildManifest") {
-		buildIDRe := `"_buildId"\s*:\s*"([^"]+)"`
-		_ = buildIDRe // handled by regex in ExtractInlineJSPaths
 	}
 
 	return paths

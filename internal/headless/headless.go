@@ -14,10 +14,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/debugger"
+	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
+	"github.com/Veincc/JSpider/internal/apidiscovery"
 	"github.com/Veincc/JSpider/internal/logging"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
@@ -30,6 +33,8 @@ var browserCandidates = []string{
 	"chromium-browser",
 	"chrome",
 }
+
+const finalNetworkDrainMax = 2 * time.Second
 
 // dangerousPatterns are substrings in link/button text or href that indicate
 // state-changing actions we should NOT click during discovery.
@@ -78,6 +83,14 @@ type Config struct {
 	InsecureSkipVerify bool
 	// Proxy is the proxy server used by Chrome.
 	Proxy string
+	// CaptureAPI records XHR, fetch, EventSource, and WebSocket requests.
+	CaptureAPI bool
+	// UserAgent is applied to browser requests when non-empty.
+	UserAgent string
+	// Cookies is a Cookie header-style list applied before navigation.
+	Cookies string
+	// Headers are extra browser request headers.
+	Headers map[string]string
 }
 
 // networkCapture holds JS URLs captured from network events.
@@ -160,10 +173,6 @@ func CheckBrowserAvailable() error {
 
 // findBrowser locates a Chrome/Chromium binary.
 func findBrowser() (string, error) {
-	// Try chromedp's built-in detection first
-	if path := chromedp.DefaultExecAllocatorOptions[0]; path != nil {
-		// chromedp uses findExecPath internally, try common names
-	}
 	for _, name := range browserCandidates {
 		if path, err := exec.LookPath(name); err == nil {
 			return path, nil
@@ -171,10 +180,38 @@ func findBrowser() (string, error) {
 	}
 	return "", fmt.Errorf("no Chrome/Chromium browser found; searched for: %s\n"+
 		"Install Chrome or Chromium and ensure it is in PATH.\n"+
-		"Required for --headless mode.", strings.Join(browserCandidates, ", "))
+		"Required for --headless and --api-discovery modes.", strings.Join(browserCandidates, ", "))
+}
+
+type DiscoveryResult struct {
+	Assets   []analyzer.JSAsset
+	Requests []apidiscovery.RuntimeRequest
+}
+
+type chromedpRunner func(context.Context, ...chromedp.Action) error
+
+func initializeBrowser(browserCtx context.Context, setupTimeout time.Duration, setupActions []chromedp.Action, runner chromedpRunner) error {
+	if err := runner(browserCtx); err != nil {
+		return fmt.Errorf("start browser: %w", err)
+	}
+
+	setupCtx, setupCancel := phaseContext(browserCtx, setupTimeout)
+	defer setupCancel()
+	if err := runner(setupCtx, setupActions...); err != nil {
+		return fmt.Errorf("enable browser network capture: %w", err)
+	}
+	return nil
 }
 
 // Discover runs headless Chrome on entryURL and returns discovered JS assets.
+// API request capture remains disabled unless Config.CaptureAPI is true.
+func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer.JSAsset, error) {
+	result, err := DiscoverWithRuntime(ctx, cfg, log)
+	return result.Assets, err
+}
+
+// DiscoverWithRuntime runs browser discovery and optionally returns sanitized
+// runtime API requests in addition to the existing JavaScript asset results.
 // It uses CDP network monitoring to capture:
 //   - Network requests with ResourceType=Script
 //   - Responses with JS Content-Type
@@ -188,7 +225,12 @@ func findBrowser() (string, error) {
 //
 // All chromedp.Run calls receive contexts derived from browserCtx (the
 // chromedp-managed context) so that the CDP session stays valid across phases.
-func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer.JSAsset, error) {
+func DiscoverWithRuntime(ctx context.Context, cfg *Config, log *logging.Logger) (DiscoveryResult, error) {
+	if cfg == nil {
+		return DiscoveryResult{}, fmt.Errorf("headless config is nil")
+	}
+	runCfg := *cfg
+	cfg = &runCfg
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30 * time.Second
 	}
@@ -197,17 +239,30 @@ func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer
 	}
 
 	totalBudget := cfg.Timeout
-	deadline := time.Now().Add(totalBudget)
+	drainReserve := finalNetworkDrainMax
+	if totalBudget < 4*drainReserve {
+		drainReserve = totalBudget / 4
+	}
+	operationCtx, operationCancel := context.WithTimeout(ctx, totalBudget)
+	defer operationCancel()
+	deadline, _ := operationCtx.Deadline()
 
 	browserPath, err := findBrowser()
 	if err != nil {
-		return nil, err
+		return DiscoveryResult{}, err
 	}
 
 	capture := newNetworkCapture()
+	var apiCapture *runtimeCapture
+	if cfg.CaptureAPI {
+		apiCapture = newRuntimeCapture(cfg.EntryURL)
+	}
 
-	// Create allocator — uses the caller-supplied ctx for cancellation,
-	// not the deadline, so that browserCtx lifetime is not cut short.
+	// Create the allocator under the caller context. The first
+	// chromedp.Run below must use browserCtx directly; a shorter setup context
+	// would bind the Chrome process lifetime to that child and kill it on cancel.
+	// The operation deadline budgets phases only; Chrome must stay alive long
+	// enough for bounded final CDP reads such as Network.getResponseBody.
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(browserPath),
 		chromedp.Flag("headless", true),
@@ -230,17 +285,51 @@ func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer
 	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
 	defer browserCancel()
 
+	currentResult := func(domHTML string) DiscoveryResult {
+		result := DiscoveryResult{
+			Assets:   buildAssets(capture, domHTML, cfg, log),
+			Requests: []apidiscovery.RuntimeRequest{},
+		}
+		if apiCapture != nil {
+			result.Requests = apiCapture.snapshot()
+		}
+		return result
+	}
+
 	// Set up network event listener BEFORE navigating
 	chromedp.ListenTarget(browserCtx, func(ev any) {
 		switch e := ev.(type) {
 		case *network.EventRequestWillBeSent:
-			if e.Type == network.ResourceTypeScript {
+			if e.Request != nil && e.Type == network.ResourceTypeScript {
 				capture.mu.Lock()
 				capture.scriptURLs[e.Request.URL] = true
 				capture.mu.Unlock()
 				log.Verbose("  [network] Script request: %s", e.Request.URL)
 			}
+			if apiCapture != nil && apiCapture.handleRequest(e) {
+				log.Verbose("  [api] %s %s (type=%s stage=%s)", e.Request.Method, e.Request.URL, e.Type, apiCapture.stageName())
+				if e.Request.HasPostData {
+					apiCapture.beginPostDataFetch()
+					go func(requestID network.RequestID, requestURL string) {
+						defer apiCapture.endPostDataFetch()
+						var body []byte
+						err := chromedp.Run(browserCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+							var err error
+							body, err = network.GetRequestPostData(requestID).Do(ctx)
+							return err
+						}))
+						if err != nil {
+							log.Verbose("  [api] request body unavailable for %s: %v", requestURL, err)
+							return
+						}
+						apiCapture.setPostData(requestID, requestURL, body)
+					}(e.RequestID, e.Request.URL)
+				}
+			}
 		case *network.EventResponseReceived:
+			if apiCapture != nil {
+				apiCapture.handleResponse(e)
+			}
 			ct := e.Response.MimeType
 			if isJSContentType(ct) || isJSResourceType(e.Type) {
 				capture.mu.Lock()
@@ -267,19 +356,66 @@ func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer
 					}
 				}(e.RequestID, e.Response.URL)
 			}
+		case *network.EventLoadingFinished:
+			if apiCapture != nil {
+				apiCapture.handleFinished(e)
+			}
+		case *network.EventLoadingFailed:
+			if apiCapture != nil {
+				apiCapture.handleFailed(e)
+			}
+		case *network.EventWebSocketCreated:
+			if apiCapture != nil {
+				apiCapture.handleWebSocketCreated(e)
+				log.Verbose("  [api] WebSocket %s (stage=%s)", e.URL, apiCapture.stageName())
+			}
+		case *network.EventWebSocketHandshakeResponseReceived:
+			if apiCapture != nil {
+				apiCapture.handleWebSocketHandshakeResponse(e)
+			}
 		}
 	})
 
 	budgetExhausted := false
 
+	setupTimeout := remaining(deadline)
+	if setupTimeout > 5*time.Second {
+		setupTimeout = 5 * time.Second
+	}
+	setupActions := []chromedp.Action{network.Enable()}
+	if cfg.CaptureAPI {
+		setupActions = append(setupActions, chromedp.ActionFunc(func(ctx context.Context) error {
+			_, err := debugger.Enable().Do(ctx)
+			return err
+		}))
+	}
+	if cfg.UserAgent != "" {
+		setupActions = append(setupActions, emulation.SetUserAgentOverride(cfg.UserAgent))
+	}
+	if headers := browserHeaders(cfg.Headers); len(headers) > 0 {
+		setupActions = append(setupActions, network.SetExtraHTTPHeaders(headers))
+	}
+	if cookies := browserCookies(cfg.Cookies, cfg.EntryURL); len(cookies) > 0 {
+		setupActions = append(setupActions, network.SetCookies(cookies))
+	}
+	if err := initializeBrowser(browserCtx, setupTimeout, setupActions, chromedp.Run); err != nil {
+		return currentResult(""), err
+	}
+
 	// Phase 1: Navigate + wait for page load (~40% of budget)
-	if time.Now().Before(deadline) {
+	if phaseWindow := phaseBudget(deadline, drainReserve); phaseWindow > 0 {
 		phaseTimeout := totalBudget * 40 / 100
 		if phaseTimeout < 2*time.Second {
 			phaseTimeout = 2 * time.Second
 		}
+		if phaseTimeout > phaseWindow {
+			phaseTimeout = phaseWindow
+		}
 		phaseCtx, phaseCancel := phaseContext(browserCtx, phaseTimeout)
 
+		if apiCapture != nil {
+			apiCapture.setStage("navigate")
+		}
 		log.Verbose("Headless: navigating to %s", cfg.EntryURL)
 		if err := chromedp.Run(phaseCtx, chromedp.Navigate(cfg.EntryURL)); err != nil {
 			phaseCancel()
@@ -287,7 +423,7 @@ func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer
 				budgetExhausted = true
 				log.Verbose("Headless: navigate timed out: %v", err)
 			} else {
-				return nil, fmt.Errorf("navigate failed: %w", err)
+				return currentResult(""), fmt.Errorf("navigate failed: %w", err)
 			}
 		} else {
 			log.Verbose("Headless: waiting for page load...")
@@ -304,78 +440,109 @@ func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer
 	}
 
 	// Phase 2: Scroll to trigger lazy loading (~20% of budget)
-	if !budgetExhausted && time.Now().Before(deadline) {
-		phaseCtx, phaseCancel := phaseContext(browserCtx, remaining(deadline))
+	if !budgetExhausted {
+		phaseWindow := phaseBudget(deadline, drainReserve)
+		if phaseWindow <= 0 {
+			budgetExhausted = true
+		} else {
+			phaseCtx, phaseCancel := phaseContext(browserCtx, phaseWindow)
 
-		log.Verbose("Headless: scrolling page...")
-		if err := chromedp.Run(phaseCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-			return scrollPage(ctx, log)
-		})); err != nil {
-			if isDeadlineExceeded(err) {
-				budgetExhausted = true
-				log.Verbose("Headless: scroll timed out: %v", err)
-			} else {
-				log.Verbose("Headless: scroll error (non-fatal): %v", err)
+			if apiCapture != nil {
+				apiCapture.setStage("scroll")
 			}
+			log.Verbose("Headless: scrolling page...")
+			if err := chromedp.Run(phaseCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+				return scrollPage(ctx, log)
+			})); err != nil {
+				if isDeadlineExceeded(err) {
+					budgetExhausted = true
+					log.Verbose("Headless: scroll timed out: %v", err)
+				} else {
+					log.Verbose("Headless: scroll error (non-fatal): %v", err)
+				}
+			}
+			phaseCancel()
 		}
-		phaseCancel()
 	}
 
 	// Phase 3: Click safe elements + settle (~25% of budget)
-	if !budgetExhausted && time.Now().Before(deadline) {
-		phaseCtx, phaseCancel := phaseContext(browserCtx, remaining(deadline))
+	if !budgetExhausted {
+		phaseWindow := phaseBudget(deadline, drainReserve)
+		if phaseWindow <= 0 {
+			budgetExhausted = true
+		} else {
+			phaseCtx, phaseCancel := phaseContext(browserCtx, phaseWindow)
 
-		log.Verbose("Headless: clicking safe elements (max %d)...", cfg.MaxClicks)
-		if err := chromedp.Run(phaseCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-			return clickSafeElements(ctx, cfg.EntryURL, cfg.MaxClicks, log)
-		})); err != nil {
-			if isDeadlineExceeded(err) {
-				budgetExhausted = true
-				log.Verbose("Headless: click pass timed out: %v", err)
-			} else {
-				log.Verbose("Headless: click pass error (non-fatal): %v", err)
+			if apiCapture != nil {
+				apiCapture.setStage("click")
 			}
-		}
+			log.Verbose("Headless: clicking safe elements (max %d)...", cfg.MaxClicks)
+			if err := chromedp.Run(phaseCtx, chromedp.ActionFunc(func(ctx context.Context) error {
+				return clickSafeElements(ctx, cfg.EntryURL, cfg.MaxClicks, apiCapture, log)
+			})); err != nil {
+				if isDeadlineExceeded(err) {
+					budgetExhausted = true
+					log.Verbose("Headless: click pass timed out: %v", err)
+				} else {
+					log.Verbose("Headless: click pass error (non-fatal): %v", err)
+				}
+			}
 
-		if !budgetExhausted {
-			if err := chromedp.Run(phaseCtx, chromedp.Sleep(2*time.Second)); err != nil && isDeadlineExceeded(err) {
-				log.Verbose("Headless: post-click settle timed out")
+			if !budgetExhausted {
+				if apiCapture != nil {
+					apiCapture.setStage("settle")
+					if !apiCapture.waitForAPIIdle(phaseCtx, 750*time.Millisecond) {
+						log.Verbose("Headless: post-click API settle timed out")
+					}
+				} else {
+					if err := chromedp.Run(phaseCtx, chromedp.Sleep(2*time.Second)); err != nil && isDeadlineExceeded(err) {
+						log.Verbose("Headless: post-click settle timed out")
+					}
+				}
 			}
+			phaseCancel()
 		}
-		phaseCancel()
 	}
 
 	// Phase 4: Extract DOM scripts (~15% of budget)
 	var domHTML string
-	if !budgetExhausted && time.Now().Before(deadline) {
-		phaseCtx, phaseCancel := phaseContext(browserCtx, remaining(deadline))
+	if !budgetExhausted {
+		phaseWindow := phaseBudget(deadline, drainReserve)
+		if phaseWindow <= 0 {
+			budgetExhausted = true
+		} else {
+			phaseCtx, phaseCancel := phaseContext(browserCtx, phaseWindow)
 
-		if err := chromedp.Run(phaseCtx, chromedp.OuterHTML("html", &domHTML, chromedp.ByQuery)); err != nil {
-			if isDeadlineExceeded(err) {
-				log.Verbose("Headless: DOM extraction timed out: %v", err)
-			} else {
-				log.Verbose("Headless: DOM extraction error (non-fatal): %v", err)
+			if apiCapture != nil {
+				apiCapture.setStage("settle")
 			}
+			if err := chromedp.Run(phaseCtx, chromedp.OuterHTML("html", &domHTML, chromedp.ByQuery)); err != nil {
+				if isDeadlineExceeded(err) {
+					log.Verbose("Headless: DOM extraction timed out: %v", err)
+				} else {
+					log.Verbose("Headless: DOM extraction error (non-fatal): %v", err)
+				}
+			}
+			phaseCancel()
 		}
-		phaseCancel()
 	}
 
 	if budgetExhausted {
 		log.Info("Headless discovery reached time budget; using captured network assets")
 	}
 
-	waitBudget := remaining(deadline)
-	if waitBudget > 2*time.Second {
-		waitBudget = 2 * time.Second
-	}
+	waitBudget := finalDrainBudget(ctx, deadline, drainReserve)
 	if !capture.waitForResponseBodies(waitBudget) {
 		log.Verbose("Headless: timed out waiting for pending XHR/fetch response bodies")
 	}
+	if apiCapture != nil {
+		postDataBudget := finalDrainBudget(ctx, deadline, drainReserve)
+		if !apiCapture.waitForPostData(postDataBudget) {
+			log.Verbose("Headless: timed out waiting for pending request bodies")
+		}
+	}
 
-	// Combine all discovered assets (from whatever phases succeeded)
-	assets := buildAssets(capture, domHTML, cfg, log)
-
-	return assets, nil
+	return currentResult(domHTML), nil
 }
 
 // phaseContext creates a child context of browserCtx with a timeout.
@@ -383,6 +550,28 @@ func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer
 // this helper enforces that pattern.
 func phaseContext(browserCtx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(browserCtx, timeout)
+}
+
+func phaseBudget(deadline time.Time, reserve time.Duration) time.Duration {
+	budget := remaining(deadline) - reserve
+	if budget < 0 {
+		return 0
+	}
+	return budget
+}
+
+func finalDrainBudget(ctx context.Context, deadline time.Time, max time.Duration) time.Duration {
+	if ctx.Err() != nil || max <= 0 {
+		return 0
+	}
+	budget := remaining(deadline)
+	if budget <= 0 {
+		return max
+	}
+	if budget > max {
+		return max
+	}
+	return budget
 }
 
 // isDeadlineExceeded checks whether an error is a context deadline exceeded.
@@ -434,7 +623,7 @@ func scrollPage(ctx context.Context, log *logging.Logger) error {
 
 // clickSafeElements clicks up to maxClicks safe interactive elements on the page.
 // It skips elements with dangerous text/href patterns.
-func clickSafeElements(ctx context.Context, entryURL string, maxClicks int, log *logging.Logger) error {
+func clickSafeElements(ctx context.Context, entryURL string, maxClicks int, apiCapture *runtimeCapture, log *logging.Logger) error {
 	// Find clickable elements: links, buttons, and elements with click handlers
 	var elementCount int
 	if err := chromedp.Evaluate(`(function() {
@@ -501,13 +690,58 @@ func clickSafeElements(ctx context.Context, entryURL string, maxClicks int, log 
 		if clickResult {
 			clicked++
 			log.Verbose("  Clicked element %d: %q href=%q", i, info.Text, info.Href)
-			// Wait for any triggered network activity
-			time.Sleep(500 * time.Millisecond)
+			if apiCapture != nil {
+				if !apiCapture.waitForAPIIdle(ctx, 750*time.Millisecond) {
+					if err := clickIdleTimeoutError(ctx); err != nil {
+						return err
+					}
+					log.Verbose("  API idle wait timed out after click; continuing")
+				}
+			} else {
+				time.Sleep(500 * time.Millisecond)
+			}
 		}
 	}
 
 	log.Verbose("  Clicked %d elements", clicked)
 	return nil
+}
+
+func clickIdleTimeoutError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func browserHeaders(headers map[string]string) network.Headers {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(network.Headers, len(headers))
+	for name, value := range headers {
+		out[name] = value
+	}
+	return out
+}
+
+func browserCookies(raw, entryURL string) []*network.CookieParam {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var cookies []*network.CookieParam
+	for _, item := range strings.Split(raw, ";") {
+		parts := strings.SplitN(strings.TrimSpace(item), "=", 2)
+		if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
+			continue
+		}
+		cookies = append(cookies, &network.CookieParam{
+			Name:  strings.TrimSpace(parts[0]),
+			Value: strings.TrimSpace(parts[1]),
+			URL:   entryURL,
+		})
+	}
+	return cookies
 }
 
 func shouldSkipClickableHref(href, entryURL string) bool {
@@ -782,7 +1016,6 @@ func extractLinkScripts(line string) []string {
 		}
 		end += start
 		tag := line[start : end+1]
-		tagLower := lower[start : end+1]
 
 		rel := extractAttr(tag, "rel")
 		relLower := strings.ToLower(rel)
@@ -804,7 +1037,6 @@ func extractLinkScripts(line string) []string {
 			}
 		}
 		idx = end + 1
-		_ = tagLower
 	}
 
 	return results

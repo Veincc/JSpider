@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
+	"github.com/Veincc/JSpider/internal/apidiscovery"
 	"github.com/Veincc/JSpider/internal/config"
 	"github.com/Veincc/JSpider/internal/fetcher"
 	"github.com/Veincc/JSpider/internal/headless"
@@ -38,6 +39,9 @@ type crawlState struct {
 	processed map[string]bool
 }
 
+var discoverBrowser = headless.DiscoverWithRuntime
+var checkBrowserAvailable = headless.CheckBrowserAvailable
+
 func crawlStateForSite(states map[string]*crawlState, site string) *crawlState {
 	state := states[site]
 	if state == nil {
@@ -60,6 +64,10 @@ func buildHeadlessConfig(cfg *config.Config, entryURL string) *headless.Config {
 		Verbose:            cfg.Verbose,
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 		Proxy:              cfg.Proxy,
+		CaptureAPI:         cfg.APIDiscovery,
+		UserAgent:          cfg.UserAgent,
+		Cookies:            cfg.Cookies,
+		Headers:            cfg.Headers,
 	}
 }
 
@@ -72,6 +80,17 @@ func main() {
 }
 
 func run(cfg *config.Config) error {
+	if cfg.APIDiscovery {
+		if err := apidiscovery.CheckAvailable(); err != nil {
+			return err
+		}
+	}
+	if cfg.Headless {
+		if err := checkBrowserAvailable(); err != nil {
+			return err
+		}
+	}
+
 	if err := os.MkdirAll(cfg.OutDir, 0755); err != nil {
 		return fmt.Errorf("create output directory: %w", err)
 	}
@@ -88,11 +107,9 @@ func run(cfg *config.Config) error {
 	a := analyzer.NewAnalyzer(log)
 	htmlEx := html.NewExtractor()
 
-	// Check browser availability when headless mode is requested
-	if cfg.Headless {
-		if err := headless.CheckBrowserAvailable(); err != nil {
-			return err
-		}
+	if cfg.APIDiscovery {
+		log.Info("API discovery enabled (headless implied)")
+	} else if cfg.Headless {
 		log.Info("Headless discovery enabled: Chrome/Chromium found")
 	}
 
@@ -105,6 +122,7 @@ func run(cfg *config.Config) error {
 
 	initializedSites := make(map[string]bool)
 	processors := make(map[string]*preprocess.Processor)
+	apiSessions := make(map[string]*apidiscovery.Session)
 	states := make(map[string]*crawlState)
 	defer func() {
 		for _, processor := range processors {
@@ -131,8 +149,8 @@ func run(cfg *config.Config) error {
 			prep = processors[site]
 			if prep == nil {
 				var err error
-				prep, err = preprocess.New(siteDir, func(rawURL string) ([]byte, error) {
-					result := f.Fetch(rawURL)
+				prep, err = preprocess.New(siteDir, func(entryURL, rawURL string) ([]byte, error) {
+					result := f.FetchForEntry(rawURL, entryURL)
 					if result.Err != nil {
 						return nil, result.Err
 					}
@@ -150,8 +168,39 @@ func run(cfg *config.Config) error {
 		}
 
 		state := crawlStateForSite(states, site)
+		var apiSession *apidiscovery.Session
+		if cfg.APIDiscovery {
+			apiSession = apiSessions[site]
+			if apiSession == nil {
+				apiSession = apidiscovery.NewSession()
+				apiSessions[site] = apiSession
+			}
+			apiSession.AddEntryURL(entryURL)
+		}
 		log.Info("[%d/%d] Analyzing: %s", i+1, len(urls), entryURL)
-		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, entryURL, state.queued, state.processed, &totalAnalyzed)
+		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, state.queued, state.processed, &totalAnalyzed)
+		if apiSession != nil {
+			if err := apiSession.AnalyzeSources(); err != nil {
+				return fmt.Errorf("analyze discovered JavaScript APIs for %s: %w", entryURL, err)
+			}
+			report := apiSession.Report()
+			if err := apidiscovery.WriteArtifacts(siteDir, report); err != nil {
+				return fmt.Errorf("save API discovery artifacts for %s: %w", entryURL, err)
+			}
+			log.Info("[%d/%d] API discovery: static=%d runtime=%d matched=%d confirmed=%d bases=%d",
+				i+1, len(urls), report.Summary.Static, report.Summary.Runtime,
+				report.Summary.Matched, report.Summary.Confirmed, report.Summary.Bases)
+			for _, association := range report.Associations {
+				log.Verbose("  [api] match static=%s runtime=%s score=%d confidence=%s evidence=%v",
+					association.StaticRawURL, association.RuntimeURL, association.Score,
+					association.Confidence, association.Evidence)
+			}
+			for _, base := range report.Bases {
+				if base.Confidence == apidiscovery.ConfidenceConfirmed {
+					log.Info("Runtime base confirmed: %s (evidence=%d)", base.RuntimeBase, base.EvidenceCount)
+				}
+			}
+		}
 		log.Info("[%d/%d] Done: %s (analyzed %d JS)", i+1, len(urls), entryURL, analyzed)
 	}
 
@@ -172,12 +221,12 @@ func run(cfg *config.Config) error {
 // analyzeEntry analyzes a single entry URL and returns the number of JS files analyzed.
 // It always runs static HTML extraction, and additionally runs headless browser
 // discovery if cfg.Headless is enabled, merging and deduplicating the results.
-func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, entryURL string, queued, processed map[string]bool, totalAnalyzed *int) int {
+func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, entryURL string, queued, processed map[string]bool, totalAnalyzed *int) int {
 	entryDomain := urlutil.SanitizeDomain(entryURL)
 
 	// 1. Static HTML extraction (always)
 	log.Info("Downloading entry HTML: %s", entryURL)
-	htmlResult := f.Fetch(entryURL)
+	htmlResult := f.FetchForEntry(entryURL, entryURL)
 	if htmlResult.Err != nil {
 		log.LogError("download entry HTML", "URL=%s error=%v", entryURL, htmlResult.Err)
 		return 0
@@ -198,10 +247,15 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 	// 2. Headless discovery (optional)
 	if cfg.Headless {
 		log.Info("Running headless discovery: %s", entryURL)
-		hlAssets, err := headless.Discover(context.Background(), buildHeadlessConfig(cfg, entryURL), log)
+		discovery, err := discoverBrowser(context.Background(), buildHeadlessConfig(cfg, entryURL), log)
+		var hlAssets []analyzer.JSAsset
 		if err != nil {
 			log.Warn("Headless discovery failed (continuing with static results): %v", err)
 		} else {
+			hlAssets = discovery.Assets
+			if apiSession != nil {
+				apiSession.AddRuntime(discovery.Requests)
+			}
 			log.Info("Headless discovery found %d JS assets", len(hlAssets))
 		}
 
@@ -258,12 +312,12 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 		}
 
 		// Concurrent download this batch
-		results := fetchBatch(cfg, f, log, queue)
+		results := fetchBatch(cfg, f, log, queue, entryURL)
 		queue = nil
 
 		// Serially analyze each result
 		for res := range results {
-			analyzeResultWithPreprocess(cfg, s, a, log, prep, res, entryURL, queued, processed, &queue, &analyzed, totalAnalyzed)
+			analyzeResultWithPreprocess(cfg, s, a, log, prep, apiSession, res, entryURL, queued, processed, &queue, &analyzed, totalAnalyzed)
 		}
 	}
 
@@ -289,7 +343,7 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 }
 
 // fetchBatch concurrently downloads a batch of URLs
-func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, queue []fetchReq) <-chan fetchRes {
+func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, queue []fetchReq, entryURL string) <-chan fetchRes {
 	results := make(chan fetchRes, len(queue))
 	workers := cfg.Workers
 	if workers <= 0 {
@@ -312,7 +366,7 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 			defer wg.Done()
 			for req := range reqCh {
 				log.Verbose("Downloading: %s (depth=%d)", req.url, req.depth)
-				results <- fetchRes{req: req, result: f.FetchJS(req.url)}
+				results <- fetchRes{req: req, result: f.FetchJSForEntry(req.url, entryURL)}
 			}
 		}()
 	}
@@ -325,13 +379,8 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 	return results
 }
 
-// analyzeResult analyzes a single download result
-func analyzeResult(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
-	analyzeResultWithPreprocess(cfg, s, a, log, nil, res, entryURL, queued, processed, queue, analyzed, totalAnalyzed)
-}
-
 // analyzeResultWithPreprocess analyzes a single download result with optional audit-prep preprocessing.
-func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
+func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
 	item := res.req
 
 	if processed[item.url] {
@@ -367,6 +416,10 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		if _, _, err := s.SaveJS(entrySite, item.url, res.result.Body); err != nil {
 			log.LogError("save JavaScript", "URL=%s error=%v", item.url, err)
 		}
+	}
+
+	if cfg.APIDiscovery && apiSession != nil {
+		apiSession.AddSource(item.url, analysisData)
 	}
 
 	*analyzed++

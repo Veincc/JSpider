@@ -248,6 +248,7 @@ func TestParseIndices(t *testing.T) {
 		{"1, 2, 3", []int{1, 2, 3}},
 		{"0,1,2", []int{0, 1, 2}},
 		{"10, 20, 30", []int{10, 20, 30}},
+		{"99999999999999999999, 0, 1", []int{0, 1}},
 	}
 	for _, tt := range tests {
 		got := parseIndices(tt.input)

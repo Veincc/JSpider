@@ -8,45 +8,45 @@ func TestExtractDynamicImports_Static(t *testing.T) {
 	r := NewRegexAnalyzer()
 
 	tests := []struct {
-		name        string
-		raw         string
-		fromJS      string
-		expectedURL string
+		name         string
+		raw          string
+		fromJS       string
+		expectedURL  string
 		expectedConf string
 	}{
 		{
-			name:        "relative ./ import",
-			raw:         `import("./chunk.js")`,
-			fromJS:      "http://example.com/assets/app.js",
-			expectedURL: "http://example.com/assets/chunk.js",
+			name:         "relative ./ import",
+			raw:          `import("./chunk.js")`,
+			fromJS:       "http://example.com/assets/app.js",
+			expectedURL:  "http://example.com/assets/chunk.js",
 			expectedConf: ConfHigh,
 		},
 		{
-			name:        "relative ../ import",
-			raw:         `import("../lib/utils.js")`,
-			fromJS:      "http://example.com/assets/js/app.js",
-			expectedURL: "http://example.com/assets/lib/utils.js",
+			name:         "relative ../ import",
+			raw:          `import("../lib/utils.js")`,
+			fromJS:       "http://example.com/assets/js/app.js",
+			expectedURL:  "http://example.com/assets/lib/utils.js",
 			expectedConf: ConfHigh,
 		},
 		{
-			name:        "absolute URL import",
-			raw:         `import("https://cdn.example.com/lib.js")`,
-			fromJS:      "http://example.com/app.js",
-			expectedURL: "https://cdn.example.com/lib.js",
+			name:         "absolute URL import",
+			raw:          `import("https://cdn.example.com/lib.js")`,
+			fromJS:       "http://example.com/app.js",
+			expectedURL:  "https://cdn.example.com/lib.js",
 			expectedConf: ConfHigh,
 		},
 		{
-			name:        "absolute path import",
-			raw:         `import("/static/app.js")`,
-			fromJS:      "http://example.com/page/index.html",
-			expectedURL: "http://example.com/static/app.js",
+			name:         "absolute path import",
+			raw:          `import("/static/app.js")`,
+			fromJS:       "http://example.com/page/index.html",
+			expectedURL:  "http://example.com/static/app.js",
 			expectedConf: ConfHigh,
 		},
 		{
-			name:        "bare specifier (no resolve)",
-			raw:         `import("lodash")`,
-			fromJS:      "http://example.com/app.js",
-			expectedURL: "",
+			name:         "bare specifier (no resolve)",
+			raw:          `import("lodash")`,
+			fromJS:       "http://example.com/app.js",
+			expectedURL:  "",
 			expectedConf: ConfMedium,
 		},
 	}
@@ -72,31 +72,31 @@ func TestExtractDynamicImports_TemplateLiteral(t *testing.T) {
 	r := NewRegexAnalyzer()
 
 	tests := []struct {
-		name        string
-		raw         string
-		fromJS      string
-		expectedURL string
+		name         string
+		raw          string
+		fromJS       string
+		expectedURL  string
 		expectedConf string
 	}{
 		{
-			name:        "template with variable",
-			raw:         "import(`./page-${id}.js`)",
-			fromJS:      "http://example.com/app.js",
-			expectedURL: "",
+			name:         "template with variable",
+			raw:          "import(`./page-${id}.js`)",
+			fromJS:       "http://example.com/app.js",
+			expectedURL:  "",
 			expectedConf: ConfLow,
 		},
 		{
-			name:        "template with expression",
-			raw:         "import(`./modules/${name}/index.js`)",
-			fromJS:      "http://example.com/app.js",
-			expectedURL: "",
+			name:         "template with expression",
+			raw:          "import(`./modules/${name}/index.js`)",
+			fromJS:       "http://example.com/app.js",
+			expectedURL:  "",
 			expectedConf: ConfLow,
 		},
 		{
-			name:        "template without expression (static)",
-			raw:         "import(`./chunk.js`)",
-			fromJS:      "http://example.com/app.js",
-			expectedURL: "http://example.com/chunk.js",
+			name:         "template without expression (static)",
+			raw:          "import(`./chunk.js`)",
+			fromJS:       "http://example.com/app.js",
+			expectedURL:  "http://example.com/chunk.js",
 			expectedConf: ConfHigh,
 		},
 	}
@@ -139,10 +139,10 @@ import("./utils.js");
 		resolvedURL string
 		confidence  string
 	}{
-		"./static-chunk.js":                   {resolvedURL: "http://example.com/assets/static-chunk.js", confidence: ConfHigh},
-		"./page-${route}.js":                  {resolvedURL: "", confidence: ConfLow},
-		"https://cdn.example.com/vendor.js":   {resolvedURL: "https://cdn.example.com/vendor.js", confidence: ConfHigh},
-		"./utils.js":                          {resolvedURL: "http://example.com/assets/utils.js", confidence: ConfHigh},
+		"./static-chunk.js":                 {resolvedURL: "http://example.com/assets/static-chunk.js", confidence: ConfHigh},
+		"./page-${route}.js":                {resolvedURL: "", confidence: ConfLow},
+		"https://cdn.example.com/vendor.js": {resolvedURL: "https://cdn.example.com/vendor.js", confidence: ConfHigh},
+		"./utils.js":                        {resolvedURL: "http://example.com/assets/utils.js", confidence: ConfHigh},
 	}
 
 	for _, imp := range imports {

@@ -1,6 +1,7 @@
 package analyzer
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Veincc/JSpider/internal/logging"
@@ -12,9 +13,9 @@ func TestWebpack_URLResolution(t *testing.T) {
 	a := NewAnalyzer(log)
 
 	tests := []struct {
-		name        string
-		jsContent   string
-		fromJS      string
+		name         string
+		jsContent    string
+		fromJS       string
 		expectedURLs []string
 	}{
 		{
@@ -177,9 +178,8 @@ self.__BUILD_MANIFEST = {"/about":["/_next/static/chunks/pages/about.js"]};
 
 	for _, route := range result.Routes {
 		for _, dep := range route.Deps {
-			// Should NOT contain double /_next/
-			if contains := `/_next/static/chunks//_next/`; len(dep) > 0 {
-				_ = contains
+			if strings.Contains(dep, `/_next/static/chunks//_next/`) {
+				t.Errorf("Route dep contains double _next prefix: %s", dep)
 			}
 			// Should be a clean URL
 			if dep == "" {

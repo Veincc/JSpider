@@ -31,7 +31,7 @@ const NodeVersionError = "--audit-prep requires Node.js 18 or newer"
 
 var sourceMapDirective = regexp.MustCompile(`//[#@]\s*sourceMappingURL\s*=\s*(\S+)|(?s:/\*[#@]\s*sourceMappingURL\s*=\s*(.*?)\s*\*/)`)
 
-type FetchFunc func(rawURL string) ([]byte, error)
+type FetchFunc func(entryURL, rawURL string) ([]byte, error)
 
 type Processor struct {
 	auditDir string
@@ -176,7 +176,7 @@ func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
 		return p.recordFailure(entryURL, jsURL, body, "not_attempted", "", "audit-prep processor is closed")
 	}
 
-	mapURL, mapStatus, sources := p.recoverSourceMap(jsURL, body)
+	mapURL, mapStatus, sources := p.recoverSourceMap(entryURL, jsURL, body)
 	if len(sources) > 0 {
 		outputs := make([]string, 0, len(sources))
 		for _, source := range sources {
@@ -260,7 +260,7 @@ func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
 	return result
 }
 
-func (p *Processor) recoverSourceMap(jsURL string, body []byte) (string, string, []sourceFile) {
+func (p *Processor) recoverSourceMap(entryURL, jsURL string, body []byte) (string, string, []sourceFile) {
 	reference := extractSourceMapReference(string(body))
 	if strings.HasPrefix(reference, "data:") {
 		data, err := decodeDataURL(reference)
@@ -286,7 +286,7 @@ func (p *Processor) recoverSourceMap(jsURL string, body []byte) (string, string,
 		return mapURL, "not_found", nil
 	}
 
-	data, err := p.fetch(mapURL)
+	data, err := p.fetch(entryURL, mapURL)
 	if err != nil {
 		if explicit {
 			return mapURL, "fetch_error", nil

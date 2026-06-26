@@ -234,9 +234,15 @@ func TestMissingNodeProducesClearError(t *testing.T) {
 	}
 }
 
-func newTestProcessor(t *testing.T, siteDir string, fetch FetchFunc) *Processor {
+func newTestProcessor(t *testing.T, siteDir string, fetch func(string) ([]byte, error)) *Processor {
 	t.Helper()
-	p, err := New(siteDir, fetch)
+	var fetchForEntry FetchFunc
+	if fetch != nil {
+		fetchForEntry = func(_ string, rawURL string) ([]byte, error) {
+			return fetch(rawURL)
+		}
+	}
+	p, err := New(siteDir, fetchForEntry)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

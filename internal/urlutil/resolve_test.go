@@ -63,6 +63,23 @@ func TestIsSameOrigin(t *testing.T) {
 	}
 }
 
+func TestGetOriginRequiresSchemeAndHost(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{"https://example.com/path", "https://example.com"},
+		{"http://example.com:8080/path", "http://example.com:8080"},
+		{"/relative/path", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := GetOrigin(tt.raw); got != tt.want {
+			t.Errorf("GetOrigin(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
 func TestIsJSPath(t *testing.T) {
 	tests := []struct {
 		input string
