@@ -20,34 +20,34 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Veincc/JSpider/internal/fileutil"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
 //go:embed audit-prep.cjs
 var workerBundle []byte
 
-const NodeRuntimeError = "--audit-prep requires Node.js runtime"
-const NodeVersionError = "--audit-prep requires Node.js 18 or newer"
+const NodeRuntimeError = "JSpider requires Node.js runtime"
+const NodeVersionError = "JSpider requires Node.js 18 or newer"
 
 var sourceMapDirective = regexp.MustCompile(`//[#@]\s*sourceMappingURL\s*=\s*(\S+)|(?s:/\*[#@]\s*sourceMappingURL\s*=\s*(.*?)\s*\*/)`)
 
 type FetchFunc func(entryURL, rawURL string) ([]byte, error)
 
 type Processor struct {
-	auditDir string
-	tempDir  string
-	fetch    FetchFunc
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   *json.Decoder
-	stderr   strings.Builder
-	stderrMu sync.Mutex
+	outputDir string
+	tempDir   string
+	fetch     FetchFunc
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	stdout    *json.Decoder
+	stderr    strings.Builder
+	stderrMu  sync.Mutex
 
 	mu          sync.Mutex
 	nextID      int
 	closed      bool
 	workerErr   string
-	records     []ManifestFile
 	contentRefs map[string]string
 	pathHashes  map[string]string
 }
@@ -58,21 +58,6 @@ type FileResult struct {
 	Outputs      []string
 	Failed       bool
 	Error        string
-}
-
-type Manifest struct {
-	Version int            `json:"version"`
-	Files   []ManifestFile `json:"files"`
-}
-
-type ManifestFile struct {
-	EntryURL        string   `json:"entry_url"`
-	JSURL           string   `json:"js_url"`
-	Status          string   `json:"status"`
-	SourceMapURL    string   `json:"source_map_url,omitempty"`
-	SourceMapStatus string   `json:"source_map_status"`
-	Outputs         []string `json:"outputs"`
-	Error           string   `json:"error,omitempty"`
 }
 
 type workerRequest struct {
@@ -95,8 +80,19 @@ type sourceFile struct {
 }
 
 func CheckNodeRuntime() error {
-	if _, err := exec.LookPath("node"); err != nil {
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
 		return errors.New(NodeRuntimeError)
+	}
+	output, err := exec.Command(nodePath, "--version").Output()
+	if err != nil {
+		return errors.New(NodeRuntimeError)
+	}
+	version := strings.TrimPrefix(strings.TrimSpace(string(output)), "v")
+	majorText, _, _ := strings.Cut(version, ".")
+	major, err := strconv.Atoi(majorText)
+	if err != nil || major < 18 {
+		return errors.New(NodeVersionError)
 	}
 	return nil
 }
@@ -107,12 +103,12 @@ func New(siteDir string, fetch FetchFunc) (*Processor, error) {
 		return nil, errors.New(NodeRuntimeError)
 	}
 
-	auditDir := filepath.Join(siteDir, "audit")
-	if err := os.RemoveAll(auditDir); err != nil {
-		return nil, fmt.Errorf("reset audit directory: %w", err)
+	outputDir := filepath.Join(siteDir, "js")
+	if err := os.RemoveAll(outputDir); err != nil {
+		return nil, fmt.Errorf("reset JavaScript output directory: %w", err)
 	}
-	if err := os.MkdirAll(auditDir, 0755); err != nil {
-		return nil, fmt.Errorf("create audit directory: %w", err)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, fmt.Errorf("create JavaScript output directory: %w", err)
 	}
 
 	tempDir, err := os.MkdirTemp("", "jspider-audit-prep-*")
@@ -143,13 +139,12 @@ func New(siteDir string, fetch FetchFunc) (*Processor, error) {
 	}
 
 	p := &Processor{
-		auditDir:    auditDir,
+		outputDir:   outputDir,
 		tempDir:     tempDir,
 		fetch:       fetch,
 		cmd:         cmd,
 		stdin:       stdin,
 		stdout:      json.NewDecoder(stdoutPipe),
-		records:     make([]ManifestFile, 0),
 		contentRefs: make(map[string]string),
 		pathHashes:  make(map[string]string),
 	}
@@ -173,37 +168,29 @@ func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
 
 	result := FileResult{AnalysisBody: body, Outputs: make([]string, 0)}
 	if p.closed {
-		return p.recordFailure(entryURL, jsURL, body, "not_attempted", "", "audit-prep processor is closed")
+		return p.recordFailure(jsURL, body, "audit-prep processor is closed")
 	}
 
-	mapURL, mapStatus, sources := p.recoverSourceMap(entryURL, jsURL, body)
+	_, _, sources := p.recoverSourceMap(entryURL, jsURL, body)
 	if len(sources) > 0 {
 		outputs := make([]string, 0, len(sources))
 		for _, source := range sources {
 			rel, err := p.writeSource(source.Name, []byte(source.Content))
 			if err != nil {
-				return p.recordFailure(entryURL, jsURL, body, mapStatus, mapURL, fmt.Sprintf("write recovered source: %v", err))
+				return p.recordFailure(jsURL, body, fmt.Sprintf("write recovered source: %v", err))
 			}
 			if !contains(outputs, rel) {
 				outputs = append(outputs, rel)
 			}
 		}
 		sort.Strings(outputs)
-		p.records = append(p.records, ManifestFile{
-			EntryURL:        entryURL,
-			JSURL:           jsURL,
-			Status:          "sourcemap",
-			SourceMapURL:    mapURL,
-			SourceMapStatus: "used",
-			Outputs:         outputs,
-		})
 		result.Status = "sourcemap"
 		result.Outputs = outputs
 		return result
 	}
 
 	if p.workerErr != "" {
-		return p.recordFailure(entryURL, jsURL, body, mapStatus, mapURL, "audit-prep worker unavailable after previous failure: "+p.workerErr)
+		return p.recordFailure(jsURL, body, "audit-prep worker unavailable after previous failure: "+p.workerErr)
 	}
 
 	p.nextID++
@@ -211,7 +198,7 @@ func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
 	if err := json.NewEncoder(p.stdin).Encode(workerRequest{ID: id, Source: string(body)}); err != nil {
 		errText := fmt.Sprintf("send audit-prep request: %v", err)
 		p.latchWorkerFailure(errText)
-		return p.recordFailure(entryURL, jsURL, body, mapStatus, mapURL, errText)
+		return p.recordFailure(jsURL, body, errText)
 	}
 
 	var response workerResponse
@@ -224,37 +211,29 @@ func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
 			errText += ": " + stderr
 		}
 		p.latchWorkerFailure(errText)
-		return p.recordFailure(entryURL, jsURL, body, mapStatus, mapURL, errText)
+		return p.recordFailure(jsURL, body, errText)
 	}
 	if response.ID != id {
 		errText := fmt.Sprintf("audit-prep response id mismatch: got %d want %d", response.ID, id)
 		p.latchWorkerFailure(errText)
-		return p.recordFailure(entryURL, jsURL, body, mapStatus, mapURL, errText)
+		return p.recordFailure(jsURL, body, errText)
 	}
 	if !response.OK {
 		errText := response.Error
 		if errText == "" {
 			errText = "audit-prep processing failed"
 		}
-		return p.recordFailure(entryURL, jsURL, body, mapStatus, mapURL, errText)
+		return p.recordFailure(jsURL, body, errText)
 	}
 
 	code := []byte(response.Code)
 	if len(code) == 0 {
 		code = body
 	}
-	rel, err := p.writeGenerated("bundles", jsURL, ".js", code)
+	rel, err := p.writeGenerated(jsURL, ".js", code)
 	if err != nil {
-		return p.recordFailure(entryURL, jsURL, body, mapStatus, mapURL, fmt.Sprintf("write processed bundle: %v", err))
+		return p.recordFailure(jsURL, body, fmt.Sprintf("write processed bundle: %v", err))
 	}
-	p.records = append(p.records, ManifestFile{
-		EntryURL:        entryURL,
-		JSURL:           jsURL,
-		Status:          "processed",
-		SourceMapURL:    mapURL,
-		SourceMapStatus: mapStatus,
-		Outputs:         []string{rel},
-	})
 	result.Status = "processed"
 	result.Outputs = []string{rel}
 	return result
@@ -450,57 +429,46 @@ func safeApplicationSourcePath(name string) string {
 }
 
 func (p *Processor) writeSource(name string, data []byte) (string, error) {
-	return p.writeContent(filepath.ToSlash(filepath.Join("sources", filepath.FromSlash(name))), data)
+	return p.writeContent(filepath.ToSlash(filepath.FromSlash(name)), data)
 }
 
-func (p *Processor) writeGenerated(dir, sourceURL, fallbackExt string, data []byte) (string, error) {
-	return p.writeContent(filepath.ToSlash(filepath.Join(dir, urlutil.ArtifactFilename(sourceURL, fallbackExt, "bundle"))), data)
+func (p *Processor) writeGenerated(sourceURL, fallbackExt string, data []byte) (string, error) {
+	return p.writeContent(urlutil.ArtifactFilename(sourceURL, fallbackExt, "script"), data)
 }
 
 func (p *Processor) writeContent(preferredRel string, data []byte) (string, error) {
 	hash := fullHash(data)
-	category, _, _ := strings.Cut(preferredRel, "/")
-	contentKey := category + "\x00" + hash
-	if rel, ok := p.contentRefs[contentKey]; ok {
-		return rel, nil
+	if rel, ok := p.contentRefs[hash]; ok {
+		return filepath.ToSlash(filepath.Join("js", rel)), nil
 	}
 
-	rel := preferredRel
+	rel := filepath.ToSlash(preferredRel)
 	if existingHash, ok := p.pathHashes[rel]; ok && existingHash != hash {
 		ext := path.Ext(rel)
 		rel = strings.TrimSuffix(rel, ext) + "-" + hash[:8] + ext
 	}
-	fullPath := filepath.Join(p.auditDir, filepath.FromSlash(rel))
+	fullPath := filepath.Join(p.outputDir, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(fullPath, data, 0644); err != nil {
+	if err := fileutil.WriteFileAtomic(fullPath, data, 0644); err != nil {
 		return "", err
 	}
-	p.contentRefs[contentKey] = rel
+	p.contentRefs[hash] = rel
 	p.pathHashes[rel] = hash
-	return rel, nil
+	return filepath.ToSlash(filepath.Join("js", rel)), nil
 }
 
-func (p *Processor) recordFailure(entryURL, jsURL string, body []byte, mapStatus, mapURL, errText string) FileResult {
-	rel, writeErr := p.writeGenerated("failures", jsURL, ".js", body)
+func (p *Processor) recordFailure(jsURL string, body []byte, errText string) FileResult {
+	rel, writeErr := p.writeGenerated(jsURL, ".js", body)
 	if writeErr != nil {
-		errText += fmt.Sprintf("; write failure file: %v", writeErr)
+		errText += fmt.Sprintf("; write fallback file: %v", writeErr)
 		rel = ""
 	}
 	outputs := make([]string, 0, 1)
 	if rel != "" {
 		outputs = append(outputs, rel)
 	}
-	p.records = append(p.records, ManifestFile{
-		EntryURL:        entryURL,
-		JSURL:           jsURL,
-		Status:          "failed",
-		SourceMapURL:    mapURL,
-		SourceMapStatus: mapStatus,
-		Outputs:         outputs,
-		Error:           errText,
-	})
 	return FileResult{
 		AnalysisBody: body,
 		Status:       "failed",
@@ -508,37 +476,6 @@ func (p *Processor) recordFailure(entryURL, jsURL string, body []byte, mapStatus
 		Failed:       true,
 		Error:        errText,
 	}
-}
-
-func (p *Processor) Save() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	sort.Slice(p.records, func(i, j int) bool {
-		if p.records[i].EntryURL != p.records[j].EntryURL {
-			return p.records[i].EntryURL < p.records[j].EntryURL
-		}
-		return p.records[i].JSURL < p.records[j].JSURL
-	})
-	manifest := Manifest{Version: 1, Files: p.records}
-	path := filepath.Join(p.auditDir, "manifest.json")
-	tmpPath := path + ".tmp"
-	file, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(manifest); err != nil {
-		_ = file.Close()
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	return os.Rename(tmpPath, path)
 }
 
 func (p *Processor) checkWorker() error {

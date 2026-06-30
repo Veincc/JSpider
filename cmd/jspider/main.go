@@ -85,6 +85,9 @@ func run(cfg *config.Config) error {
 			return err
 		}
 	}
+	if err := preprocess.CheckNodeRuntime(); err != nil {
+		return err
+	}
 	if cfg.Headless {
 		if err := checkBrowserAvailable(); err != nil {
 			return err
@@ -123,6 +126,7 @@ func run(cfg *config.Config) error {
 	initializedSites := make(map[string]bool)
 	processors := make(map[string]*preprocess.Processor)
 	apiSessions := make(map[string]*apidiscovery.Session)
+	siteEntryURLs := make(map[string][]string)
 	states := make(map[string]*crawlState)
 	defer func() {
 		for _, processor := range processors {
@@ -144,28 +148,26 @@ func run(cfg *config.Config) error {
 			initializedSites[site] = true
 		}
 
-		var prep *preprocess.Processor
-		if cfg.AuditPrep {
-			prep = processors[site]
-			if prep == nil {
-				var err error
-				prep, err = preprocess.New(siteDir, func(entryURL, rawURL string) ([]byte, error) {
-					result := f.FetchForEntry(rawURL, entryURL)
-					if result.Err != nil {
-						return nil, result.Err
-					}
-					if result.StatusCode != 200 {
-						return nil, fmt.Errorf("HTTP %d", result.StatusCode)
-					}
-					return result.Body, nil
-				})
-				if err != nil {
-					return err
+		prep := processors[site]
+		if prep == nil {
+			var err error
+			prep, err = preprocess.New(siteDir, func(entryURL, rawURL string) ([]byte, error) {
+				result := f.FetchForEntry(rawURL, entryURL)
+				if result.Err != nil {
+					return nil, result.Err
 				}
-				processors[site] = prep
-				log.Info("Audit preparation enabled: output will be written to %s", filepath.Join(siteDir, "audit"))
+				if result.StatusCode != 200 {
+					return nil, fmt.Errorf("HTTP %d", result.StatusCode)
+				}
+				return result.Body, nil
+			})
+			if err != nil {
+				return err
 			}
+			processors[site] = prep
+			log.Info("Processed JavaScript will be written to %s", filepath.Join(siteDir, "js"))
 		}
+		siteEntryURLs[site] = append(siteEntryURLs[site], entryURL)
 
 		state := crawlStateForSite(states, site)
 		var apiSession *apidiscovery.Session
@@ -184,9 +186,6 @@ func run(cfg *config.Config) error {
 				return fmt.Errorf("analyze discovered JavaScript APIs for %s: %w", entryURL, err)
 			}
 			report := apiSession.Report()
-			if err := apidiscovery.WriteArtifacts(siteDir, report); err != nil {
-				return fmt.Errorf("save API discovery artifacts for %s: %w", entryURL, err)
-			}
 			log.Info("[%d/%d] API discovery: static=%d runtime=%d matched=%d confirmed=%d bases=%d",
 				i+1, len(urls), report.Summary.Static, report.Summary.Runtime,
 				report.Summary.Matched, report.Summary.Confirmed, report.Summary.Bases)
@@ -204,14 +203,8 @@ func run(cfg *config.Config) error {
 		log.Info("[%d/%d] Done: %s (analyzed %d JS)", i+1, len(urls), entryURL, analyzed)
 	}
 
-	for site, prep := range processors {
-		if err := prep.Save(); err != nil {
-			return fmt.Errorf("save audit manifest: %w", err)
-		}
-		delete(processors, site)
-		if err := prep.Close(); err != nil {
-			return fmt.Errorf("close audit-prep worker: %w", err)
-		}
+	if err := finalizeOutputs(cfg.OutDir, s, initializedSites, processors, apiSessions, siteEntryURLs, cfg.APIDiscovery); err != nil {
+		return err
 	}
 
 	printSummary(s, totalAnalyzed, log)
@@ -222,8 +215,6 @@ func run(cfg *config.Config) error {
 // It always runs static HTML extraction, and additionally runs headless browser
 // discovery if cfg.Headless is enabled, merging and deduplicating the results.
 func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, entryURL string, queued, processed map[string]bool, totalAnalyzed *int) int {
-	entryDomain := urlutil.SanitizeDomain(entryURL)
-
 	// 1. Static HTML extraction (always)
 	log.Info("Downloading entry HTML: %s", entryURL)
 	htmlResult := f.FetchForEntry(entryURL, entryURL)
@@ -234,10 +225,6 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 
 	htmlContent := string(htmlResult.Body)
 	log.Info("Entry HTML size: %d bytes", len(htmlContent))
-	if err := s.SaveEntry(entryDomain, htmlResult.Body); err != nil {
-		log.LogError("save entry HTML", "URL=%s error=%v", entryURL, err)
-		return 0
-	}
 
 	staticAssets := htmlEx.ExtractEntryJS(htmlContent, entryURL)
 	log.Info("Static extraction found %d JS assets", len(staticAssets))
@@ -379,7 +366,7 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 	return results
 }
 
-// analyzeResultWithPreprocess analyzes a single download result with optional audit-prep preprocessing.
+// analyzeResultWithPreprocess analyzes a single downloaded JavaScript response.
 func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
 	item := res.req
 
@@ -403,20 +390,13 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		return
 	}
 
-	analysisData := res.result.Body
+	prepResult := prep.Process(entryURL, item.url, res.result.Body)
+	analysisData := prepResult.AnalysisBody
 	entrySite := urlutil.SanitizeDomain(entryURL)
-
-	if cfg.AuditPrep && prep != nil {
-		prepResult := prep.Process(entryURL, item.url, res.result.Body)
-		analysisData = prepResult.AnalysisBody
-		if prepResult.Failed {
-			log.Warn("Audit preparation failed for %s: %s", item.url, prepResult.Error)
-		}
-	} else {
-		if _, _, err := s.SaveJS(entrySite, item.url, res.result.Body); err != nil {
-			log.LogError("save JavaScript", "URL=%s error=%v", item.url, err)
-		}
+	if prepResult.Failed {
+		log.Warn("JavaScript processing fell back for %s: %s", item.url, prepResult.Error)
 	}
+	s.RecordJSOutputs(entrySite, item.url, prepResult.Outputs)
 
 	if cfg.APIDiscovery && apiSession != nil {
 		apiSession.AddSource(item.url, analysisData)

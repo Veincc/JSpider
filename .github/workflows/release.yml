@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        env:
+          CGO_ENABLED: "1"
+        run: go test ./...
+      - name: Vet
+        env:
+          CGO_ENABLED: "1"
+        run: go vet ./...
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            asset: jspider-linux-amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            asset: jspider-linux-arm64
+          - runner: windows-2025
+            goos: windows
+            goarch: amd64
+            asset: jspider-windows-amd64.exe
+          - runner: windows-11-arm
+            goos: windows
+            goarch: arm64
+            asset: jspider-windows-arm64.exe
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            asset: jspider-darwin-amd64
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+            asset: jspider-darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify C compiler
+        shell: bash
+        run: clang --version
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          CC: clang
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o "dist/${ASSET}" ./cmd/jspider
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect release assets
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          cd dist
+          LC_ALL=C sha256sum jspider-* > checksums.txt
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes

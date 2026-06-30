@@ -2,13 +2,22 @@ package preprocess
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	if version := os.Getenv("JSPIDER_TEST_NODE_VERSION"); version != "" {
+		_, _ = os.Stdout.WriteString(version + "\n")
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 func TestExternalSourceMapRecoversApplicationSources(t *testing.T) {
 	if err := CheckNodeRuntime(); err != nil {
@@ -36,12 +45,11 @@ func TestExternalSourceMapRecoversApplicationSources(t *testing.T) {
 	if result.Failed || result.Status != "sourcemap" {
 		t.Fatalf("Process() = %+v", result)
 	}
-	if len(result.Outputs) != 1 || result.Outputs[0] != "sources/src/main.ts" {
+	if len(result.Outputs) != 1 || result.Outputs[0] != "js/src/main.ts" {
 		t.Fatalf("outputs = %v", result.Outputs)
 	}
-	assertAuditFile(t, siteDir, "sources/src/main.ts")
-	assertMissing(t, filepath.Join(siteDir, "audit", "bundles"))
-	assertMissing(t, filepath.Join(siteDir, "audit", "failures"))
+	assertOutputFile(t, siteDir, "js/src/main.ts")
+	assertMissing(t, filepath.Join(siteDir, "audit"))
 }
 
 func TestExtractSourceMapReferenceAllowsAsterisk(t *testing.T) {
@@ -92,7 +100,8 @@ func TestInlineAndIndexedSourceMaps(t *testing.T) {
 	if result.Status != "sourcemap" || len(result.Outputs) != 1 {
 		t.Fatalf("Process() = %+v", result)
 	}
-	assertAuditFile(t, siteDir, "sources/src/app.tsx")
+	assertOutputFile(t, siteDir, "js/src/app.tsx")
+	assertMissing(t, filepath.Join(siteDir, "audit"))
 }
 
 func TestAdjacentSourceMapProbe(t *testing.T) {
@@ -139,13 +148,16 @@ func TestUnavailableSourceMapFallsBackToReadableBundle(t *testing.T) {
 	if string(result.AnalysisBody) != string(body) {
 		t.Fatal("audit processing must not change the crawler discovery input")
 	}
-	output := readAuditFile(t, siteDir, result.Outputs[0])
+	if !strings.HasPrefix(result.Outputs[0], "js/") || !strings.HasSuffix(result.Outputs[0], ".js") {
+		t.Fatalf("processed output = %q", result.Outputs[0])
+	}
+	output := readOutputFile(t, siteDir, result.Outputs[0])
 	for _, want := range []string{`const value = "/api/b64";`, `fetch("/api/value");`} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("processed output missing %q:\n%s", want, output)
 		}
 	}
-	assertMissing(t, filepath.Join(siteDir, "audit", "sources"))
+	assertMissing(t, filepath.Join(siteDir, "audit"))
 }
 
 func TestVendorOnlySourceMapFallsBackToBundle(t *testing.T) {
@@ -162,13 +174,11 @@ func TestVendorOnlySourceMapFallsBackToBundle(t *testing.T) {
 		}`), nil
 	})
 	result := p.Process("https://example.com/", "https://example.com/app.js", []byte("const value=1;"))
-	if result.Status != "processed" {
+	if result.Failed || result.Status != "processed" || len(result.Outputs) != 1 {
 		t.Fatalf("Process() = %+v", result)
 	}
-	manifest := saveAndReadManifest(t, p, siteDir)
-	if manifest.Files[0].SourceMapStatus != "no_application_sources" {
-		t.Fatalf("source map status = %q", manifest.Files[0].SourceMapStatus)
-	}
+	assertOutputFile(t, siteDir, result.Outputs[0])
+	assertMissing(t, filepath.Join(siteDir, "audit"))
 }
 
 func TestParseFailureSavesOnlyFailureSource(t *testing.T) {
@@ -185,13 +195,16 @@ func TestParseFailureSavesOnlyFailureSource(t *testing.T) {
 	if !result.Failed || result.Status != "failed" || len(result.Outputs) != 1 {
 		t.Fatalf("Process() = %+v", result)
 	}
-	if got := readAuditFile(t, siteDir, result.Outputs[0]); got != string(body) {
+	if got := readOutputFile(t, siteDir, result.Outputs[0]); got != string(body) {
 		t.Fatalf("failure output = %q", got)
 	}
-	assertMissing(t, filepath.Join(siteDir, "audit", "bundles"))
+	if count := countOutputFiles(t, filepath.Join(siteDir, "js")); count != 1 {
+		t.Fatalf("fallback files = %d, want 1", count)
+	}
+	assertMissing(t, filepath.Join(siteDir, "audit"))
 }
 
-func TestManifestIsMinimalAndContentIsDeduplicated(t *testing.T) {
+func TestProcessedOutputsAreDeduplicatedWithoutManifest(t *testing.T) {
 	if err := CheckNodeRuntime(); err != nil {
 		t.Skip(err)
 	}
@@ -207,23 +220,63 @@ func TestManifestIsMinimalAndContentIsDeduplicated(t *testing.T) {
 	})
 	first := p.Process("https://first.example/", "https://cdn.example/a.js", []byte("//# sourceMappingURL=a.js.map"))
 	second := p.Process("https://second.example/", "https://cdn.example/b.js", []byte("//# sourceMappingURL=b.js.map"))
-	if first.Outputs[0] != second.Outputs[0] {
+	if !reflect.DeepEqual(first.Outputs, second.Outputs) {
 		t.Fatalf("deduplicated outputs differ: %v vs %v", first.Outputs, second.Outputs)
 	}
+	if count := countOutputFiles(t, filepath.Join(siteDir, "js")); count != 1 {
+		t.Fatalf("deduplicated files = %d, want 1", count)
+	}
+	assertMissing(t, filepath.Join(siteDir, "audit"))
+	assertMissing(t, filepath.Join(siteDir, "manifest.json"))
+}
 
-	manifest := saveAndReadManifest(t, p, siteDir)
-	if manifest.Version != 1 || len(manifest.Files) != 2 {
-		t.Fatalf("manifest = %+v", manifest)
+func TestSourcePathCollisionPreservesBothContents(t *testing.T) {
+	if err := CheckNodeRuntime(); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(siteDir, "audit", "manifest.json")); err != nil {
-		t.Fatalf("manifest missing: %v", err)
+	siteDir := t.TempDir()
+	maps := map[string][]byte{
+		"https://example.com/a.js.map": []byte(`{"version":3,"sources":["src/shared.ts"],"sourcesContent":["export const value = 1;"]}`),
+		"https://example.com/b.js.map": []byte(`{"version":3,"sources":["src/shared.ts"],"sourcesContent":["export const value = 2;"]}`),
 	}
-	for _, unwanted := range []string{"indexes", "slices", "transform_log.json"} {
-		assertMissing(t, filepath.Join(siteDir, "audit", unwanted))
+	p := newTestProcessor(t, siteDir, func(rawURL string) ([]byte, error) { return maps[rawURL], nil })
+	first := p.Process("https://example.com/", "https://example.com/a.js", []byte("//# sourceMappingURL=a.js.map"))
+	second := p.Process("https://example.com/", "https://example.com/b.js", []byte("//# sourceMappingURL=b.js.map"))
+	if len(first.Outputs) != 1 || len(second.Outputs) != 1 || first.Outputs[0] == second.Outputs[0] {
+		t.Fatalf("collision outputs = %v and %v", first.Outputs, second.Outputs)
+	}
+	if got := readOutputFile(t, siteDir, first.Outputs[0]); got != "export const value = 1;" {
+		t.Fatalf("first collision output = %q", got)
+	}
+	if got := readOutputFile(t, siteDir, second.Outputs[0]); got != "export const value = 2;" {
+		t.Fatalf("second collision output = %q", got)
 	}
 }
 
-func TestMissingNodeProducesClearError(t *testing.T) {
+func TestProcessedOutputIsAtomicAndUsesJavaScriptPermissions(t *testing.T) {
+	if err := CheckNodeRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	siteDir := t.TempDir()
+	p := newTestProcessor(t, siteDir, func(string) ([]byte, error) { return nil, errors.New("404") })
+	result := p.Process("https://example.com/", "https://example.com/app.js", []byte("const value=1;"))
+	if len(result.Outputs) != 1 {
+		t.Fatalf("Process() = %+v", result)
+	}
+	info, err := os.Stat(filepath.Join(siteDir, filepath.FromSlash(result.Outputs[0])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0644 {
+		t.Fatalf("mode = %o, want 644", info.Mode().Perm())
+	}
+	temps, err := filepath.Glob(filepath.Join(siteDir, "js", ".*.tmp-*"))
+	if err != nil || len(temps) != 0 {
+		t.Fatalf("temporary outputs = %v, error = %v", temps, err)
+	}
+}
+
+func TestMissingNodeProducesClearGlobalError(t *testing.T) {
 	t.Setenv("PATH", "")
 	if err := CheckNodeRuntime(); err == nil || err.Error() != NodeRuntimeError {
 		t.Fatalf("CheckNodeRuntime() error = %v", err)
@@ -231,6 +284,35 @@ func TestMissingNodeProducesClearError(t *testing.T) {
 	if p, err := New(t.TempDir(), nil); err == nil {
 		_ = p.Close()
 		t.Fatal("New() succeeded without Node.js")
+	}
+}
+
+func TestNodeOlderThan18ProducesClearError(t *testing.T) {
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeName := "node"
+	if runtime.GOOS == "windows" {
+		nodeName += ".exe"
+	}
+	node := filepath.Join(dir, nodeName)
+	if runtime.GOOS == "windows" {
+		binary, readErr := os.ReadFile(executable)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if writeErr := os.WriteFile(node, binary, 0755); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	} else if err := os.Link(executable, node); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("JSPIDER_TEST_NODE_VERSION", "v17.9.1")
+	if err := CheckNodeRuntime(); err == nil || err.Error() != NodeVersionError {
+		t.Fatalf("CheckNodeRuntime() error = %v", err)
 	}
 }
 
@@ -252,36 +334,41 @@ func newTestProcessor(t *testing.T, siteDir string, fetch func(string) ([]byte, 
 	return p
 }
 
-func saveAndReadManifest(t *testing.T, p *Processor, siteDir string) Manifest {
+func assertOutputFile(t *testing.T, siteDir, rel string) {
 	t.Helper()
-	if err := p.Save(); err != nil {
-		t.Fatalf("Save() error = %v", err)
-	}
-	var manifest Manifest
-	data, err := os.ReadFile(filepath.Join(siteDir, "audit", "manifest.json"))
-	if err != nil {
-		t.Fatalf("read manifest: %v", err)
-	}
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("decode manifest: %v", err)
-	}
-	return manifest
-}
-
-func assertAuditFile(t *testing.T, siteDir, rel string) {
-	t.Helper()
-	if _, err := os.Stat(filepath.Join(siteDir, "audit", filepath.FromSlash(rel))); err != nil {
-		t.Fatalf("expected audit file %s: %v", rel, err)
+	if _, err := os.Stat(filepath.Join(siteDir, filepath.FromSlash(rel))); err != nil {
+		t.Fatalf("expected output %s: %v", rel, err)
 	}
 }
 
-func readAuditFile(t *testing.T, siteDir, rel string) string {
+func readOutputFile(t *testing.T, siteDir, rel string) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join(siteDir, "audit", filepath.FromSlash(rel)))
+	data, err := os.ReadFile(filepath.Join(siteDir, filepath.FromSlash(rel)))
 	if err != nil {
-		t.Fatalf("read audit file %s: %v", rel, err)
+		t.Fatalf("read output %s: %v", rel, err)
 	}
 	return string(data)
+}
+
+func countOutputFiles(t *testing.T, root string) int {
+	t.Helper()
+	count := 0
+	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			count++
+		}
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return count
 }
 
 func assertMissing(t *testing.T, path string) {

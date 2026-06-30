@@ -3,71 +3,66 @@ package store
 import (
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
+	"runtime"
 	"testing"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
 )
 
-func TestSaveEntryAndJavaScriptLayout(t *testing.T) {
+func TestWriteJSMapSortsDeduplicatesAndUsesSiteRelativePaths(t *testing.T) {
 	outDir := t.TempDir()
 	s := New(outDir)
+	s.RecordJSOutputs("example_com", "https://example.com/z.js", []string{"js/shared.js", "js/shared.js"})
+	s.RecordJSOutputs("example_com", "https://example.com/a.js", []string{"js/src/b.ts", "js/src/a.ts", "js/shared.js"})
 
-	if err := s.SaveEntry("example_com", []byte("<html></html>")); err != nil {
-		t.Fatalf("SaveEntry() error = %v", err)
+	if err := s.WriteJSMap("example_com"); err != nil {
+		t.Fatal(err)
 	}
-	rel, created, err := s.SaveJS(
-		"example_com",
-		"https://cdn.example.net/assets/app.min.js?v=1",
-		[]byte("console.log('app')"),
-	)
+	data, err := os.ReadFile(filepath.Join(outDir, "example_com", "js-map.txt"))
 	if err != nil {
-		t.Fatalf("SaveJS() error = %v", err)
+		t.Fatal(err)
 	}
-	if !created {
-		t.Fatal("first SaveJS() should create a file")
+	want := "https://example.com/a.js\tjs/shared.js\n" +
+		"https://example.com/a.js\tjs/src/a.ts\n" +
+		"https://example.com/a.js\tjs/src/b.ts\n" +
+		"https://example.com/z.js\tjs/shared.js\n"
+	if string(data) != want {
+		t.Fatalf("js-map.txt = %q, want %q", data, want)
 	}
-	if !strings.HasPrefix(rel, "example_com/js/app.min-") || !strings.HasSuffix(rel, ".js") {
-		t.Fatalf("SaveJS() path = %q", rel)
-	}
-	assertExists(t, filepath.Join(outDir, "example_com", "entry.html"))
-	assertExists(t, filepath.Join(outDir, filepath.FromSlash(rel)))
-}
-
-func TestSaveJavaScriptDeduplicatesWithinSite(t *testing.T) {
-	outDir := t.TempDir()
-	s := New(outDir)
-	body := []byte("same")
-
-	first, created, err := s.SaveJS("example_com", "https://example.com/a.js", body)
-	if err != nil || !created {
-		t.Fatalf("first SaveJS() = %q, %v, %v", first, created, err)
-	}
-	second, created, err := s.SaveJS("example_com", "https://example.com/b.js", body)
+	info, err := os.Stat(filepath.Join(outDir, "example_com", "js-map.txt"))
 	if err != nil {
-		t.Fatalf("second SaveJS() error = %v", err)
+		t.Fatal(err)
 	}
-	if created || second != first {
-		t.Fatalf("duplicate SaveJS() = %q, %v; want existing %q", second, created, first)
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+		t.Fatalf("map mode = %o, want 600", info.Mode().Perm())
 	}
 }
 
-func TestSaveJavaScriptKeepsSitesSelfContained(t *testing.T) {
+func TestWriteJSMapCreatesAtomicEmptyFile(t *testing.T) {
 	outDir := t.TempDir()
 	s := New(outDir)
-	body := []byte("same")
+	if err := s.WriteJSMap("empty_com"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(outDir, "empty_com", "js-map.txt"))
+	if err != nil || len(data) != 0 {
+		t.Fatalf("empty map = %q, error = %v", data, err)
+	}
+	temps, err := filepath.Glob(filepath.Join(outDir, "empty_com", ".js-map.txt.tmp-*"))
+	if err != nil || len(temps) != 0 {
+		t.Fatalf("temporary maps = %v, error = %v", temps, err)
+	}
+}
 
-	_, firstCreated, err := s.SaveJS("first_com", "https://cdn.example/app.js", body)
-	if err != nil {
-		t.Fatalf("first site SaveJS() error = %v", err)
+func TestJSMappingsAreIsolatedBySite(t *testing.T) {
+	s := New(t.TempDir())
+	s.RecordJSOutputs("first_com", "https://cdn.example/app.js", []string{"js/first.js"})
+	s.RecordJSOutputs("second_com", "https://cdn.example/app.js", []string{"js/second.js"})
+	if got := s.JSMapEntries("first_com"); len(got) != 1 || got[0].Path != "js/first.js" {
+		t.Fatalf("first-site mappings = %+v", got)
 	}
-	_, secondCreated, err := s.SaveJS("second_com", "https://cdn.example/app.js", body)
-	if err != nil {
-		t.Fatalf("second site SaveJS() error = %v", err)
-	}
-	if !firstCreated || !secondCreated {
-		t.Fatal("each entry site should keep its own copy")
+	if got := s.JSMapEntries("second_com"); len(got) != 1 || got[0].Path != "js/second.js" {
+		t.Fatalf("second-site mappings = %+v", got)
 	}
 }
 
@@ -102,72 +97,4 @@ func TestMergeJSAssetPreservesMinimumDepth(t *testing.T) {
 	if got := mergeJSAsset(deep, shallower).Depth; got != 1 {
 		t.Fatalf("merged depth = %d, want 1", got)
 	}
-}
-
-func TestSaveJavaScriptConcurrentDeduplication(t *testing.T) {
-	outDir := t.TempDir()
-	s := New(outDir)
-	body := []byte("same concurrent body")
-
-	const callers = 16
-	results := make(chan string, callers)
-	errors := make(chan error, callers)
-	var wg sync.WaitGroup
-	for i := 0; i < callers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rel, _, err := s.SaveJS("example_com", "https://example.com/app.js", body)
-			if err != nil {
-				errors <- err
-				return
-			}
-			results <- rel
-		}()
-	}
-	wg.Wait()
-	close(results)
-	close(errors)
-
-	for err := range errors {
-		t.Fatalf("SaveJS() error = %v", err)
-	}
-	var expected string
-	for rel := range results {
-		if expected == "" {
-			expected = rel
-		}
-		if rel != expected {
-			t.Fatalf("SaveJS() path = %q, want %q", rel, expected)
-		}
-	}
-	assertExists(t, filepath.Join(outDir, filepath.FromSlash(expected)))
-	if count := countRegularFiles(t, filepath.Join(outDir, "example_com", "js")); count != 1 {
-		t.Fatalf("saved files = %d, want 1", count)
-	}
-}
-
-func assertExists(t *testing.T, path string) {
-	t.Helper()
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("expected %s: %v", path, err)
-	}
-}
-
-func countRegularFiles(t *testing.T, root string) int {
-	t.Helper()
-	count := 0
-	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !entry.IsDir() {
-			count++
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("WalkDir() error = %v", err)
-	}
-	return count
 }

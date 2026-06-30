@@ -6,9 +6,96 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func TestEndpointURLsUsesPriorityAndResolvesRelativeRawURLs(t *testing.T) {
+	report := Report{Endpoints: []Endpoint{
+		{ResolvedURL: "https://api.example.com/matched#fragment", RawURL: "/ignored"},
+		{ResolvedCandidates: []string{"https://example.com/candidate?x=1#drop"}, RawURL: "/ignored-too"},
+		{RawURL: "https://example.com/absolute?q=1#drop"},
+		{RawURL: "/api/users"},
+		{RawURL: "./api/orders"},
+		{RawURL: "../api/admin"},
+		{RawURL: "//api.example.net/users"},
+	}}
+	got := EndpointURLs(report, []string{"https://example.com/base/page"})
+	want := []string{
+		"https://api.example.com/matched",
+		"https://api.example.net/users",
+		"https://example.com/absolute?q=1",
+		"https://example.com/api/admin",
+		"https://example.com/api/users",
+		"https://example.com/base/api/orders",
+		"https://example.com/candidate?x=1",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs() = %v, want %v", got, want)
+	}
+}
+
+func TestEndpointURLsFiltersInvalidAndDeduplicatesAcrossEntries(t *testing.T) {
+	report := Report{Endpoints: []Endpoint{
+		{RawURL: ""}, {RawURL: "?page=1"}, {RawURL: "#section"},
+		{RawURL: "mailto:test@example.com"}, {RawURL: "file:///tmp/a"},
+		{RawURL: "javascript:alert(1)"}, {RawURL: "http://[::1"},
+		{RawURL: "/api/EXPR/users"}, {RawURL: "/shared"}, {RawURL: "/shared"},
+		{ResolvedCandidates: []string{"ftp://example.com/ignored"}, RawURL: "/must-not-fallback"},
+		{ResolvedCandidates: []string{" "}, RawURL: "https://example.com/fallback"},
+	}}
+	got := EndpointURLs(report, []string{"https://example.com/a", "https://example.com/b"})
+	want := []string{"https://example.com/fallback", "https://example.com/shared"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs() = %v, want %v", got, want)
+	}
+}
+
+func TestEndpointURLsDoesNotReintroduceFilteredReportNoise(t *testing.T) {
+	report := BuildReport([]StaticEndpoint{
+		{RawURL: "examples/PDF.js/web/viewer.html", SourceJSURL: "https://example.com/vendor.js"},
+		{RawURL: "https://api.iconify.design", SourceJSURL: "https://example.com/app.js"},
+		{RawURL: "https://example.com/api/local", Method: "GET", SourceJSURL: "https://example.com/app.js"},
+		{RawURL: "/api/users", Method: "GET", SourceJSURL: "https://example.com/app.js"},
+	}, nil)
+	got := EndpointURLs(report, []string{"https://example.com/"})
+	want := []string{"https://example.com/api/local", "https://example.com/api/users"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs(filtered report) = %v, want %v", got, want)
+	}
+}
+
+func TestWriteEndpointURLsIsAtomicPrivateAndSupportsEmptyOutput(t *testing.T) {
+	siteDir := t.TempDir()
+	if err := WriteEndpointURLs(siteDir, []string{"https://example.com/z", "https://example.com/a", "https://example.com/a"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(siteDir, "endpoints.txt")
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "https://example.com/a\nhttps://example.com/z\n" {
+		t.Fatalf("endpoints = %q, error = %v", data, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+		t.Fatalf("endpoint mode = %o, want 600", info.Mode().Perm())
+	}
+	if err := WriteEndpointURLs(siteDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err = os.ReadFile(path)
+	if err != nil || len(data) != 0 {
+		t.Fatalf("empty endpoints = %q, error = %v", data, err)
+	}
+	temps, err := filepath.Glob(filepath.Join(siteDir, ".endpoints.txt.tmp-*"))
+	if err != nil || len(temps) != 0 {
+		t.Fatalf("temporary endpoint files = %v, error = %v", temps, err)
+	}
+}
 
 func TestBuildReportIncludesRuntimeOnlyStaticOnlyAndResolvedCandidates(t *testing.T) {
 	report := BuildReport(
@@ -165,7 +252,7 @@ func TestWriteArtifactsIsSortedVersionedAtomicAndPrivate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat %s: %v", dir, err)
 		}
-		if info.Mode().Perm() != 0700 {
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0700 {
 			t.Fatalf("%s mode = %o, want 700", dir, info.Mode().Perm())
 		}
 	}
@@ -181,7 +268,7 @@ func TestWriteArtifactsIsSortedVersionedAtomicAndPrivate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("stat %s: %v", path, err)
 		}
-		if info.Mode().Perm() != 0600 {
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 			t.Fatalf("%s mode = %o, want 600", path, info.Mode().Perm())
 		}
 		assertVersionOne(t, path)

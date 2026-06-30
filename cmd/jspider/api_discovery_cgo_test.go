@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
@@ -16,7 +17,9 @@ import (
 	"github.com/Veincc/JSpider/internal/headless"
 	"github.com/Veincc/JSpider/internal/html"
 	"github.com/Veincc/JSpider/internal/logging"
+	"github.com/Veincc/JSpider/internal/preprocess"
 	"github.com/Veincc/JSpider/internal/store"
+	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
 func TestAnalyzeEntryKeepsStaticAPIsWhenHeadlessFails(t *testing.T) {
@@ -57,6 +60,20 @@ func TestAnalyzeEntryKeepsStaticAPIsWhenHeadlessFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	processor, err := preprocess.New(filepath.Join(outDir, urlutil.SanitizeDomain(server.URL)), func(entryURL, rawURL string) ([]byte, error) {
+		result := f.FetchForEntry(rawURL, entryURL)
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		if result.StatusCode != http.StatusOK {
+			return nil, errors.New(http.StatusText(result.StatusCode))
+		}
+		return result.Body, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = processor.Close() })
 	session := apidiscovery.NewSession()
 	analyzed := 0
 
@@ -67,7 +84,7 @@ func TestAnalyzeEntryKeepsStaticAPIsWhenHeadlessFails(t *testing.T) {
 		analyzer.NewAnalyzer(log),
 		html.NewExtractor(),
 		log,
-		nil,
+		processor,
 		session,
 		server.URL+"/",
 		map[string]bool{},
@@ -109,7 +126,7 @@ func TestRunChecksBrowserBeforeCreatingOutput(t *testing.T) {
 }
 
 func TestAnalyzeResultUsesInMemoryAnalysisDataForStaticAPI(t *testing.T) {
-	cfg, s, a, log := analysisHarness(t)
+	cfg, s, a, log, prep := analysisHarness(t)
 	cfg.APIDiscovery = true
 	session := apidiscovery.NewSession()
 	queued := make(map[string]bool)
@@ -123,7 +140,7 @@ func TestAnalyzeResultUsesInMemoryAnalysisDataForStaticAPI(t *testing.T) {
 		s,
 		a,
 		log,
-		nil,
+		prep,
 		session,
 		successfulFetch("app.js", `$.post("/users/create", {name: "alice"});`),
 		"https://example.com/",
@@ -148,5 +165,74 @@ func TestAnalyzeResultUsesInMemoryAnalysisDataForStaticAPI(t *testing.T) {
 	report := session.Report()
 	if report.Summary.Static == 0 || report.StaticEndpoints[0].RawURL != "/users/create" {
 		t.Fatalf("static endpoints = %+v", report.StaticEndpoints)
+	}
+}
+
+func TestAPIDiscoveryWritesOnlyFinalEndpoints(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<script src="/app.js"></script>`))
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`console.log("app")`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	originalCheck, originalDiscover := checkBrowserAvailable, discoverBrowser
+	checkBrowserAvailable = func() error { return nil }
+	discoverBrowser = func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error) {
+		return headless.DiscoveryResult{Requests: []apidiscovery.RuntimeRequest{{
+			RequestID: "runtime", URL: server.URL + "/api/runtime", Method: "GET",
+			ResourceType: "Fetch", EntryURL: server.URL + "/",
+		}}}, nil
+	}
+	t.Cleanup(func() { checkBrowserAvailable, discoverBrowser = originalCheck, originalDiscover })
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	cfg.APIDiscovery, cfg.Headless = true, true
+	if err := run(cfg); err != nil {
+		t.Fatal(err)
+	}
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	data, err := os.ReadFile(filepath.Join(siteDir, "endpoints.txt"))
+	if err != nil || string(data) != server.URL+"/api/runtime\n" {
+		t.Fatalf("endpoints = %q, error = %v", data, err)
+	}
+	assertMapTargetsExist(t, siteDir)
+	assertPathMissing(t, filepath.Join(siteDir, "entry.html"))
+	assertPathMissing(t, filepath.Join(siteDir, "runtime"))
+	assertPathMissing(t, filepath.Join(siteDir, "analysis"))
+}
+
+func TestAPIDiscoveryWritesEmptyEndpointsFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html></html>`))
+	}))
+	defer server.Close()
+
+	originalCheck, originalDiscover := checkBrowserAvailable, discoverBrowser
+	checkBrowserAvailable = func() error { return nil }
+	discoverBrowser = func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error) {
+		return headless.DiscoveryResult{}, nil
+	}
+	t.Cleanup(func() { checkBrowserAvailable, discoverBrowser = originalCheck, originalDiscover })
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	cfg.APIDiscovery, cfg.Headless = true, true
+	if err := run(cfg); err != nil {
+		t.Fatal(err)
+	}
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	data, err := os.ReadFile(filepath.Join(siteDir, "endpoints.txt"))
+	if err != nil || len(data) != 0 {
+		t.Fatalf("empty endpoints = %q, error = %v", data, err)
 	}
 }

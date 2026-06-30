@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,13 +14,14 @@ import (
 	"github.com/Veincc/JSpider/internal/analyzer"
 	"github.com/Veincc/JSpider/internal/config"
 	"github.com/Veincc/JSpider/internal/fetcher"
+	"github.com/Veincc/JSpider/internal/headless"
 	"github.com/Veincc/JSpider/internal/logging"
 	"github.com/Veincc/JSpider/internal/preprocess"
 	"github.com/Veincc/JSpider/internal/store"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
-func TestNormalModeOnlySavesEntryAndRecursiveJavaScript(t *testing.T) {
+func TestNormalModeWritesProcessedJavaScriptAndMapOnly(t *testing.T) {
 	server := newSiteServer(t, map[string]string{
 		"/":                `<script src="/assets/app.js"></script>`,
 		"/assets/app.js":   `import("./chunk.js");`,
@@ -35,15 +36,32 @@ func TestNormalModeOnlySavesEntryAndRecursiveJavaScript(t *testing.T) {
 	}
 
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
-	assertPathExists(t, filepath.Join(siteDir, "entry.html"))
 	if count := countFiles(t, filepath.Join(siteDir, "js")); count != 2 {
-		t.Fatalf("saved JavaScript files = %d, want 2", count)
+		t.Fatalf("processed JavaScript files = %d, want 2", count)
 	}
+	assertMapTargetsExist(t, siteDir)
+	assertPathMissing(t, filepath.Join(siteDir, "entry.html"))
+	assertPathMissing(t, filepath.Join(siteDir, "endpoints.txt"))
 	assertPathMissing(t, filepath.Join(siteDir, "audit"))
+	assertPathMissing(t, filepath.Join(siteDir, "runtime"))
+	assertPathMissing(t, filepath.Join(siteDir, "analysis"))
 	assertNoLegacyReports(t, outDir)
 }
 
-func TestAuditModeUsesSourceMapsThenFallsBackToReadableBundle(t *testing.T) {
+func TestRunRequiresNodeBeforeCreatingOutput(t *testing.T) {
+	server := newSiteServer(t, map[string]string{"/": `<html></html>`})
+	defer server.Close()
+
+	t.Setenv("PATH", "")
+	outDir := filepath.Join(t.TempDir(), "not-created")
+	err := run(testConfig(server.URL+"/", outDir))
+	if err == nil || err.Error() != preprocess.NodeRuntimeError {
+		t.Fatalf("run() error = %v", err)
+	}
+	assertPathMissing(t, outDir)
+}
+
+func TestNormalModeUsesSourceMapsThenFallsBackToReadableBundle(t *testing.T) {
 	if err := preprocess.CheckNodeRuntime(); err != nil {
 		t.Skip(err)
 	}
@@ -63,40 +81,26 @@ func TestAuditModeUsesSourceMapsThenFallsBackToReadableBundle(t *testing.T) {
 
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/", outDir)
-	cfg.AuditPrep = true
 	if err := run(cfg); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
 
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
-	assertPathExists(t, filepath.Join(siteDir, "entry.html"))
-	assertPathMissing(t, filepath.Join(siteDir, "js"))
-	assertPathExists(t, filepath.Join(siteDir, "audit", "sources", "src", "main.ts"))
-	if count := countFiles(t, filepath.Join(siteDir, "audit", "bundles")); count != 1 {
-		t.Fatalf("processed bundles = %d, want 1", count)
+	assertPathExists(t, filepath.Join(siteDir, "js", "src", "main.ts"))
+	if count := countFiles(t, filepath.Join(siteDir, "js")); count != 2 {
+		t.Fatalf("processed outputs = %d, want 2", count)
 	}
-	assertPathMissing(t, filepath.Join(siteDir, "audit", "indexes"))
-	assertPathMissing(t, filepath.Join(siteDir, "audit", "slices"))
-	assertPathMissing(t, filepath.Join(siteDir, "audit", "transform_log.json"))
-
-	manifest := readManifest(t, filepath.Join(siteDir, "audit", "manifest.json"))
-	if len(manifest.Files) != 2 {
-		t.Fatalf("manifest files = %d, want 2", len(manifest.Files))
+	rows := readTabMap(t, filepath.Join(siteDir, "js-map.txt"))
+	if len(rows) != 2 || rows[0][0] != server.URL+"/app.js" || rows[1][0] != server.URL+"/chunk.js" {
+		t.Fatalf("JavaScript map = %+v", rows)
 	}
-	statuses := make(map[string]string)
-	for _, file := range manifest.Files {
-		statuses[file.JSURL] = file.Status
-	}
-	if statuses[server.URL+"/app.js"] != "sourcemap" {
-		t.Fatalf("app.js status = %q", statuses[server.URL+"/app.js"])
-	}
-	if statuses[server.URL+"/chunk.js"] != "processed" {
-		t.Fatalf("chunk.js status = %q", statuses[server.URL+"/chunk.js"])
-	}
+	assertMapTargetsExist(t, siteDir)
+	assertPathMissing(t, filepath.Join(siteDir, "entry.html"))
+	assertPathMissing(t, filepath.Join(siteDir, "audit"))
 	assertNoLegacyReports(t, outDir)
 }
 
-func TestAuditFailureSavesOriginalOnlyInFailures(t *testing.T) {
+func TestNormalModeParseFailureSavesOriginalAsOnlyArtifact(t *testing.T) {
 	if err := preprocess.CheckNodeRuntime(); err != nil {
 		t.Skip(err)
 	}
@@ -109,20 +113,23 @@ func TestAuditFailureSavesOriginalOnlyInFailures(t *testing.T) {
 
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/", outDir)
-	cfg.AuditPrep = true
 	if err := run(cfg); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
 
-	auditDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL), "audit")
-	if count := countFiles(t, filepath.Join(auditDir, "failures")); count != 1 {
-		t.Fatalf("failure files = %d, want 1", count)
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	if count := countFiles(t, filepath.Join(siteDir, "js")); count != 1 {
+		t.Fatalf("fallback files = %d, want 1", count)
 	}
-	assertPathMissing(t, filepath.Join(auditDir, "bundles"))
-	manifest := readManifest(t, filepath.Join(auditDir, "manifest.json"))
-	if len(manifest.Files) != 1 || manifest.Files[0].Status != "failed" {
-		t.Fatalf("manifest = %+v", manifest)
+	rows := readTabMap(t, filepath.Join(siteDir, "js-map.txt"))
+	if len(rows) != 1 || rows[0][0] != server.URL+"/broken.js" {
+		t.Fatalf("JavaScript map = %+v", rows)
 	}
+	data, err := os.ReadFile(filepath.Join(siteDir, filepath.FromSlash(rows[0][1])))
+	if err != nil || string(data) != "function broken(" {
+		t.Fatalf("fallback = %q, error = %v", data, err)
+	}
+	assertPathMissing(t, filepath.Join(siteDir, "audit"))
 }
 
 func TestAllowedCDNJavaScriptBelongsToEntrySite(t *testing.T) {
@@ -145,10 +152,15 @@ func TestAllowedCDNJavaScriptBelongsToEntrySite(t *testing.T) {
 		t.Fatalf("run() error = %v", err)
 	}
 
-	entrySite := filepath.Join(outDir, "localhost", "js")
-	if count := countFiles(t, entrySite); count != 1 {
+	entrySite := filepath.Join(outDir, "localhost")
+	if count := countFiles(t, filepath.Join(entrySite, "js")); count != 1 {
 		t.Fatalf("entry-site JavaScript files = %d, want 1", count)
 	}
+	rows := readTabMap(t, filepath.Join(entrySite, "js-map.txt"))
+	if len(rows) != 1 || rows[0][0] != assetServer.URL+"/cdn.js" {
+		t.Fatalf("CDN map = %+v", rows)
+	}
+	assertMapTargetsExist(t, entrySite)
 	assertPathMissing(t, filepath.Join(outDir, "127_0_0_1"))
 }
 
@@ -215,12 +227,12 @@ func TestCookiesAreNotForwardedToCDNOrigins(t *testing.T) {
 func TestMultipleEntrySitesAreIsolated(t *testing.T) {
 	first := newSiteServer(t, map[string]string{
 		"/":         `<script src="/first.js"></script>`,
-		"/first.js": `console.log("first");`,
+		"/first.js": `console.log("same");`,
 	})
 	defer first.Close()
 	second := newSiteServer(t, map[string]string{
 		"/":          `<script src="/second.js"></script>`,
-		"/second.js": `console.log("second");`,
+		"/second.js": `console.log("same");`,
 	})
 	defer second.Close()
 
@@ -243,6 +255,129 @@ func TestMultipleEntrySitesAreIsolated(t *testing.T) {
 	if count := countFiles(t, filepath.Join(outDir, "localhost", "js")); count != 1 {
 		t.Fatalf("second site JavaScript files = %d, want 1", count)
 	}
+	firstRows := readTabMap(t, filepath.Join(outDir, "127_0_0_1", "js-map.txt"))
+	secondRows := readTabMap(t, filepath.Join(outDir, "localhost", "js-map.txt"))
+	if len(firstRows) != 1 || firstRows[0][0] != first.URL+"/first.js" {
+		t.Fatalf("first-site map = %+v", firstRows)
+	}
+	if len(secondRows) != 1 || secondRows[0][0] != secondURL+"second.js" {
+		t.Fatalf("second-site map = %+v", secondRows)
+	}
+	assertMapTargetsExist(t, filepath.Join(outDir, "127_0_0_1"))
+	assertMapTargetsExist(t, filepath.Join(outDir, "localhost"))
+}
+
+func TestNormalModeWritesEmptyJSMapWhenNoJavaScriptSucceeds(t *testing.T) {
+	server := newSiteServer(t, map[string]string{"/": `<html></html>`})
+	defer server.Close()
+
+	outDir := t.TempDir()
+	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
+		t.Fatal(err)
+	}
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	data, err := os.ReadFile(filepath.Join(siteDir, "js-map.txt"))
+	if err != nil || len(data) != 0 {
+		t.Fatalf("empty map = %q, error = %v", data, err)
+	}
+}
+
+func TestSameContentFromDifferentURLsMapsToOneArtifact(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/":     "<script src=\"/a.js\"></script>\n<script src=\"/b.js\"></script>",
+		"/a.js": `console.log("same");`,
+		"/b.js": `console.log("same");`,
+	})
+	defer server.Close()
+
+	outDir := t.TempDir()
+	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
+		t.Fatal(err)
+	}
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	rows := readTabMap(t, filepath.Join(siteDir, "js-map.txt"))
+	if len(rows) != 2 || rows[0][1] != rows[1][1] {
+		t.Fatalf("deduplicated map rows = %+v", rows)
+	}
+	if count := countFiles(t, filepath.Join(siteDir, "js")); count != 1 {
+		t.Fatalf("deduplicated JavaScript files = %d, want 1", count)
+	}
+}
+
+func TestSameSiteMultipleEntriesAccumulateJavaScriptMap(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/first":     `<script src="/first.js"></script>`,
+		"/second":    `<script src="/second.js"></script>`,
+		"/first.js":  `console.log("first");`,
+		"/second.js": `console.log("second");`,
+	})
+	defer server.Close()
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(server.URL+"/second\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/first", outDir)
+	cfg.URLList = listPath
+	if err := run(cfg); err != nil {
+		t.Fatal(err)
+	}
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	rows := readTabMap(t, filepath.Join(siteDir, "js-map.txt"))
+	wantURLs := []string{server.URL + "/first.js", server.URL + "/second.js"}
+	if len(rows) != 2 || rows[0][0] != wantURLs[0] || rows[1][0] != wantURLs[1] {
+		t.Fatalf("same-site accumulated map = %+v", rows)
+	}
+	assertMapTargetsExist(t, siteDir)
+}
+
+func TestHeadlessOnlyWritesJavaScriptMapWithoutAPIArtifacts(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/":            `<html></html>`,
+		"/headless.js": `console.log("headless");`,
+	})
+	defer server.Close()
+
+	originalCheck, originalDiscover := checkBrowserAvailable, discoverBrowser
+	checkBrowserAvailable = func() error { return nil }
+	discoverBrowser = func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error) {
+		return headless.DiscoveryResult{Assets: []analyzer.JSAsset{{
+			URL: server.URL + "/headless.js", Source: analyzer.SourceHeadlessNetwork,
+			Confidence: analyzer.ConfHigh, Status: analyzer.StatusCandidate,
+		}}}, nil
+	}
+	t.Cleanup(func() { checkBrowserAvailable, discoverBrowser = originalCheck, originalDiscover })
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	cfg.Headless = true
+	if err := run(cfg); err != nil {
+		t.Fatal(err)
+	}
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	assertMapTargetsExist(t, siteDir)
+	assertPathMissing(t, filepath.Join(siteDir, "endpoints.txt"))
+	assertPathMissing(t, filepath.Join(siteDir, "runtime"))
+	assertPathMissing(t, filepath.Join(siteDir, "analysis"))
+}
+
+func TestFailedJavaScriptDownloadDoesNotCreateMapRow(t *testing.T) {
+	server := newSiteServer(t, map[string]string{"/": `<script src="/missing.js"></script>`})
+	defer server.Close()
+
+	outDir := t.TempDir()
+	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
+		t.Fatal(err)
+	}
+	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
+	data, err := os.ReadFile(filepath.Join(siteDir, "js-map.txt"))
+	if err != nil || len(data) != 0 {
+		t.Fatalf("failed-download map = %q, error = %v", data, err)
+	}
+	if count := countFiles(t, filepath.Join(siteDir, "js")); count != 0 {
+		t.Fatalf("failed-download outputs = %d, want 0", count)
+	}
 }
 
 func TestRunRemovesLegacyAndPreviousModeOutputs(t *testing.T) {
@@ -262,7 +397,13 @@ func TestRunRemovesLegacyAndPreviousModeOutputs(t *testing.T) {
 		"framework_detect.json",
 		"analysis_errors.log",
 		"audit_bundle/manifest.json",
+		filepath.Join(site, "entry.html"),
 		filepath.Join(site, "audit", "manifest.json"),
+		filepath.Join(site, "runtime", "requests.jsonl"),
+		filepath.Join(site, "analysis", "endpoints.jsonl"),
+		filepath.Join(site, "js-map.txt"),
+		filepath.Join(site, "endpoints.txt"),
+		filepath.Join(site, "js", "old.js"),
 	} {
 		path := filepath.Join(outDir, stale)
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -272,16 +413,36 @@ func TestRunRemovesLegacyAndPreviousModeOutputs(t *testing.T) {
 			t.Fatalf("write stale path: %v", err)
 		}
 	}
+	for rel, content := range map[string]string{
+		"user-notes.txt":     "keep top-level",
+		"other_com/keep.txt": "keep other site",
+	} {
+		path := filepath.Join(outDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
 		t.Fatalf("run() error = %v", err)
 	}
 	assertNoLegacyReports(t, outDir)
+	assertPathMissing(t, filepath.Join(outDir, site, "entry.html"))
 	assertPathMissing(t, filepath.Join(outDir, site, "audit"))
+	assertPathMissing(t, filepath.Join(outDir, site, "runtime"))
+	assertPathMissing(t, filepath.Join(outDir, site, "analysis"))
+	assertPathMissing(t, filepath.Join(outDir, site, "endpoints.txt"))
+	assertPathMissing(t, filepath.Join(outDir, site, "js", "old.js"))
+	assertMapTargetsExist(t, filepath.Join(outDir, site))
+	assertFileContent(t, filepath.Join(outDir, "user-notes.txt"), "keep top-level")
+	assertFileContent(t, filepath.Join(outDir, "other_com", "keep.txt"), "keep other site")
 }
 
 func TestMaxJSPrecisionLimit(t *testing.T) {
-	cfg, s, a, log := analysisHarness(t)
+	cfg, s, a, log, prep := analysisHarness(t)
 	cfg.MaxJS = 2
 	queued := make(map[string]bool)
 	processed := make(map[string]bool)
@@ -290,7 +451,7 @@ func TestMaxJSPrecisionLimit(t *testing.T) {
 	total := 0
 
 	for _, name := range []string{"a.js", "b.js", "c.js"} {
-		analyzeResultForTest(cfg, s, a, log, successfulFetch(name, `console.log("ok");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
+		analyzeResultForTest(cfg, s, a, log, prep, successfulFetch(name, `console.log("ok");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
 	}
 
 	if total != 2 {
@@ -302,7 +463,7 @@ func TestMaxJSPrecisionLimit(t *testing.T) {
 }
 
 func TestMaxDepthLimit(t *testing.T) {
-	cfg, s, a, log := analysisHarness(t)
+	cfg, s, a, log, prep := analysisHarness(t)
 	cfg.MaxDepth = 1
 	queued := map[string]bool{"https://example.com/a.js": true}
 	processed := make(map[string]bool)
@@ -312,7 +473,7 @@ func TestMaxDepthLimit(t *testing.T) {
 
 	result := successfulFetch("a.js", `import("./b.js");`)
 	result.req.depth = 1
-	analyzeResultForTest(cfg, s, a, log, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
+	analyzeResultForTest(cfg, s, a, log, prep, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
 
 	if len(queue) != 0 {
 		t.Fatalf("queued items = %d, want 0 beyond depth limit", len(queue))
@@ -323,7 +484,7 @@ func TestMaxDepthLimit(t *testing.T) {
 }
 
 func TestCircularImportIsProcessedOnce(t *testing.T) {
-	cfg, s, a, log := analysisHarness(t)
+	cfg, s, a, log, prep := analysisHarness(t)
 	cfg.MaxDepth = 5
 	queued := map[string]bool{"https://example.com/a.js": true}
 	processed := make(map[string]bool)
@@ -331,7 +492,7 @@ func TestCircularImportIsProcessedOnce(t *testing.T) {
 	analyzed := 0
 	total := 0
 
-	analyzeResultForTest(cfg, s, a, log, successfulFetch("a.js", `import("./b.js");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
+	analyzeResultForTest(cfg, s, a, log, prep, successfulFetch("a.js", `import("./b.js");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
 	if len(queue) != 1 || queue[0].url != "https://example.com/b.js" {
 		t.Fatalf("queue after a.js = %+v", queue)
 	}
@@ -340,7 +501,7 @@ func TestCircularImportIsProcessedOnce(t *testing.T) {
 	queue = nil
 	result := successfulFetch("b.js", `import("./a.js");`)
 	result.req = next
-	analyzeResultForTest(cfg, s, a, log, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
+	analyzeResultForTest(cfg, s, a, log, prep, result, "https://example.com/", queued, processed, &queue, &analyzed, &total)
 
 	if len(queue) != 0 {
 		t.Fatalf("queue after circular import = %+v, want empty", queue)
@@ -375,7 +536,9 @@ func TestCLIAndDocumentationRemoveLegacyFlagsAndReports(t *testing.T) {
 	for _, removed := range []string{
 		`"m"`,
 		`"b"`,
+		`"audit-prep"`,
 		"FetchSourcemap",
+		"AuditPrep",
 		"AuditPrepAlias",
 	} {
 		if strings.Contains(configText, removed) {
@@ -393,6 +556,12 @@ func TestCLIAndDocumentationRemoveLegacyFlagsAndReports(t *testing.T) {
 		"dynamic_imports.json",
 		"route_chunk_map.json",
 		"framework_detect.json",
+		"runtime/requests.jsonl",
+		"analysis/static-endpoints.jsonl",
+		"analysis/endpoints.jsonl",
+		"analysis/runtime-bases.json",
+		"--audit-prep",
+		"audit/manifest.json",
 		"indexes/",
 		"slices/",
 		"transform_log.json",
@@ -408,10 +577,13 @@ func TestCLIAndDocumentationRemoveLegacyFlagsAndReports(t *testing.T) {
 		"`--insecure`",
 		"`--insecure-skip-verify`",
 		"`--proxy <url>`",
-		"runtime/requests.jsonl",
-		"analysis/static-endpoints.jsonl",
-		"analysis/endpoints.jsonl",
-		"analysis/runtime-bases.json",
+		"Node.js 18 or newer",
+		"js-map.txt",
+		"endpoints.txt",
+		"Tab",
+		"one absolute HTTP(S) URL per line",
+		"API intermediate JSON",
+		"does not persist entry.html",
 		"| `-d <depth>` | `10`",
 		"| `-s <mb>` | unlimited",
 	} {
@@ -453,13 +625,20 @@ func TestBuildHeadlessConfigIncludesNetworkOptions(t *testing.T) {
 	}
 }
 
-func analysisHarness(t *testing.T) (*config.Config, *store.Store, *analyzer.Analyzer, *logging.Logger) {
+func analysisHarness(t *testing.T) (*config.Config, *store.Store, *analyzer.Analyzer, *logging.Logger, *preprocess.Processor) {
 	t.Helper()
 	outDir := t.TempDir()
 	cfg := testConfig("https://example.com/", outDir)
 	log := logging.New(false, outDir)
-	t.Cleanup(func() { log.Close() })
-	return cfg, store.New(outDir), analyzer.NewAnalyzer(log), log
+	processor, err := preprocess.New(filepath.Join(outDir, "example_com"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = processor.Close()
+		log.Close()
+	})
+	return cfg, store.New(outDir), analyzer.NewAnalyzer(log), log, processor
 }
 
 func successfulFetch(name, body string) fetchRes {
@@ -476,8 +655,8 @@ func successfulFetch(name, body string) fetchRes {
 	}
 }
 
-func analyzeResultForTest(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
-	analyzeResultWithPreprocess(cfg, s, a, log, nil, nil, res, entryURL, queued, processed, queue, analyzed, totalAnalyzed)
+func analyzeResultForTest(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
+	analyzeResultWithPreprocess(cfg, s, a, log, prep, nil, res, entryURL, queued, processed, queue, analyzed, totalAnalyzed)
 }
 
 func testConfig(entryURL, outDir string) *config.Config {
@@ -513,17 +692,31 @@ func newSiteServer(t *testing.T, routes map[string]string) *httptest.Server {
 	}))
 }
 
-func readManifest(t *testing.T, path string) preprocess.Manifest {
+func readTabMap(t *testing.T, path string) [][2]string {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read manifest: %v", err)
+		t.Fatal(err)
 	}
-	var manifest preprocess.Manifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		t.Fatalf("decode manifest: %v", err)
+	var rows [][2]string
+	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) != 2 {
+			t.Fatalf("invalid map row %q", line)
+		}
+		rows = append(rows, [2]string{parts[0], parts[1]})
 	}
-	return manifest
+	return rows
+}
+
+func assertMapTargetsExist(t *testing.T, siteDir string) {
+	t.Helper()
+	for _, row := range readTabMap(t, filepath.Join(siteDir, "js-map.txt")) {
+		assertPathExists(t, filepath.Join(siteDir, filepath.FromSlash(row[1])))
+	}
 }
 
 func countFiles(t *testing.T, root string) int {
@@ -573,5 +766,13 @@ func assertPathMissing(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected %s to be absent, stat error = %v", path, err)
+	}
+}
+
+func assertFileContent(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != want {
+		t.Fatalf("%s = %q, error = %v; want %q", path, data, err, want)
 	}
 }

@@ -1,8 +1,7 @@
 package store
 
 import (
-	"crypto/sha256"
-	"fmt"
+	"bytes"
 	"os"
 	"path/filepath"
 	"sort"
@@ -10,22 +9,26 @@ import (
 
 	"github.com/Veincc/JSpider/internal/analyzer"
 	"github.com/Veincc/JSpider/internal/fileutil"
-	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
 type Store struct {
 	mu sync.Mutex
 
-	jsAssets      map[string]*analyzer.JSAsset
-	contentHashes map[string]string
-	outDir        string
+	jsAssets   map[string]*analyzer.JSAsset
+	jsMappings map[string]map[string]map[string]struct{}
+	outDir     string
+}
+
+type JSMapEntry struct {
+	URL  string
+	Path string
 }
 
 func New(outDir string) *Store {
 	return &Store{
-		jsAssets:      make(map[string]*analyzer.JSAsset),
-		contentHashes: make(map[string]string),
-		outDir:        outDir,
+		jsAssets:   make(map[string]*analyzer.JSAsset),
+		jsMappings: make(map[string]map[string]map[string]struct{}),
+		outDir:     outDir,
 	}
 }
 
@@ -99,37 +102,54 @@ func (s *Store) GetCandidateURLs() []string {
 	return urls
 }
 
-func (s *Store) SaveEntry(site string, data []byte) error {
-	dir := filepath.Join(s.outDir, site)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+func (s *Store) RecordJSOutputs(site, sourceURL string, paths []string) {
+	if site == "" || sourceURL == "" || len(paths) == 0 {
+		return
 	}
-	return os.WriteFile(filepath.Join(dir, "entry.html"), data, 0644)
-}
-
-func (s *Store) SaveJS(site, sourceURL string, data []byte) (string, bool, error) {
-	hash := contentHash(data)
-	key := site + "\x00" + hash
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.contentHashes[key]; ok {
-		return existing, false, nil
+	if s.jsMappings[site] == nil {
+		s.jsMappings[site] = make(map[string]map[string]struct{})
 	}
-	rel := filepath.ToSlash(filepath.Join(site, "js", urlutil.ArtifactFilename(sourceURL, ".js", "script")))
-
-	fullPath := filepath.Join(s.outDir, filepath.FromSlash(rel))
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return "", false, err
+	if s.jsMappings[site][sourceURL] == nil {
+		s.jsMappings[site][sourceURL] = make(map[string]struct{})
 	}
-	if err := fileutil.WriteFileAtomic(fullPath, data, 0644); err != nil {
-		return "", false, err
+	for _, outputPath := range paths {
+		if outputPath != "" {
+			s.jsMappings[site][sourceURL][filepath.ToSlash(outputPath)] = struct{}{}
+		}
 	}
-	s.contentHashes[key] = rel
-	return rel, true, nil
 }
 
-func contentHash(data []byte) string {
-	sum := sha256.Sum256(data)
-	return fmt.Sprintf("%x", sum[:])
+func (s *Store) JSMapEntries(site string) []JSMapEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var entries []JSMapEntry
+	for sourceURL, paths := range s.jsMappings[site] {
+		for outputPath := range paths {
+			entries = append(entries, JSMapEntry{URL: sourceURL, Path: outputPath})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].URL != entries[j].URL {
+			return entries[i].URL < entries[j].URL
+		}
+		return entries[i].Path < entries[j].Path
+	})
+	return entries
+}
+
+func (s *Store) WriteJSMap(site string) error {
+	siteDir := filepath.Join(s.outDir, site)
+	if err := os.MkdirAll(siteDir, 0755); err != nil {
+		return err
+	}
+	var output bytes.Buffer
+	for _, entry := range s.JSMapEntries(site) {
+		output.WriteString(entry.URL)
+		output.WriteByte('\t')
+		output.WriteString(entry.Path)
+		output.WriteByte('\n')
+	}
+	return fileutil.WriteFileAtomic(filepath.Join(siteDir, "js-map.txt"), output.Bytes(), 0600)
 }

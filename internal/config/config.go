@@ -24,7 +24,6 @@ type Config struct {
 	MaxDepth           int
 	MaxSizeMB          int
 	Workers            int
-	AuditPrep          bool
 	SameOrigin         bool
 	AllowCDN           []string
 	Timeout            int
@@ -48,7 +47,6 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL>                    Static analysis (default)\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL> --headless         Static + headless browser discovery\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL> --api-discovery    Static API extraction + browser API observation\n")
-		fmt.Fprintf(os.Stderr, "  jspider -u <URL> --headless --audit-prep\n")
 		fmt.Fprintf(os.Stderr, "  jspider -l <file>                   Analyze a URL list file\n")
 		fmt.Fprintf(os.Stderr, "  jspider -u <URL> -w 10 -o result    Full parameter example\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
@@ -57,7 +55,6 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "  -o <dir>              Output directory (default: output)\n")
 		fmt.Fprintf(os.Stderr, "  --headless            Enable headless browser JS discovery (requires Chrome/Chromium)\n")
 		fmt.Fprintf(os.Stderr, "  --api-discovery       Extract static APIs and use Chrome to click safe elements and observe XHR/fetch/EventSource requests (requires CGO and Chrome/Chromium; implies --headless)\n")
-		fmt.Fprintf(os.Stderr, "  --audit-prep          Recover source map sources or generate readable JavaScript (requires Node.js 18+ runtime)\n")
 		fmt.Fprintf(os.Stderr, "  -n <count>            Max JS files to analyze (0=unlimited)\n")
 		fmt.Fprintf(os.Stderr, "  -d <depth>            Max recursion depth (default: 10)\n")
 		fmt.Fprintf(os.Stderr, "  -s <mb>               Max download size per resource in MB (0=unlimited, default: unlimited)\n")
@@ -82,7 +79,6 @@ func Parse() *Config {
 	flag.IntVar(&cfg.MaxDepth, "d", DefaultMaxDepth, "Max recursion depth")
 	flag.IntVar(&cfg.MaxSizeMB, "s", DefaultMaxSizeMB, "Max download size per resource in MB (0=unlimited)")
 	flag.IntVar(&cfg.Workers, "w", 5, "Concurrent download workers")
-	flag.BoolVar(&cfg.AuditPrep, "audit-prep", false, "Recover source map sources or generate readable JavaScript (requires Node.js 18+ runtime)")
 	flag.BoolVar(&cfg.SameOrigin, "same-origin", true, "Only analyze same-origin JS")
 	flag.StringVar(&allowCDNStr, "c", "", "Allowed CDN domains (comma-separated)")
 	flag.StringVar(&cfg.Proxy, "proxy", "", "HTTP, HTTPS, or SOCKS5 proxy URL")

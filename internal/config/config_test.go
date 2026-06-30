@@ -138,20 +138,6 @@ func TestHeadlessAloneDoesNotEnableAPIDiscovery(t *testing.T) {
 	}
 }
 
-func TestAuditPrepDefaultFalse(t *testing.T) {
-	cfg := &Config{}
-	if cfg.AuditPrep {
-		t.Errorf("zero-value Config.AuditPrep = %v, want false", cfg.AuditPrep)
-	}
-}
-
-func TestAuditPrepCanBeSet(t *testing.T) {
-	cfg := &Config{AuditPrep: true}
-	if !cfg.AuditPrep {
-		t.Error("Config.AuditPrep should be true after setting")
-	}
-}
-
 func TestInsecureSkipVerifyDefaultFalse(t *testing.T) {
 	cfg := &Config{}
 	if cfg.InsecureSkipVerify {
