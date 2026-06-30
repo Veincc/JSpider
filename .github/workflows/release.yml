@@ -73,7 +73,7 @@ jobs:
         shell: bash
         env:
           CC: ${{ matrix.cc }}
-        run: "${CC}" --version
+        run: '"${CC}" --version'
       - name: Build
         shell: bash
         env:
