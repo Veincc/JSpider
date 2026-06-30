@@ -35,26 +35,32 @@ jobs:
           - runner: ubuntu-24.04
             goos: linux
             goarch: amd64
+            cc: clang
             asset: jspider-linux-amd64
           - runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
+            cc: clang
             asset: jspider-linux-arm64
           - runner: windows-2025
             goos: windows
             goarch: amd64
+            cc: gcc
             asset: jspider-windows-amd64.exe
           - runner: windows-11-arm
             goos: windows
             goarch: arm64
+            cc: clang
             asset: jspider-windows-arm64.exe
           - runner: macos-15-intel
             goos: darwin
             goarch: amd64
+            cc: clang
             asset: jspider-darwin-amd64
           - runner: macos-15
             goos: darwin
             goarch: arm64
+            cc: clang
             asset: jspider-darwin-arm64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -65,12 +71,14 @@ jobs:
           cache: true
       - name: Verify C compiler
         shell: bash
-        run: clang --version
+        env:
+          CC: ${{ matrix.cc }}
+        run: "${CC}" --version
       - name: Build
         shell: bash
         env:
           CGO_ENABLED: "1"
-          CC: clang
+          CC: ${{ matrix.cc }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           ASSET: ${{ matrix.asset }}
