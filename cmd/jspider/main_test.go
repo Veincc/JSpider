@@ -706,7 +706,8 @@ func TestFetchBatchResultCapacityEqualsWorkerCount(t *testing.T) {
 	if got := cap(results); got != cfg.Workers {
 		t.Errorf("result channel capacity = %d, want worker count %d", got, cfg.Workers)
 	}
-	for range results {
+	for result := range results {
+		result.acknowledgeConsumption()
 	}
 }
 
@@ -727,7 +728,8 @@ func TestFetchBatchResultCapacityUsesConfiguredWorkersForSmallBatch(t *testing.T
 	if got := cap(results); got != cfg.Workers {
 		t.Errorf("small-batch result capacity = %d, want configured workers %d", got, cfg.Workers)
 	}
-	for range results {
+	for result := range results {
+		result.acknowledgeConsumption()
 	}
 }
 
@@ -754,10 +756,127 @@ func TestFetchBatchEmitsOriginalRequestOrder(t *testing.T) {
 	var got []string
 	for result := range fetchBatch(cfg, f, log, queue, server.URL+"/") {
 		got = append(got, result.req.url)
+		result.acknowledgeConsumption()
 	}
 	want := []string{queue[0].url, queue[1].url}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Fatalf("result order = %v, want request order %v", got, want)
+	}
+}
+
+func TestFetchBatchDeliversOrderedPrefixBeforeTailCompletes(t *testing.T) {
+	releaseTail := make(chan struct{})
+	tailReleased := false
+	release := func() {
+		if !tailReleased {
+			close(releaseTail)
+			tailReleased = true
+		}
+	}
+	defer release()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/tail.js" {
+			<-releaseTail
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte(`const ok = true;`))
+	}))
+	defer server.Close()
+
+	cfg := testConfig(server.URL+"/", t.TempDir())
+	cfg.Workers = 2
+	log := logging.New(false, cfg.OutDir)
+	defer log.Close()
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	queue := []fetchReq{{url: server.URL + "/prefix.js"}, {url: server.URL + "/tail.js"}}
+	results := fetchBatch(cfg, f, log, queue, server.URL+"/")
+	var first fetchRes
+	prefixTimedOut := false
+	select {
+	case first = <-results:
+		if first.req.url != queue[0].url {
+			t.Fatalf("first result = %q, want prefix %q", first.req.url, queue[0].url)
+		}
+		first.acknowledgeConsumption()
+	case <-time.After(500 * time.Millisecond):
+		prefixTimedOut = true
+	}
+
+	release()
+	for result := range results {
+		result.acknowledgeConsumption()
+	}
+	if prefixTimedOut {
+		t.Fatal("ordered prefix did not reach consumer while tail request was blocked")
+	}
+}
+
+func TestFetchBatchEarliestBlockLimitsStartedRequestsToWorkerWindow(t *testing.T) {
+	releaseFirst := make(chan struct{})
+	firstReleased := false
+	release := func() {
+		if !firstReleased {
+			close(releaseFirst)
+			firstReleased = true
+		}
+	}
+	defer release()
+
+	var hits int32
+	started := make(chan struct{}, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		started <- struct{}{}
+		if r.URL.Path == "/first.js" {
+			<-releaseFirst
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte(`const ok = true;`))
+	}))
+	defer server.Close()
+
+	cfg := testConfig(server.URL+"/", t.TempDir())
+	cfg.Workers = 2
+	log := logging.New(false, cfg.OutDir)
+	defer log.Close()
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	queue := []fetchReq{
+		{url: server.URL + "/first.js"},
+		{url: server.URL + "/second.js"},
+		{url: server.URL + "/third.js"},
+		{url: server.URL + "/fourth.js"},
+		{url: server.URL + "/fifth.js"},
+	}
+	results := fetchBatch(cfg, f, log, queue, server.URL+"/")
+	for i := 0; i < cfg.Workers; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			release()
+			for result := range results {
+				result.acknowledgeConsumption()
+			}
+			t.Fatalf("only %d requests started, want worker window %d", i, cfg.Workers)
+		}
+	}
+	time.Sleep(150 * time.Millisecond)
+	startedBeforeRelease := int(atomic.LoadInt32(&hits))
+
+	release()
+	for result := range results {
+		result.acknowledgeConsumption()
+	}
+	if startedBeforeRelease > cfg.Workers {
+		t.Fatalf("requests started while earliest ordinal was blocked = %d, want at most worker window %d", startedBeforeRelease, cfg.Workers)
 	}
 }
 

@@ -33,6 +33,15 @@ type fetchRes struct {
 	ordinal int
 	req     fetchReq
 	result  *fetcher.Result
+	// acknowledge releases one sliding-window slot after the consumer has
+	// finished with this response body.
+	acknowledge func()
+}
+
+func (r fetchRes) acknowledgeConsumption() {
+	if r.acknowledge != nil {
+		r.acknowledge()
+	}
 }
 
 type fetchTask struct {
@@ -380,16 +389,21 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 		workers = 1
 	}
 	results := make(chan fetchRes, workers)
-	completed := make(chan fetchRes, workers)
+	effectiveWorkers := workers
+	if effectiveWorkers > len(queue) {
+		effectiveWorkers = len(queue)
+	}
+	if effectiveWorkers == 0 {
+		close(results)
+		return results
+	}
+	completed := make(chan fetchRes, effectiveWorkers)
+	acknowledged := make(chan int, 1)
 
 	var wg sync.WaitGroup
-	reqCh := make(chan fetchTask, len(queue))
-	for ordinal, req := range queue {
-		reqCh <- fetchTask{ordinal: ordinal, req: req}
-	}
-	close(reqCh)
+	reqCh := make(chan fetchTask)
 
-	for i := 0; i < workers; i++ {
+	for i := 0; i < effectiveWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -410,14 +424,56 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 	}()
 
 	go func() {
-		ordered := make([]fetchRes, len(queue))
-		for result := range completed {
-			ordered[result.ordinal] = result
+		defer close(results)
+
+		nextLaunch := 0
+		launchNext := func() {
+			reqCh <- fetchTask{ordinal: nextLaunch, req: queue[nextLaunch]}
+			nextLaunch++
+			if nextLaunch == len(queue) {
+				close(reqCh)
+			}
 		}
-		for _, result := range ordered {
-			results <- result
+		for i := 0; i < effectiveWorkers; i++ {
+			launchNext()
 		}
-		close(results)
+
+		pending := make(map[int]fetchRes, effectiveWorkers)
+		nextOrdinal := 0
+		waitingForAcknowledgement := false
+		for nextOrdinal < len(queue) {
+			if !waitingForAcknowledgement {
+				if result, ok := pending[nextOrdinal]; ok {
+					delete(pending, nextOrdinal)
+					ordinal := result.ordinal
+					var once sync.Once
+					result.acknowledge = func() {
+						once.Do(func() { acknowledged <- ordinal })
+					}
+					results <- result
+					waitingForAcknowledgement = true
+					continue
+				}
+			}
+
+			select {
+			case result, ok := <-completed:
+				if !ok {
+					completed = nil
+					continue
+				}
+				pending[result.ordinal] = result
+			case ordinal := <-acknowledged:
+				if ordinal != nextOrdinal {
+					continue
+				}
+				waitingForAcknowledgement = false
+				nextOrdinal++
+				if nextLaunch < len(queue) {
+					launchNext()
+				}
+			}
+		}
 	}()
 
 	return results
@@ -425,6 +481,7 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 
 // analyzeResultWithPreprocess analyzes a single downloaded JavaScript response.
 func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, res fetchRes, entryURL, site string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
+	defer res.acknowledgeConsumption()
 	item := res.req
 
 	if processed[item.url] {
