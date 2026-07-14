@@ -61,6 +61,30 @@ func TestRunRequiresNodeBeforeCreatingOutput(t *testing.T) {
 	assertPathMissing(t, outDir)
 }
 
+func TestRunRejectsInvalidConfigBeforeCreatingOutput(t *testing.T) {
+	outDir := filepath.Join(t.TempDir(), "not-created")
+	cfg := testConfig("https://example.com/", outDir)
+	cfg.Workers = 0
+
+	err := run(cfg)
+	if err == nil || !strings.Contains(err.Error(), "workers") {
+		t.Fatalf("run() error = %v, want worker validation error", err)
+	}
+	assertPathMissing(t, outDir)
+}
+
+func TestRunReturnsURLFileErrorBeforeCreatingOutput(t *testing.T) {
+	outDir := filepath.Join(t.TempDir(), "not-created")
+	cfg := testConfig("", outDir)
+	cfg.URLList = filepath.Join(t.TempDir(), "missing.txt")
+
+	err := run(cfg)
+	if err == nil || !strings.Contains(err.Error(), "URL list") {
+		t.Fatalf("run() error = %v, want URL list error", err)
+	}
+	assertPathMissing(t, outDir)
+}
+
 func TestNormalModeUsesSourceMapsThenFallsBackToReadableBundle(t *testing.T) {
 	if err := preprocess.CheckNodeRuntime(); err != nil {
 		t.Skip(err)
@@ -152,7 +176,7 @@ func TestAllowedCDNJavaScriptBelongsToEntrySite(t *testing.T) {
 		t.Fatalf("run() error = %v", err)
 	}
 
-	entrySite := filepath.Join(outDir, "localhost")
+	entrySite := filepath.Join(outDir, urlutil.SanitizeDomain(entryURL))
 	if count := countFiles(t, filepath.Join(entrySite, "js")); count != 1 {
 		t.Fatalf("entry-site JavaScript files = %d, want 1", count)
 	}
@@ -161,7 +185,7 @@ func TestAllowedCDNJavaScriptBelongsToEntrySite(t *testing.T) {
 		t.Fatalf("CDN map = %+v", rows)
 	}
 	assertMapTargetsExist(t, entrySite)
-	assertPathMissing(t, filepath.Join(outDir, "127_0_0_1"))
+	assertPathMissing(t, filepath.Join(outDir, urlutil.SanitizeDomain(assetServer.URL)))
 }
 
 func TestRedirectTargetMustRemainAllowedForEntry(t *testing.T) {
@@ -249,22 +273,24 @@ func TestMultipleEntrySitesAreIsolated(t *testing.T) {
 		t.Fatalf("run() error = %v", err)
 	}
 
-	if count := countFiles(t, filepath.Join(outDir, "127_0_0_1", "js")); count != 1 {
+	firstSite := filepath.Join(outDir, urlutil.SanitizeDomain(first.URL))
+	secondSite := filepath.Join(outDir, urlutil.SanitizeDomain(secondURL))
+	if count := countFiles(t, filepath.Join(firstSite, "js")); count != 1 {
 		t.Fatalf("first site JavaScript files = %d, want 1", count)
 	}
-	if count := countFiles(t, filepath.Join(outDir, "localhost", "js")); count != 1 {
+	if count := countFiles(t, filepath.Join(secondSite, "js")); count != 1 {
 		t.Fatalf("second site JavaScript files = %d, want 1", count)
 	}
-	firstRows := readTabMap(t, filepath.Join(outDir, "127_0_0_1", "js-map.txt"))
-	secondRows := readTabMap(t, filepath.Join(outDir, "localhost", "js-map.txt"))
+	firstRows := readTabMap(t, filepath.Join(firstSite, "js-map.txt"))
+	secondRows := readTabMap(t, filepath.Join(secondSite, "js-map.txt"))
 	if len(firstRows) != 1 || firstRows[0][0] != first.URL+"/first.js" {
 		t.Fatalf("first-site map = %+v", firstRows)
 	}
 	if len(secondRows) != 1 || secondRows[0][0] != secondURL+"second.js" {
 		t.Fatalf("second-site map = %+v", secondRows)
 	}
-	assertMapTargetsExist(t, filepath.Join(outDir, "127_0_0_1"))
-	assertMapTargetsExist(t, filepath.Join(outDir, "localhost"))
+	assertMapTargetsExist(t, firstSite)
+	assertMapTargetsExist(t, secondSite)
 }
 
 func TestNormalModeWritesEmptyJSMapWhenNoJavaScriptSucceeds(t *testing.T) {
@@ -483,6 +509,25 @@ func TestMaxDepthLimit(t *testing.T) {
 	}
 }
 
+func TestZeroDepthStopsRecursiveDiscovery(t *testing.T) {
+	cfg, s, a, log, prep := analysisHarness(t)
+	cfg.MaxDepth = 0
+	queued := map[string]bool{"https://example.com/a.js": true}
+	processed := make(map[string]bool)
+	var queue []fetchReq
+	analyzed := 0
+	total := 0
+
+	analyzeResultForTest(cfg, s, a, log, prep, successfulFetch("a.js", `import("./b.js");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
+
+	if len(queue) != 0 {
+		t.Fatalf("queued items = %d, want 0 when depth is zero", len(queue))
+	}
+	if total != 1 {
+		t.Fatalf("total analyzed = %d, want the entry JavaScript only", total)
+	}
+}
+
 func TestCircularImportIsProcessedOnce(t *testing.T) {
 	cfg, s, a, log, prep := analysisHarness(t)
 	cfg.MaxDepth = 5
@@ -656,20 +701,22 @@ func successfulFetch(name, body string) fetchRes {
 }
 
 func analyzeResultForTest(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
-	analyzeResultWithPreprocess(cfg, s, a, log, prep, nil, res, entryURL, queued, processed, queue, analyzed, totalAnalyzed)
+	analyzeResultWithPreprocess(cfg, s, a, log, prep, nil, res, entryURL, urlutil.SanitizeDomain(entryURL), queued, processed, queue, analyzed, totalAnalyzed)
 }
 
 func testConfig(entryURL, outDir string) *config.Config {
 	return &config.Config{
-		URL:        entryURL,
-		OutDir:     outDir,
-		MaxJS:      100,
-		MaxDepth:   config.DefaultMaxDepth,
-		MaxSizeMB:  config.DefaultMaxSizeMB,
-		Workers:    2,
-		SameOrigin: true,
-		Timeout:    5,
-		UserAgent:  "JSpider-Test/1.0",
+		URL:                   entryURL,
+		OutDir:                outDir,
+		MaxJS:                 100,
+		MaxDepth:              config.DefaultMaxDepth,
+		MaxSizeMB:             config.DefaultMaxSizeMB,
+		Workers:               2,
+		SameOrigin:            true,
+		Timeout:               5,
+		ProcessTimeoutSeconds: config.DefaultProcessTimeoutSeconds,
+		HeadlessBodyMB:        config.DefaultHeadlessBodyMB,
+		UserAgent:             "JSpider-Test/1.0",
 	}
 }
 

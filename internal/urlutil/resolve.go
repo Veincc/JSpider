@@ -153,19 +153,18 @@ func IsJSContentType(ct string) bool {
 		strings.Contains(ct, "text/js")
 }
 
-// SanitizeDomain extracts the domain from a URL and converts it to a safe directory name.
-// e.g. https://cdn.example.com/path -> cdn_example_com
+// SanitizeDomain returns the non-collision-aware directory base for a URL.
+// Call OriginDirectoryNames when naming more than one input origin.
 func SanitizeDomain(rawURL string) string {
-	u, err := url.Parse(rawURL)
+	origin, err := CanonicalOrigin(rawURL)
 	if err != nil {
 		return "unknown"
 	}
-	host := u.Hostname()
-	if host == "" {
+	base, err := originDirectoryBase(origin)
+	if err != nil {
 		return "unknown"
 	}
-	host = strings.ReplaceAll(host, ".", "_")
-	return host
+	return base
 }
 
 // SanitizeFilename converts a URL to a safe filename.

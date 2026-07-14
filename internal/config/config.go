@@ -7,32 +7,38 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
 const (
-	DefaultMaxDepth  = 10
-	DefaultMaxSizeMB = 0
+	DefaultMaxDepth              = 10
+	DefaultMaxSizeMB             = 0
+	DefaultProcessTimeoutSeconds = 30
+	DefaultHeadlessBodyMB        = 8
 )
 
 type Config struct {
-	URL                string
-	URLList            string
-	OutDir             string
-	Headless           bool // enable headless browser JS discovery
-	APIDiscovery       bool // enable static/runtime API discovery; implies headless
-	MaxJS              int
-	MaxDepth           int
-	MaxSizeMB          int
-	Workers            int
-	SameOrigin         bool
-	AllowCDN           []string
-	Timeout            int
-	UserAgent          string
-	Cookies            string
-	Headers            map[string]string
-	Verbose            bool
-	InsecureSkipVerify bool
-	Proxy              string
+	URL                   string
+	URLList               string
+	OutDir                string
+	Headless              bool // enable headless browser JS discovery
+	APIDiscovery          bool // enable static/runtime API discovery; implies headless
+	MaxJS                 int
+	MaxDepth              int
+	MaxSizeMB             int
+	Workers               int
+	SameOrigin            bool
+	AllowCDN              []string
+	Timeout               int
+	ProcessTimeoutSeconds int
+	HeadlessBodyMB        int
+	UserAgent             string
+	Cookies               string
+	Headers               map[string]string
+	Verbose               bool
+	InsecureSkipVerify    bool
+	Proxy                 string
 }
 
 func Parse() *Config {
@@ -63,6 +69,8 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "  -c <domains>          Allowed CDN domains, comma-separated\n")
 		fmt.Fprintf(os.Stderr, "  --proxy <url>         HTTP, HTTPS, or SOCKS5 proxy used by requests and headless Chrome\n")
 		fmt.Fprintf(os.Stderr, "  -t <seconds>          HTTP timeout in seconds (default: 15)\n")
+		fmt.Fprintf(os.Stderr, "  --process-timeout <seconds>  JavaScript processing timeout (default: 30)\n")
+		fmt.Fprintf(os.Stderr, "  --headless-body-mb <mb>      Headless response body limit (default: 8)\n")
 		fmt.Fprintf(os.Stderr, "  -a <ua>               Custom User-Agent\n")
 		fmt.Fprintf(os.Stderr, "  -k <cookie>           Optional cookie string\n")
 		fmt.Fprintf(os.Stderr, "  -H <headers>          Extra headers (Header1=Value1;Header2=Value2)\n")
@@ -83,6 +91,8 @@ func Parse() *Config {
 	flag.StringVar(&allowCDNStr, "c", "", "Allowed CDN domains (comma-separated)")
 	flag.StringVar(&cfg.Proxy, "proxy", "", "HTTP, HTTPS, or SOCKS5 proxy URL")
 	flag.IntVar(&cfg.Timeout, "t", 15, "HTTP timeout in seconds")
+	flag.IntVar(&cfg.ProcessTimeoutSeconds, "process-timeout", DefaultProcessTimeoutSeconds, "JavaScript processing timeout in seconds")
+	flag.IntVar(&cfg.HeadlessBodyMB, "headless-body-mb", DefaultHeadlessBodyMB, "Headless response body limit in MB")
 	flag.StringVar(&cfg.UserAgent, "a", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Custom User-Agent")
 	flag.StringVar(&cfg.Cookies, "k", "", "Optional cookie string")
 	flag.StringVar(&headersStr, "H", "", "Extra headers (Header1=Value1;Header2=Value2)")
@@ -96,12 +106,6 @@ func Parse() *Config {
 		cfg.InsecureSkipVerify = true
 		fmt.Fprintln(os.Stderr, "Warning: --insecure-skip-verify is deprecated; use --insecure")
 	}
-	if cfg.URL == "" && cfg.URLList == "" {
-		fmt.Fprintln(os.Stderr, "Error: provide at least one of -u or -l")
-		flag.Usage()
-		os.Exit(1)
-	}
-
 	if allowCDNStr != "" {
 		for _, d := range strings.Split(allowCDNStr, ",") {
 			d = strings.TrimSpace(d)
@@ -128,6 +132,41 @@ func ApplyModeImplications(cfg *Config) {
 	if cfg.APIDiscovery {
 		cfg.Headless = true
 	}
+}
+
+// Validate rejects configuration values that cannot produce a valid run.
+func (c *Config) Validate() error {
+	if strings.TrimSpace(c.URL) == "" && strings.TrimSpace(c.URLList) == "" {
+		return fmt.Errorf("provide at least one URL with -u or -l")
+	}
+	if strings.TrimSpace(c.OutDir) == "" {
+		return fmt.Errorf("output directory must not be empty")
+	}
+	if c.Workers <= 0 {
+		return fmt.Errorf("workers must be greater than zero")
+	}
+	if c.MaxDepth < 0 {
+		return fmt.Errorf("maximum depth must not be negative")
+	}
+	if c.MaxJS < 0 {
+		return fmt.Errorf("maximum JavaScript count must not be negative")
+	}
+	if c.MaxSizeMB < 0 {
+		return fmt.Errorf("maximum download size must not be negative")
+	}
+	if c.Timeout <= 0 {
+		return fmt.Errorf("HTTP timeout must be greater than zero")
+	}
+	if c.ProcessTimeoutSeconds <= 0 {
+		return fmt.Errorf("process timeout must be greater than zero")
+	}
+	if c.HeadlessBodyMB <= 0 {
+		return fmt.Errorf("headless body limit must be greater than zero")
+	}
+	if _, err := NormalizeProxy(c.Proxy); err != nil {
+		return fmt.Errorf("proxy configuration: %w", err)
+	}
+	return nil
 }
 
 // NormalizeProxy validates a proxy value and adds an HTTP scheme when omitted.
@@ -163,13 +202,16 @@ func NormalizeProxy(raw string) (string, error) {
 	return proxyURL.String(), nil
 }
 
-// URLs returns the list of URLs to analyze (merges -u and -l)
-func (c *Config) URLs() []string {
+// URLs returns the list of URLs to analyze (merges -u and -l).
+func (c *Config) URLs() ([]string, error) {
 	var urls []string
 	seen := make(map[string]bool)
 
 	if c.URL != "" {
-		u := normalizeURL(strings.TrimSpace(c.URL))
+		u, err := normalizeURL(strings.TrimSpace(c.URL))
+		if err != nil {
+			return nil, fmt.Errorf("parse entry URL %q: %w", c.URL, err)
+		}
 		if u != "" && !seen[u] {
 			seen[u] = true
 			urls = append(urls, u)
@@ -177,8 +219,15 @@ func (c *Config) URLs() []string {
 	}
 
 	if c.URLList != "" {
-		for _, u := range readURLList(c.URLList) {
-			u = normalizeURL(u)
+		rawURLs, err := readURLList(c.URLList)
+		if err != nil {
+			return nil, err
+		}
+		for _, raw := range rawURLs {
+			u, err := normalizeURL(raw)
+			if err != nil {
+				return nil, fmt.Errorf("parse URL %q from %s: %w", raw, c.URLList, err)
+			}
 			if u != "" && !seen[u] {
 				seen[u] = true
 				urls = append(urls, u)
@@ -186,43 +235,63 @@ func (c *Config) URLs() []string {
 		}
 	}
 
-	return urls
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("no HTTP(S) URLs to analyze")
+	}
+	return urls, nil
 }
 
 // normalizeURL adds a scheme prefix; URLs without http:// or https:// default to https://.
 // - //cdn.example.com/lib.js  → ignored
 // - mailto:, file:, data: and other non-HTTP(S) schemes → ignored
 // - example.com/path  → https://example.com/path
-func normalizeURL(u string) string {
+func normalizeURL(u string) (string, error) {
 	if u == "" {
-		return u
-	}
-	// Already http/https, return as-is
-	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-		return u
+		return u, nil
 	}
 	// Protocol-relative URLs (e.g. //cdn.example.com/lib.js) are not used as entry URLs
 	if strings.HasPrefix(u, "//") {
-		return ""
+		return "", nil
 	}
+
+	candidate := "https://" + u
 	// For this tool, non-HTTP(S) entry URLs are ignored.
 	if idx := strings.Index(u, ":"); idx > 0 {
 		if idx+1 < len(u) && u[idx+1] >= '0' && u[idx+1] <= '9' {
-			return "https://" + u
-		}
-		isScheme := true
-		for i := 0; i < idx; i++ {
-			c := u[i]
-			if c == '.' || !isSchemeChar(c) {
-				isScheme = false
-				break
+			candidate = "https://" + u
+		} else {
+			isScheme := true
+			for i := 0; i < idx; i++ {
+				c := u[i]
+				if c == '.' || !isSchemeChar(c) {
+					isScheme = false
+					break
+				}
+			}
+			if isScheme && isAlpha(u[0]) {
+				parsed, err := url.Parse(u)
+				if err != nil {
+					return "", err
+				}
+				if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+					return "", nil
+				}
+				candidate = u
 			}
 		}
-		if isScheme && idx > 0 && isAlpha(u[0]) {
-			return ""
-		}
 	}
-	return "https://" + u
+
+	parsed, err := url.Parse(candidate)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return "", nil
+	}
+	if _, err := urlutil.CanonicalOrigin(candidate); err != nil {
+		return "", err
+	}
+	return candidate, nil
 }
 
 // isAlpha checks whether a byte is an ASCII letter
@@ -236,11 +305,10 @@ func isSchemeChar(c byte) bool {
 		(c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
 }
 
-func readURLList(path string) []string {
+func readURLList(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read URL list file: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("read URL list file %s: %w", path, err)
 	}
 	defer f.Close()
 
@@ -254,8 +322,7 @@ func readURLList(path string) []string {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read URL list file: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("scan URL list file %s: %w", path, err)
 	}
-	return urls
+	return urls, nil
 }

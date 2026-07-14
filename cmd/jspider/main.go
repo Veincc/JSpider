@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -80,6 +79,18 @@ func main() {
 }
 
 func run(cfg *config.Config) error {
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	urls, err := cfg.URLs()
+	if err != nil {
+		return err
+	}
+	originDirectories, err := urlutil.OriginDirectoryNames(urls)
+	if err != nil {
+		return fmt.Errorf("plan origin directories: %w", err)
+	}
+
 	if cfg.APIDiscovery {
 		if err := apidiscovery.CheckAvailable(); err != nil {
 			return err
@@ -116,11 +127,6 @@ func run(cfg *config.Config) error {
 		log.Info("Headless discovery enabled: Chrome/Chromium found")
 	}
 
-	urls := cfg.URLs()
-	if len(urls) == 0 {
-		return errors.New("no URLs to analyze")
-	}
-
 	log.Info("JSpider started: %d entry URLs, workers %d, output dir %s", len(urls), cfg.Workers, cfg.OutDir)
 
 	initializedSites := make(map[string]bool)
@@ -136,7 +142,11 @@ func run(cfg *config.Config) error {
 	totalAnalyzed := 0
 
 	for i, entryURL := range urls {
-		site := urlutil.SanitizeDomain(entryURL)
+		origin, err := urlutil.CanonicalOrigin(entryURL)
+		if err != nil {
+			return fmt.Errorf("canonicalize entry URL %s: %w", entryURL, err)
+		}
+		site := originDirectories[origin]
 		siteDir := filepath.Join(cfg.OutDir, site)
 		if !initializedSites[site] {
 			if err := os.RemoveAll(siteDir); err != nil {
@@ -180,7 +190,7 @@ func run(cfg *config.Config) error {
 			apiSession.AddEntryURL(entryURL)
 		}
 		log.Info("[%d/%d] Analyzing: %s", i+1, len(urls), entryURL)
-		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, state.queued, state.processed, &totalAnalyzed)
+		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, site, state.queued, state.processed, &totalAnalyzed)
 		if apiSession != nil {
 			if err := apiSession.AnalyzeSources(); err != nil {
 				return fmt.Errorf("analyze discovered JavaScript APIs for %s: %w", entryURL, err)
@@ -214,7 +224,7 @@ func run(cfg *config.Config) error {
 // analyzeEntry analyzes a single entry URL and returns the number of JS files analyzed.
 // It always runs static HTML extraction, and additionally runs headless browser
 // discovery if cfg.Headless is enabled, merging and deduplicating the results.
-func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, entryURL string, queued, processed map[string]bool, totalAnalyzed *int) int {
+func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, entryURL, site string, queued, processed map[string]bool, totalAnalyzed *int) int {
 	// 1. Static HTML extraction (always)
 	log.Info("Downloading entry HTML: %s", entryURL)
 	htmlResult := f.FetchForEntry(entryURL, entryURL)
@@ -304,7 +314,7 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 
 		// Serially analyze each result
 		for res := range results {
-			analyzeResultWithPreprocess(cfg, s, a, log, prep, apiSession, res, entryURL, queued, processed, &queue, &analyzed, totalAnalyzed)
+			analyzeResultWithPreprocess(cfg, s, a, log, prep, apiSession, res, entryURL, site, queued, processed, &queue, &analyzed, totalAnalyzed)
 		}
 	}
 
@@ -367,7 +377,7 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 }
 
 // analyzeResultWithPreprocess analyzes a single downloaded JavaScript response.
-func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
+func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, res fetchRes, entryURL, site string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
 	item := res.req
 
 	if processed[item.url] {
@@ -392,11 +402,10 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 
 	prepResult := prep.Process(entryURL, item.url, res.result.Body)
 	analysisData := prepResult.AnalysisBody
-	entrySite := urlutil.SanitizeDomain(entryURL)
 	if prepResult.Failed {
 		log.Warn("JavaScript processing fell back for %s: %s", item.url, prepResult.Error)
 	}
-	s.RecordJSOutputs(entrySite, item.url, prepResult.Outputs)
+	s.RecordJSOutputs(site, item.url, prepResult.Outputs)
 
 	if cfg.APIDiscovery && apiSession != nil {
 		apiSession.AddSource(item.url, analysisData)
@@ -432,7 +441,7 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		if shouldEnqueue(newAsset.Confidence, newAsset.Status) {
 			newAsset.FromURL = item.url
 			newAsset.Depth = item.depth + 1
-			if cfg.MaxDepth > 0 && newAsset.Depth > cfg.MaxDepth {
+			if newAsset.Depth > cfg.MaxDepth {
 				log.Verbose("Skipping (exceeds depth limit %d): %s", cfg.MaxDepth, newAsset.URL)
 				continue
 			}
