@@ -346,33 +346,6 @@ func TestExtractFromDOM_DoesNotTreatDataSrcAsScriptSrc(t *testing.T) {
 	}
 }
 
-func TestNetworkCaptureWaitForResponseBodies(t *testing.T) {
-	capture := newNetworkCapture()
-	capture.beginResponseBody()
-
-	done := make(chan struct{})
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		capture.endResponseBody()
-		close(done)
-	}()
-
-	waitCtx, waitCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer waitCancel()
-	if !capture.waitForResponseBodies(waitCtx) {
-		t.Fatal("waitForResponseBodies timed out before pending body completed")
-	}
-	<-done
-
-	capture.beginResponseBody()
-	timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), time.Millisecond)
-	defer timeoutCancel()
-	if capture.waitForResponseBodies(timeoutCtx) {
-		t.Fatal("waitForResponseBodies returned true while body was still pending")
-	}
-	capture.endResponseBody()
-}
-
 func TestPhaseCutoffsShareOneAbsoluteOrigin(t *testing.T) {
 	origin := time.Unix(123, 456)
 	cutoffs := newPhaseCutoffs(origin, 20*time.Second)

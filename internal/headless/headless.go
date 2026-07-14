@@ -133,6 +133,8 @@ type networkCapture struct {
 	bodyCtx          context.Context
 	bodyCancel       context.CancelFunc
 	bodyWorkers      sync.WaitGroup
+	bodyWatcher      sync.WaitGroup
+	bodyAccepting    bool
 	bodyFetcher      responseBodyFetcher
 	bodyLimit        int64
 	bodyEntryURL     string
@@ -142,7 +144,6 @@ type networkCapture struct {
 type responseBodyMetadata struct {
 	requestID network.RequestID
 	url       string
-	mimeType  string
 }
 
 type responseBodyJob struct {
@@ -150,6 +151,12 @@ type responseBodyJob struct {
 }
 
 type responseBodyFetcher func(context.Context, network.RequestID) ([]byte, error)
+
+const (
+	responseBodyWorkerCount         = 4
+	responseBodyQueueCapacity       = 4
+	responseBodyOutstandingCapacity = responseBodyWorkerCount + responseBodyQueueCapacity
+)
 
 func newNetworkCapture() *networkCapture {
 	idle := make(chan struct{})
@@ -164,29 +171,21 @@ func newNetworkCapture() *networkCapture {
 	}
 }
 
-func (c *networkCapture) beginResponseBody() {
-	c.bodyMu.Lock()
-	if c.pendingBodies == 0 {
-		c.bodyIdle = make(chan struct{})
-	}
-	c.pendingBodies++
-	c.bodyMu.Unlock()
-}
-
 func (c *networkCapture) endResponseBody() {
 	c.bodyMu.Lock()
 	if c.pendingBodies > 0 {
 		c.pendingBodies--
-		if c.pendingBodies == 0 {
-			close(c.bodyIdle)
-		}
 	}
+	c.signalBodyIdleLocked()
 	c.bodyMu.Unlock()
 }
 
 func (c *networkCapture) waitForResponseBodies(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	c.bodyMu.Lock()
-	if c.pendingBodies == 0 {
+	if !c.hasPendingBodyWorkLocked() {
 		c.bodyMu.Unlock()
 		return true
 	}
@@ -195,7 +194,7 @@ func (c *networkCapture) waitForResponseBodies(ctx context.Context) bool {
 
 	select {
 	case <-idle:
-		return true
+		return ctx.Err() == nil
 	case <-ctx.Done():
 		return false
 	}
@@ -211,12 +210,20 @@ func (c *networkCapture) startBodyWorkers(ctx context.Context, limit int64, entr
 	c.bodyLimit = limit
 	c.bodyEntryURL = entryURL
 	c.bodyLog = log
+	c.bodyAccepting = true
+	c.bodyQueue = make([]responseBodyJob, 0, responseBodyQueueCapacity)
 	c.bodyMu.Unlock()
 
-	for range 4 {
+	for range responseBodyWorkerCount {
 		c.bodyWorkers.Add(1)
 		go c.runBodyWorker()
 	}
+	c.bodyWatcher.Add(1)
+	go func() {
+		defer c.bodyWatcher.Done()
+		<-c.bodyCtx.Done()
+		c.shutdownBodyAdmission()
+	}()
 }
 
 func (c *networkCapture) stopBodyWorkers() {
@@ -226,7 +233,28 @@ func (c *networkCapture) stopBodyWorkers() {
 	if cancel != nil {
 		cancel()
 	}
+	c.shutdownBodyAdmission()
+	c.bodyWatcher.Wait()
 	c.bodyWorkers.Wait()
+}
+
+func (c *networkCapture) shutdownBodyAdmission() {
+	c.bodyMu.Lock()
+	c.bodyAccepting = false
+	clear(c.pendingResponses)
+	dropped := len(c.bodyQueue)
+	clear(c.bodyQueue)
+	c.bodyQueue = nil
+	if dropped >= c.pendingBodies {
+		c.pendingBodies = 0
+	} else {
+		c.pendingBodies -= dropped
+	}
+	c.signalBodyIdleLocked()
+	c.bodyMu.Unlock()
+	for range responseBodyWorkerCount {
+		c.wakeBodyWorker()
+	}
 }
 
 func (c *networkCapture) handleResponseReceived(event *network.EventResponseReceived) {
@@ -238,14 +266,22 @@ func (c *networkCapture) handleResponseReceived(event *network.EventResponseRece
 
 	c.bodyMu.Lock()
 	defer c.bodyMu.Unlock()
-	if !eligible || event.Response.EncodedDataLength > float64(c.bodyLimit) {
+	if !c.bodyAdmissionOpenLocked() || !eligible || event.Response.EncodedDataLength > float64(c.bodyLimit) {
 		delete(c.pendingResponses, event.RequestID)
+		c.signalBodyIdleLocked()
 		return
+	}
+	_, exists := c.pendingResponses[event.RequestID]
+	if !exists && len(c.pendingResponses)+c.pendingBodies >= responseBodyOutstandingCapacity {
+		c.signalBodyIdleLocked()
+		return
+	}
+	if !exists && !c.hasPendingBodyWorkLocked() {
+		c.bodyIdle = make(chan struct{})
 	}
 	c.pendingResponses[event.RequestID] = responseBodyMetadata{
 		requestID: event.RequestID,
 		url:       event.Response.URL,
-		mimeType:  event.Response.MimeType,
 	}
 }
 
@@ -256,12 +292,11 @@ func (c *networkCapture) handleLoadingFinished(event *network.EventLoadingFinish
 	c.bodyMu.Lock()
 	metadata, ok := c.pendingResponses[event.RequestID]
 	delete(c.pendingResponses, event.RequestID)
-	if !ok || event.EncodedDataLength > float64(c.bodyLimit) {
+	if !ok || !c.bodyAdmissionOpenLocked() || event.EncodedDataLength > float64(c.bodyLimit) ||
+		len(c.bodyQueue) >= responseBodyQueueCapacity {
+		c.signalBodyIdleLocked()
 		c.bodyMu.Unlock()
 		return
-	}
-	if c.pendingBodies == 0 {
-		c.bodyIdle = make(chan struct{})
 	}
 	c.pendingBodies++
 	c.bodyQueue = append(c.bodyQueue, responseBodyJob{responseBodyMetadata: metadata})
@@ -275,7 +310,27 @@ func (c *networkCapture) handleLoadingFailed(event *network.EventLoadingFailed) 
 	}
 	c.bodyMu.Lock()
 	delete(c.pendingResponses, event.RequestID)
+	c.signalBodyIdleLocked()
 	c.bodyMu.Unlock()
+}
+
+func (c *networkCapture) hasPendingBodyWorkLocked() bool {
+	return len(c.pendingResponses) > 0 || c.pendingBodies > 0
+}
+
+func (c *networkCapture) bodyAdmissionOpenLocked() bool {
+	return c.bodyAccepting && c.bodyCtx != nil && c.bodyCtx.Err() == nil
+}
+
+func (c *networkCapture) signalBodyIdleLocked() {
+	if c.hasPendingBodyWorkLocked() {
+		return
+	}
+	select {
+	case <-c.bodyIdle:
+	default:
+		close(c.bodyIdle)
+	}
 }
 
 func (c *networkCapture) wakeBodyWorker() {
@@ -299,6 +354,11 @@ func (c *networkCapture) runBodyWorker() {
 func (c *networkCapture) nextBodyJob() (responseBodyJob, bool) {
 	for {
 		c.bodyMu.Lock()
+		ctx := c.bodyCtx
+		if ctx == nil || ctx.Err() != nil || !c.bodyAccepting {
+			c.bodyMu.Unlock()
+			return responseBodyJob{}, false
+		}
 		if len(c.bodyQueue) > 0 {
 			job := c.bodyQueue[0]
 			c.bodyQueue[0] = responseBodyJob{}
@@ -306,11 +366,7 @@ func (c *networkCapture) nextBodyJob() (responseBodyJob, bool) {
 			c.bodyMu.Unlock()
 			return job, true
 		}
-		ctx := c.bodyCtx
 		c.bodyMu.Unlock()
-		if ctx == nil {
-			return responseBodyJob{}, false
-		}
 		select {
 		case <-ctx.Done():
 			return responseBodyJob{}, false
@@ -328,7 +384,7 @@ func (c *networkCapture) processBodyJob(job responseBodyJob) {
 		return
 	}
 	body, err := fetcher(ctx, job.requestID)
-	if err != nil {
+	if err != nil || ctx.Err() != nil {
 		return
 	}
 	if int64(len(body)) > limit {
@@ -351,7 +407,8 @@ func (c *networkCapture) processBodyJob(job responseBodyJob) {
 
 func isTextResponseMIME(mimeType string) bool {
 	mimeType = strings.ToLower(strings.TrimSpace(strings.SplitN(mimeType, ";", 2)[0]))
-	return strings.HasPrefix(mimeType, "text/") || mimeType == "application/json" || strings.HasSuffix(mimeType, "+json")
+	return strings.HasPrefix(mimeType, "text/") || mimeType == "application/json" ||
+		(strings.HasPrefix(mimeType, "application/") && strings.HasSuffix(mimeType, "+json"))
 }
 
 // CheckBrowserAvailable checks whether Chrome or Chromium is available on the system.
