@@ -2,6 +2,8 @@ package fetcher
 
 import (
 	"compress/gzip"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Veincc/JSpider/internal/config"
 	"github.com/Veincc/JSpider/internal/logging"
@@ -58,6 +61,75 @@ func TestFetchRecordsRequestedAndRedirectFinalURLs(t *testing.T) {
 	}
 	if want := ts.URL + "/final/nested/app.js"; result.FinalURL != want {
 		t.Fatalf("FinalURL = %q, want %q", result.FinalURL, want)
+	}
+}
+
+func TestFetchForEntryContextCancelsRequest(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	result := f.FetchForEntryContext(ctx, ts.URL+"/map", ts.URL+"/")
+	if !errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("FetchForEntryContext() error = %v", result.Err)
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP request context was not canceled")
+	}
+}
+
+func TestShortSingleflightCallerDoesNotCancelLongCaller(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	requestCanceled := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		select {
+		case <-releaseRequest:
+			_, _ = w.Write([]byte("ok"))
+		case <-r.Context().Done():
+			requestCanceled <- struct{}{}
+		}
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer shortCancel()
+	shortResult := make(chan *Result, 1)
+	go func() {
+		shortResult <- f.FetchForEntryContext(shortCtx, ts.URL+"/map", ts.URL+"/")
+	}()
+	<-requestStarted
+
+	longCtx, longCancel := context.WithTimeout(context.Background(), time.Second)
+	defer longCancel()
+	longResult := make(chan *Result, 1)
+	go func() {
+		longResult <- f.FetchForEntryContext(longCtx, ts.URL+"/map", ts.URL+"/")
+	}()
+
+	short := <-shortResult
+	if !errors.Is(short.Err, context.DeadlineExceeded) {
+		t.Fatalf("short caller error = %v", short.Err)
+	}
+	close(releaseRequest)
+	long := <-longResult
+	if long.Err != nil || string(long.Body) != "ok" {
+		t.Fatalf("long caller result = %+v", long)
+	}
+	select {
+	case <-requestCanceled:
+		t.Fatal("short caller canceled the shared HTTP request")
+	default:
 	}
 }
 

@@ -275,7 +275,7 @@ func TestTightBudgetChildMembershipDoesNotDependOnParentCompletionOrder(t *testi
 	}
 }
 
-func TestNormalModeUsesSourceMapsThenFallsBackToReadableBundle(t *testing.T) {
+func TestNormalModeUsesCompleteSourceMapWithoutAnalyzingOriginalBundle(t *testing.T) {
 	if err := preprocess.CheckNodeRuntime(); err != nil {
 		t.Skip(err)
 	}
@@ -301,17 +301,75 @@ func TestNormalModeUsesSourceMapsThenFallsBackToReadableBundle(t *testing.T) {
 
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
 	assertPathExists(t, filepath.Join(siteDir, "js", "src", "main.ts"))
-	if count := countFiles(t, filepath.Join(siteDir, "js")); count != 2 {
-		t.Fatalf("processed outputs = %d, want 2", count)
+	if count := countFiles(t, filepath.Join(siteDir, "js")); count != 1 {
+		t.Fatalf("processed outputs = %d, want only the recovered source", count)
 	}
 	rows := readTabMap(t, filepath.Join(siteDir, "js-map.txt"))
-	if len(rows) != 2 || rows[0][0] != server.URL+"/app.js" || rows[1][0] != server.URL+"/chunk.js" {
+	if len(rows) != 1 || rows[0][0] != server.URL+"/app.js" {
 		t.Fatalf("JavaScript map = %+v", rows)
 	}
 	assertMapTargetsExist(t, siteDir)
 	assertPathMissing(t, filepath.Join(siteDir, "entry.html"))
 	assertPathMissing(t, filepath.Join(siteDir, "audit"))
 	assertNoLegacyReports(t, outDir)
+}
+
+func TestSourceMapAnalysisUsesRecoveredOnlyWhenComplete(t *testing.T) {
+	if err := preprocess.CheckNodeRuntime(); err != nil {
+		t.Skip(err)
+	}
+
+	for _, partial := range []bool{false, true} {
+		name := "complete"
+		if partial {
+			name = "partial"
+		}
+		t.Run(name, func(t *testing.T) {
+			var originalHits atomic.Int32
+			var recoveredHits atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/":
+					w.Header().Set("Content-Type", "text/html")
+					_, _ = w.Write([]byte(`<script src="/app.js"></script>`))
+				case "/app.js":
+					w.Header().Set("Content-Type", "application/javascript")
+					_, _ = w.Write([]byte(`import("./original.js");
+//# sourceMappingURL=app.js.map`))
+				case "/app.js.map":
+					w.Header().Set("Content-Type", "application/json")
+					if partial {
+						_, _ = w.Write([]byte(`{"version":3,"sources":["src/main.js","src/missing.js"],"sourcesContent":["import('/recovered.js');",null]}`))
+					} else {
+						_, _ = w.Write([]byte(`{"version":3,"sources":["src/main.js"],"sourcesContent":["import('/recovered.js');"]}`))
+					}
+				case "/original.js":
+					originalHits.Add(1)
+					w.Header().Set("Content-Type", "application/javascript")
+					_, _ = w.Write([]byte(`console.log("original")`))
+				case "/recovered.js":
+					recoveredHits.Add(1)
+					w.Header().Set("Content-Type", "application/javascript")
+					_, _ = w.Write([]byte(`console.log("recovered")`))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			cfg := testConfig(server.URL+"/", t.TempDir())
+			if err := run(cfg); err != nil {
+				t.Fatal(err)
+			}
+			if partial {
+				if originalHits.Load() != 1 || recoveredHits.Load() != 0 {
+					t.Fatalf("partial map hits original=%d recovered=%d", originalHits.Load(), recoveredHits.Load())
+				}
+			} else if originalHits.Load() != 0 || recoveredHits.Load() != 1 {
+				t.Fatalf("complete map hits original=%d recovered=%d", originalHits.Load(), recoveredHits.Load())
+			}
+		})
+	}
 }
 
 func TestNormalModeParseFailureSavesOriginalAsOnlyArtifact(t *testing.T) {

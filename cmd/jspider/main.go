@@ -178,8 +178,8 @@ func run(cfg *config.Config) error {
 		prep := processors[site]
 		if prep == nil {
 			var err error
-			prep, err = preprocess.New(siteDir, func(entryURL, rawURL string) ([]byte, error) {
-				result := f.FetchForEntry(rawURL, entryURL)
+			prep, err = preprocess.NewWithTimeout(siteDir, func(ctx context.Context, entryURL, rawURL string) ([]byte, error) {
+				result := f.FetchForEntryContext(ctx, rawURL, entryURL)
 				if result.Err != nil {
 					return nil, result.Err
 				}
@@ -187,7 +187,7 @@ func run(cfg *config.Config) error {
 					return nil, fmt.Errorf("HTTP %d", result.StatusCode)
 				}
 				return result.Body, nil
-			})
+			}, time.Duration(cfg.ProcessTimeoutSeconds)*time.Second)
 			if err != nil {
 				return err
 			}
@@ -511,7 +511,6 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 	processed[finalURL] = true
 
 	prepResult := prep.Process(entryURL, finalURL, res.result.Body)
-	analysisData := prepResult.AnalysisBody
 	if prepResult.Failed {
 		log.Warn("JavaScript processing fell back for %s: %s", item.url, prepResult.Error)
 	}
@@ -520,8 +519,14 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		s.RecordJSOutputs(site, finalURL, prepResult.Outputs)
 	}
 
+	analysisUnits := prepResult.Analysis
+	if len(analysisUnits) == 0 {
+		analysisUnits = []preprocess.AnalysisUnit{{SourceName: finalURL, BaseURL: finalURL, Body: res.result.Body}}
+	}
 	if cfg.APIDiscovery && apiSession != nil {
-		apiSession.AddSource(finalURL, analysisData)
+		for _, unit := range analysisUnits {
+			apiSession.AddSource(unit.SourceName, unit.Body)
+		}
 	}
 
 	*analyzed++
@@ -536,7 +541,10 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		Size: res.result.Size, Hash: res.result.Hash,
 	})
 
-	discovered := a.DiscoverJS(string(analysisData), finalURL)
+	discovered := make([]analyzer.JSAsset, 0)
+	for _, unit := range analysisUnits {
+		discovered = append(discovered, a.DiscoverJS(string(unit.Body), unit.BaseURL)...)
+	}
 
 	// Add newly discovered JS URLs to the next batch queue
 	for _, newAsset := range discovered {
@@ -553,7 +561,6 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 			continue
 		}
 		if shouldEnqueue(newAsset.Confidence, newAsset.Status) {
-			newAsset.FromURL = finalURL
 			newAsset.Depth = item.depth + 1
 			if newAsset.Depth > cfg.MaxDepth {
 				log.Verbose("Skipping (exceeds depth limit %d): %s", cfg.MaxDepth, newAsset.URL)

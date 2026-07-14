@@ -60,8 +60,8 @@ func TestAnalyzeEntryKeepsStaticAPIsWhenHeadlessFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	processor, err := preprocess.New(filepath.Join(outDir, urlutil.SanitizeDomain(server.URL)), func(entryURL, rawURL string) ([]byte, error) {
-		result := f.FetchForEntry(rawURL, entryURL)
+	processor, err := preprocess.New(filepath.Join(outDir, urlutil.SanitizeDomain(server.URL)), func(ctx context.Context, entryURL, rawURL string) ([]byte, error) {
+		result := f.FetchForEntryContext(ctx, rawURL, entryURL)
 		if result.Err != nil {
 			return nil, result.Err
 		}

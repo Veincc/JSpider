@@ -57,8 +57,10 @@ func (r *Result) clone() *Result {
 
 // inflight represents an in-progress request
 type inflight struct {
-	done chan struct{}
-	res  *Result
+	done    chan struct{}
+	res     *Result
+	cancel  context.CancelFunc
+	waiters int
 }
 
 type Fetcher struct {
@@ -106,57 +108,94 @@ func New(cfg *config.Config, log *logging.Logger) (*Fetcher, error) {
 
 // Fetch downloads URL content with active-request singleflight deduplication.
 func (f *Fetcher) Fetch(rawURL string) *Result {
-	return f.fetch(rawURL, rawURL)
+	return f.FetchContext(context.Background(), rawURL)
+}
+
+// FetchContext downloads URL content and cancels the request when ctx ends.
+func (f *Fetcher) FetchContext(ctx context.Context, rawURL string) *Result {
+	return f.fetch(ctx, rawURL, rawURL)
 }
 
 // FetchForEntry downloads URL content using entryURL as the same-origin policy
 // anchor for redirects and credential scoping.
 func (f *Fetcher) FetchForEntry(rawURL, entryURL string) *Result {
+	return f.FetchForEntryContext(context.Background(), rawURL, entryURL)
+}
+
+// FetchForEntryContext downloads URL content with a caller-controlled context
+// and entryURL as the same-origin policy anchor.
+func (f *Fetcher) FetchForEntryContext(ctx context.Context, rawURL, entryURL string) *Result {
 	if entryURL == "" {
 		entryURL = rawURL
 	}
-	return f.fetch(rawURL, entryURL)
+	return f.fetch(ctx, rawURL, entryURL)
 }
 
-func (f *Fetcher) fetch(rawURL, entryURL string) *Result {
+func (f *Fetcher) fetch(ctx context.Context, rawURL, entryURL string) *Result {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cacheKey := fetchCacheKey(rawURL, entryURL)
 
 	f.mu.Lock()
 
 	// Join an in-flight request for the same URL and entry policy.
 	if inf, ok := f.pending[cacheKey]; ok {
+		inf.waiters++
 		f.mu.Unlock()
-		// Wait for the request to complete
-		<-inf.done
-		return inf.res
+		return f.waitForInflight(ctx, cacheKey, rawURL, inf)
 	}
 
 	// Create a new in-flight request. Completed bodies are not retained.
-	inf := &inflight{done: make(chan struct{})}
+	requestContext, cancel := context.WithCancel(context.Background())
+	inf := &inflight{done: make(chan struct{}), cancel: cancel, waiters: 1}
 	f.pending[cacheKey] = inf
 	f.mu.Unlock()
 
-	result := f.doFetch(rawURL, entryURL)
+	go f.runInflight(requestContext, cacheKey, rawURL, entryURL, inf)
+	return f.waitForInflight(ctx, cacheKey, rawURL, inf)
+}
+
+func (f *Fetcher) runInflight(ctx context.Context, cacheKey, rawURL, entryURL string, inf *inflight) {
+	result := f.doFetch(ctx, rawURL, entryURL)
 
 	// Publish to current waiters, then release the request from the active set.
 	f.mu.Lock()
 	inf.res = result
-	delete(f.pending, cacheKey)
+	if f.pending[cacheKey] == inf {
+		delete(f.pending, cacheKey)
+	}
 	f.mu.Unlock()
 	close(inf.done)
-
-	return result
+	inf.cancel()
 }
 
-func (f *Fetcher) doFetch(rawURL, entryURL string) *Result {
+func (f *Fetcher) waitForInflight(ctx context.Context, cacheKey, rawURL string, inf *inflight) *Result {
+	select {
+	case <-inf.done:
+		return inf.res
+	case <-ctx.Done():
+		f.mu.Lock()
+		if f.pending[cacheKey] == inf {
+			inf.waiters--
+			if inf.waiters == 0 {
+				delete(f.pending, cacheKey)
+				inf.cancel()
+			}
+		}
+		f.mu.Unlock()
+		return &Result{URL: rawURL, RequestedURL: rawURL, Err: ctx.Err()}
+	}
+}
+
+func (f *Fetcher) doFetch(ctx context.Context, rawURL, entryURL string) *Result {
 	result := &Result{URL: rawURL, RequestedURL: rawURL}
-	req, err := http.NewRequest("GET", rawURL, nil)
+	requestContext := context.WithValue(ctx, redirectPolicyKey{}, entryURL)
+	req, err := http.NewRequestWithContext(requestContext, "GET", rawURL, nil)
 	if err != nil {
 		result.Err = err
 		return result
 	}
-	req = req.WithContext(context.WithValue(req.Context(), redirectPolicyKey{}, entryURL))
-
 	req.Header.Set("User-Agent", f.cfg.UserAgent)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
