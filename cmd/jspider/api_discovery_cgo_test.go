@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
@@ -21,6 +22,66 @@ import (
 	"github.com/Veincc/JSpider/internal/store"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
+
+func TestRunReportsCheapPerEntryAPIStatsAndWritesOneFinalEndpointSet(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/first" && r.URL.Path != "/second" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html></html>`))
+	}))
+	defer server.Close()
+
+	originalCheck, originalDiscover := checkBrowserAvailable, discoverBrowser
+	checkBrowserAvailable = func() error { return nil }
+	discoverBrowser = func(_ context.Context, cfg *headless.Config, _ *logging.Logger) (headless.DiscoveryResult, error) {
+		name := strings.TrimPrefix(cfg.EntryURL, server.URL+"/")
+		return headless.DiscoveryResult{Requests: []apidiscovery.RuntimeRequest{{
+			RequestID: name, URL: server.URL + "/api/" + name + "?keep=" + name,
+			Method: "GET", ResourceType: "Fetch",
+		}}}, nil
+	}
+	t.Cleanup(func() { checkBrowserAvailable, discoverBrowser = originalCheck, originalDiscover })
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(server.URL+"/second\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(server.URL+"/first", t.TempDir())
+	cfg.URLList = listPath
+	cfg.APIDiscovery, cfg.Headless = true, true
+
+	result, err := run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Success) != 2 {
+		t.Fatalf("success results = %+v", result.Success)
+	}
+	for _, entry := range result.Success {
+		if entry.API.Sources != 0 || entry.API.Runtime != 1 {
+			t.Fatalf("API stats for %s = %+v", entry.EntryURL, entry.API)
+		}
+	}
+	origin, canonicalErr := urlutil.CanonicalOrigin(server.URL)
+	if canonicalErr != nil {
+		t.Fatal(canonicalErr)
+	}
+	stats := result.Sites[origin]
+	if stats.API.Sources != 0 || stats.API.Runtime != 2 {
+		t.Fatalf("site API stats = %+v", stats.API)
+	}
+	data, readErr := os.ReadFile(filepath.Join(cfg.OutDir, stats.Directory, "endpoints.txt"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	want := server.URL + "/api/first?keep=first\n" + server.URL + "/api/second?keep=second\n"
+	if string(data) != want {
+		t.Fatalf("endpoints.txt = %q, want %q", data, want)
+	}
+}
 
 func TestAnalyzeEntryKeepsStaticAPIsWhenHeadlessFails(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -122,9 +183,9 @@ func TestRunChecksBrowserBeforeCreatingOutput(t *testing.T) {
 	cfg.APIDiscovery = true
 	cfg.Headless = true
 
-	err := run(cfg)
+	err := runTest(cfg)
 	if err == nil || err.Error() != "browser unavailable for test" {
-		t.Fatalf("run() error = %v", err)
+		t.Fatalf("runTest() error = %v", err)
 	}
 	if _, statErr := os.Stat(outDir); !os.IsNotExist(statErr) {
 		t.Fatalf("output directory was created before browser validation: %v", statErr)
@@ -203,7 +264,7 @@ func TestAPIDiscoveryWritesOnlyFinalEndpoints(t *testing.T) {
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/", outDir)
 	cfg.APIDiscovery, cfg.Headless = true, true
-	if err := run(cfg); err != nil {
+	if err := runTest(cfg); err != nil {
 		t.Fatal(err)
 	}
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -234,7 +295,7 @@ func TestAPIDiscoveryWritesEmptyEndpointsFile(t *testing.T) {
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/", outDir)
 	cfg.APIDiscovery, cfg.Headless = true, true
-	if err := run(cfg); err != nil {
+	if err := runTest(cfg); err != nil {
 		t.Fatal(err)
 	}
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))

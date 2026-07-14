@@ -21,11 +21,12 @@ const (
 type Session struct {
 	mu sync.Mutex
 
-	static       []StaticEndpoint
-	runtime      []RuntimeRequest
-	entryURLs    []string
-	sources      map[string][]byte
-	sourceStates map[string]sourceAnalysisState
+	static           []StaticEndpoint
+	runtime          []RuntimeRequest
+	entryURLs        []string
+	sources          map[string][]byte
+	sourceIdentities map[SourceIdentity]struct{}
+	sourceStates     map[string]sourceAnalysisState
 	// sourceVersions changes every time AddSource replaces a URL's bytes.
 	// AnalyzeSources uses it to discard stale analysis results if a source is
 	// updated while jsluice is running outside the lock.
@@ -34,9 +35,10 @@ type Session struct {
 
 func NewSession() *Session {
 	return &Session{
-		sources:        make(map[string][]byte),
-		sourceStates:   make(map[string]sourceAnalysisState),
-		sourceVersions: make(map[string]uint64),
+		sources:          make(map[string][]byte),
+		sourceIdentities: make(map[SourceIdentity]struct{}),
+		sourceStates:     make(map[string]sourceAnalysisState),
+		sourceVersions:   make(map[string]uint64),
 	}
 }
 
@@ -65,19 +67,45 @@ func (s *Session) AddStatic(endpoints []StaticEndpoint) {
 }
 
 func (s *Session) AddRuntime(requests []RuntimeRequest) {
+	s.AddRuntimeForEntry("", requests)
+}
+
+// AddRuntimeForEntry associates collected browser requests with the entry
+// that initiated discovery. Existing non-empty request identities win.
+func (s *Session) AddRuntimeForEntry(entryURL string, requests []RuntimeRequest) {
 	if s == nil || len(requests) == 0 {
 		return
 	}
+	collected := append([]RuntimeRequest(nil), requests...)
 	s.mu.Lock()
-	s.runtime = append(s.runtime, requests...)
+	for i := range collected {
+		if collected[i].EntryURL == "" {
+			collected[i].EntryURL = entryURL
+		}
+	}
+	s.runtime = append(s.runtime, collected...)
 	s.mu.Unlock()
 }
 
 func (s *Session) AddSource(sourceURL string, source []byte) {
+	s.AddSourceWithIdentity(SourceIdentity{FinalURL: sourceURL}, sourceURL, source)
+}
+
+// AddSourceWithIdentity records the complete fetch identity while preserving
+// the current sourceURL-keyed analysis set. Keeping these concerns separate is
+// intentional: source matching changes belong to the later identity task.
+func (s *Session) AddSourceWithIdentity(identity SourceIdentity, sourceURL string, source []byte) {
 	if s == nil || sourceURL == "" {
 		return
 	}
 	s.mu.Lock()
+	if s.sourceIdentities == nil {
+		s.sourceIdentities = make(map[SourceIdentity]struct{})
+	}
+	if identity.FinalURL == "" {
+		identity.FinalURL = sourceURL
+	}
+	s.sourceIdentities[identity] = struct{}{}
 	if s.sources == nil {
 		s.sources = make(map[string][]byte)
 	}
@@ -97,6 +125,28 @@ func (s *Session) AddSource(sourceURL string, source []byte) {
 	s.sourceVersions[sourceURL]++
 	s.sourceStates[sourceURL] = sourceStatePending
 	s.mu.Unlock()
+}
+
+// Stats returns a per-entry collection snapshot without running jsluice or
+// building the final association report.
+func (s *Session) Stats(entryURL string) SessionStats {
+	if s == nil {
+		return SessionStats{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stats := SessionStats{}
+	for identity := range s.sourceIdentities {
+		if identity.EntryURL == entryURL {
+			stats.Sources++
+		}
+	}
+	for _, request := range s.runtime {
+		if request.EntryURL == entryURL && isRuntimeAPI(request.ResourceType) && !request.WebSocket && !request.Preflight {
+			stats.Runtime++
+		}
+	}
+	return stats
 }
 
 func (s *Session) SourceCount() int {

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Veincc/JSpider/internal/apidiscovery"
@@ -10,10 +12,79 @@ import (
 	"github.com/Veincc/JSpider/internal/store"
 )
 
+type closeErrorProcessor struct {
+	err error
+}
+
+func (p *closeErrorProcessor) Process(string, string, []byte) preprocess.FileResult {
+	return preprocess.FileResult{}
+}
+
+func (p *closeErrorProcessor) Close() error { return p.err }
+
+func TestFinalizeOutputsJoinsCloseErrorsAndStillWritesEveryMap(t *testing.T) {
+	outDir := t.TempDir()
+	sites := map[string]*siteRuntime{
+		"first": {
+			origin: "first", directory: "first", store: store.New(outDir),
+			processor: &closeErrorProcessor{err: errors.New("first close failed")},
+		},
+		"second": {
+			origin: "second", directory: "second", store: store.New(outDir),
+			processor: &closeErrorProcessor{err: errors.New("second close failed")},
+		},
+	}
+
+	err := finalizeOutputs(outDir, sites, false, nil)
+	if err == nil || !strings.Contains(err.Error(), "first close failed") || !strings.Contains(err.Error(), "second close failed") {
+		t.Fatalf("finalizeOutputs() error = %v, want both close failures", err)
+	}
+	for origin, site := range sites {
+		if site.processor != nil {
+			t.Fatalf("processor for %s was retained after close failure", origin)
+		}
+		assertPathExists(t, filepath.Join(outDir, site.directory, "js-map.txt"))
+	}
+}
+
+func TestFinalizeOutputsJoinsSiteErrorsAndContinuesFinalizing(t *testing.T) {
+	outDir := t.TempDir()
+	sites := make(map[string]*siteRuntime)
+	for _, site := range []string{"first_com", "second_com", "third_com"} {
+		processor, err := preprocess.New(filepath.Join(outDir, site), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sites[site] = &siteRuntime{origin: site, directory: site, store: store.New(outDir), processor: processor}
+	}
+	t.Cleanup(func() {
+		for _, site := range sites {
+			if site.processor != nil {
+				_ = site.processor.Close()
+			}
+		}
+	})
+	for _, site := range []string{"first_com", "second_com"} {
+		if err := os.Mkdir(filepath.Join(outDir, site, "js-map.txt"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err := finalizeOutputs(outDir, sites, false, nil)
+	if err == nil || !strings.Contains(err.Error(), "first_com") || !strings.Contains(err.Error(), "second_com") {
+		t.Fatalf("finalizeOutputs() error = %v, want both site failures", err)
+	}
+	for origin, site := range sites {
+		if site.processor != nil {
+			t.Fatalf("processor for %s was not closed", origin)
+		}
+	}
+	assertPathExists(t, filepath.Join(outDir, "third_com", "js-map.txt"))
+}
+
 func TestFinalizeOutputsWritesMapsWithoutEndpoints(t *testing.T) {
 	outDir := t.TempDir()
-	s := store.New(outDir)
-	processors := make(map[string]*preprocess.Processor)
+	sites := make(map[string]*siteRuntime)
 	for _, site := range []string{"second_com", "first_com"} {
 		processor, err := preprocess.New(filepath.Join(outDir, site), nil)
 		if err != nil {
@@ -23,24 +94,19 @@ func TestFinalizeOutputsWritesMapsWithoutEndpoints(t *testing.T) {
 		if len(result.Outputs) != 1 {
 			t.Fatalf("%s Process() = %+v", site, result)
 		}
-		s.RecordJSOutputs(site, "https://"+site+"/app.js", result.Outputs)
-		processors[site] = processor
+		siteStore := store.New(outDir)
+		siteStore.RecordJSOutputs(site, "https://"+site+"/app.js", result.Outputs)
+		sites[site] = &siteRuntime{origin: site, directory: site, store: siteStore, processor: processor}
 	}
 	t.Cleanup(func() {
-		for _, processor := range processors {
-			_ = processor.Close()
+		for _, site := range sites {
+			if site.processor != nil {
+				_ = site.processor.Close()
+			}
 		}
 	})
 
-	err := finalizeOutputs(
-		outDir,
-		s,
-		map[string]bool{"second_com": true, "first_com": true},
-		processors,
-		nil,
-		nil,
-		false,
-	)
+	err := finalizeOutputs(outDir, sites, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,20 +114,20 @@ func TestFinalizeOutputsWritesMapsWithoutEndpoints(t *testing.T) {
 		assertPathExists(t, filepath.Join(outDir, site, "js-map.txt"))
 		assertPathMissing(t, filepath.Join(outDir, site, "endpoints.txt"))
 	}
-	if len(processors) != 0 {
-		t.Fatalf("processors after finalization = %d, want 0", len(processors))
+	for origin, site := range sites {
+		if site.processor != nil {
+			t.Fatalf("processor for %s was not closed", origin)
+		}
 	}
 }
 
 func TestFinalizeOutputsWritesAPIEndpoints(t *testing.T) {
 	outDir := t.TempDir()
 	site := "example_com"
-	s := store.New(outDir)
 	processor, err := preprocess.New(filepath.Join(outDir, site), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	processors := map[string]*preprocess.Processor{site: processor}
 	t.Cleanup(func() { _ = processor.Close() })
 	session := apidiscovery.NewSession()
 	session.AddEntryURL("https://example.com/")
@@ -69,15 +135,11 @@ func TestFinalizeOutputsWritesAPIEndpoints(t *testing.T) {
 		RequestID: "runtime", URL: "https://example.com/api/runtime", Method: "GET", ResourceType: "Fetch",
 	}})
 
-	err = finalizeOutputs(
-		outDir,
-		s,
-		map[string]bool{site: true},
-		processors,
-		map[string]*apidiscovery.Session{site: session},
-		map[string][]string{site: {"https://example.com/"}},
-		true,
-	)
+	sites := map[string]*siteRuntime{site: {
+		origin: site, directory: site, store: store.New(outDir), processor: processor,
+		apiSession: session, entryURLs: []string{"https://example.com/"},
+	}}
+	err = finalizeOutputs(outDir, sites, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

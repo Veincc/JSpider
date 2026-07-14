@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,372 @@ import (
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
+func runTest(cfg *config.Config) error {
+	_, err := run(context.Background(), cfg)
+	return err
+}
+
+func TestRunMixedEntriesContinuesAndReturnsStructuredFailure(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/ok":    `<script src="/ok.js"></script>`,
+		"/ok.js": `console.log("ok");`,
+	})
+	defer server.Close()
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(server.URL+"/ok\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(server.URL+"/missing", t.TempDir())
+	cfg.URLList = listPath
+
+	result, err := run(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("run() error = %v, want joined entry failure", err)
+	}
+	if len(result.Success) != 1 || result.Success[0].EntryURL != server.URL+"/ok" || result.Success[0].Err != nil {
+		t.Fatalf("success results = %+v", result.Success)
+	}
+	if len(result.Failure) != 1 || result.Failure[0].EntryURL != server.URL+"/missing" || result.Failure[0].Err == nil {
+		t.Fatalf("failure results = %+v", result.Failure)
+	}
+	if len(result.Skipped) != 0 {
+		t.Fatalf("skipped results = %+v, want none", result.Skipped)
+	}
+	origin, canonicalErr := urlutil.CanonicalOrigin(server.URL)
+	if canonicalErr != nil {
+		t.Fatal(canonicalErr)
+	}
+	stats := result.Sites[origin]
+	if stats.Success != 1 || stats.Failure != 1 || stats.Skipped != 0 ||
+		stats.FetchAttempts != 1 || stats.Analyzed != 1 || stats.Confirmed != 1 {
+		t.Fatalf("site stats = %+v", stats)
+	}
+	assertMapTargetsExist(t, filepath.Join(cfg.OutDir, stats.Directory))
+}
+
+func TestRunMaxJSBudgetAndOutputsAreIsolatedPerOrigin(t *testing.T) {
+	first := newSiteServer(t, map[string]string{
+		"/":          `<script src="/shared.js"></script>`,
+		"/shared.js": `console.log("first");`,
+	})
+	defer first.Close()
+	second := newSiteServer(t, map[string]string{
+		"/":          `<script src="/shared.js"></script>`,
+		"/shared.js": `console.log("second");`,
+	})
+	defer second.Close()
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(second.URL+"/\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(first.URL+"/", t.TempDir())
+	cfg.URLList = listPath
+	cfg.MaxJS = 1
+
+	result, err := run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Success) != 2 || len(result.Sites) != 2 {
+		t.Fatalf("run result = %+v", result)
+	}
+	for _, rawURL := range []string{first.URL, second.URL} {
+		origin, canonicalErr := urlutil.CanonicalOrigin(rawURL)
+		if canonicalErr != nil {
+			t.Fatal(canonicalErr)
+		}
+		stats := result.Sites[origin]
+		if stats.FetchAttempts != 1 || stats.Analyzed != 1 || stats.Confirmed != 1 {
+			t.Fatalf("stats for %s = %+v", origin, stats)
+		}
+		rows := readTabMap(t, filepath.Join(cfg.OutDir, stats.Directory, "js-map.txt"))
+		if len(rows) != 1 || rows[0][0] != rawURL+"/shared.js" {
+			t.Fatalf("map for %s = %+v", origin, rows)
+		}
+	}
+}
+
+func TestRunFinalizationFailureIsSiteScopedAndDoesNotBlockOtherSites(t *testing.T) {
+	outDir := t.TempDir()
+	var firstSiteDir string
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = w.Write([]byte(`<script src="/app.js"></script>`))
+		case "/app.js":
+			if err := os.Mkdir(filepath.Join(firstSiteDir, "js-map.txt"), 0755); err != nil {
+				t.Errorf("block first js-map output: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`console.log("first");`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer first.Close()
+	second := newSiteServer(t, map[string]string{
+		"/":       `<script src="/app.js"></script>`,
+		"/app.js": `console.log("second");`,
+	})
+	defer second.Close()
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(second.URL+"/\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(first.URL+"/", outDir)
+	cfg.URLList = listPath
+	directories, err := urlutil.OriginDirectoryNames([]string{first.URL + "/", second.URL + "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstOrigin, err := urlutil.CanonicalOrigin(first.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondOrigin, err := urlutil.CanonicalOrigin(second.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSiteDir = filepath.Join(outDir, directories[firstOrigin])
+
+	result, runErr := run(context.Background(), cfg)
+	if runErr == nil || !strings.Contains(runErr.Error(), "write JavaScript map") {
+		t.Fatalf("run() error = %v, want first-site finalization error", runErr)
+	}
+	if len(result.Success) != 2 || len(result.Failure) != 0 || len(result.Skipped) != 0 {
+		t.Fatalf("entry outcomes changed by finalization: %+v", result)
+	}
+	if result.Sites[firstOrigin].FinalizationError == "" {
+		t.Fatalf("first site stats missing finalization error: %+v", result.Sites[firstOrigin])
+	}
+	if result.Sites[secondOrigin].FinalizationError != "" {
+		t.Fatalf("second site stats inherited first error: %+v", result.Sites[secondOrigin])
+	}
+	assertMapTargetsExist(t, filepath.Join(outDir, result.Sites[secondOrigin].Directory))
+}
+
+func TestRunFatalArtifactWriteFailureStopsNewEntries(t *testing.T) {
+	outDir := t.TempDir()
+	var secondHits atomic.Int32
+	var siteDir string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/fatal":
+			_, _ = w.Write([]byte(`<script src="/fatal.js"></script>`))
+		case "/fatal.js":
+			if err := os.RemoveAll(filepath.Join(siteDir, "js")); err != nil {
+				t.Errorf("remove JavaScript directory: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(siteDir, "js"), []byte("blocks output directory"), 0600); err != nil {
+				t.Errorf("block JavaScript directory: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`console.log("fatal");`))
+		case "/second":
+			secondHits.Add(1)
+			_, _ = w.Write([]byte(`<html></html>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	origin, err := urlutil.CanonicalOrigin(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directories, err := urlutil.OriginDirectoryNames([]string{server.URL + "/fatal", server.URL + "/second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	siteDir = filepath.Join(outDir, directories[origin])
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(server.URL+"/second\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(server.URL+"/fatal", outDir)
+	cfg.URLList = listPath
+
+	result, runErr := run(context.Background(), cfg)
+	if runErr == nil || !strings.Contains(runErr.Error(), "write fallback file") {
+		t.Fatalf("run() error = %v, want fatal artifact error", runErr)
+	}
+	if got := secondHits.Load(); got != 0 {
+		t.Fatalf("second entry hits = %d, want entry skipped", got)
+	}
+	if len(result.Failure) != 1 || result.Failure[0].EntryURL != server.URL+"/fatal" {
+		t.Fatalf("failure results = %+v", result.Failure)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].EntryURL != server.URL+"/second" || result.Skipped[0].Reason == "" {
+		t.Fatalf("skipped results = %+v", result.Skipped)
+	}
+	stats := result.Sites[origin]
+	if stats.Analyzed != 0 || stats.Confirmed != 0 || stats.Failure != 1 || stats.Skipped != 1 {
+		t.Fatalf("site stats after fatal write = %+v", stats)
+	}
+}
+
+func TestFatalArtifactWriteStopsUnlaunchedBatchRequests(t *testing.T) {
+	outDir := t.TempDir()
+	var laterHits atomic.Int32
+	var siteDir string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = w.Write([]byte(`<script src="/a.js"></script><script src="/b.js"></script><script src="/c.js"></script>`))
+		case "/a.js":
+			if err := os.RemoveAll(filepath.Join(siteDir, "js")); err != nil {
+				t.Errorf("remove JavaScript directory: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(siteDir, "js"), []byte("blocks output directory"), 0600); err != nil {
+				t.Errorf("block JavaScript directory: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`console.log("fatal");`))
+		case "/b.js", "/c.js":
+			laterHits.Add(1)
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`console.log("must not start");`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	directories, err := urlutil.OriginDirectoryNames([]string{server.URL + "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	origin, err := urlutil.CanonicalOrigin(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	siteDir = filepath.Join(outDir, directories[origin])
+	cfg := testConfig(server.URL+"/", outDir)
+	cfg.Workers = 1
+
+	result, runErr := run(context.Background(), cfg)
+	if runErr == nil || len(result.Failure) != 1 {
+		t.Fatalf("run result = %+v, error = %v", result, runErr)
+	}
+	if got := laterHits.Load(); got != 0 {
+		t.Fatalf("requests started after fatal output error = %d, want 0", got)
+	}
+	if got := result.Sites[origin].FetchAttempts; got != 1 {
+		t.Fatalf("fetch attempts after fatal output error = %d, want actual started requests 1", got)
+	}
+}
+
+func TestRunCanceledContextSkipsEveryUnstartedEntry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg := testConfig("https://first.invalid/", filepath.Join(t.TempDir(), "not-created"))
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte("https://second.invalid/\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.URLList = listPath
+
+	result, err := run(ctx, cfg)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run() error = %v, want context canceled", err)
+	}
+	if len(result.Success) != 0 || len(result.Failure) != 0 || len(result.Skipped) != 2 {
+		t.Fatalf("canceled result = %+v", result)
+	}
+	if result.Skipped[0].EntryURL != cfg.URL || result.Skipped[1].EntryURL != "https://second.invalid/" {
+		t.Fatalf("skipped order = %+v", result.Skipped)
+	}
+}
+
+func TestRunCancellationFailsStartedEntryAndSkipsRemaining(t *testing.T) {
+	started := make(chan struct{})
+	var secondHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/slow":
+			close(started)
+			<-r.Context().Done()
+		case "/second":
+			secondHits.Add(1)
+			_, _ = w.Write([]byte(`<html></html>`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(server.URL+"/second\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(server.URL+"/slow", t.TempDir())
+	cfg.URLList = listPath
+	ctx, cancel := context.WithCancel(context.Background())
+	type outcome struct {
+		result RunResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := run(ctx, cfg)
+		done <- outcome{result: result, err: err}
+	}()
+	<-started
+	cancel()
+
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("run() error = %v, want context canceled", got.err)
+		}
+		if len(got.result.Failure) != 1 || !errors.Is(got.result.Failure[0].Err, context.Canceled) {
+			t.Fatalf("failure results = %+v", got.result.Failure)
+		}
+		if len(got.result.Skipped) != 1 || got.result.Skipped[0].EntryURL != server.URL+"/second" {
+			t.Fatalf("skipped results = %+v", got.result.Skipped)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return promptly after context cancellation")
+	}
+	if got := secondHits.Load(); got != 0 {
+		t.Fatalf("second entry hits = %d, want skipped", got)
+	}
+}
+
+func TestRunHTTPAndHTTPSOriginsWithCollidingBaseDirectoriesRemainDistinct(t *testing.T) {
+	urls := []string{"http://127.0.0.1:1/", "https://127.0.0.1:1/"}
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(urls[1]+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(urls[0], t.TempDir())
+	cfg.URLList = listPath
+	cfg.Timeout = 1
+
+	result, err := run(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("run() error = nil, want both network failures")
+	}
+	if len(result.Failure) != 2 || len(result.Sites) != 2 {
+		t.Fatalf("run result = %+v", result)
+	}
+	seenDirectories := make(map[string]bool)
+	for _, rawURL := range urls {
+		origin, canonicalErr := urlutil.CanonicalOrigin(rawURL)
+		if canonicalErr != nil {
+			t.Fatal(canonicalErr)
+		}
+		stats := result.Sites[origin]
+		if stats.Directory == "" || seenDirectories[stats.Directory] {
+			t.Fatalf("origin directories are not distinct: %+v", result.Sites)
+		}
+		seenDirectories[stats.Directory] = true
+		assertPathExists(t, filepath.Join(cfg.OutDir, stats.Directory, "js-map.txt"))
+	}
+}
+
 func TestNormalModeWritesProcessedJavaScriptAndMapOnly(t *testing.T) {
 	server := newSiteServer(t, map[string]string{
 		"/":                `<script src="/assets/app.js"></script>`,
@@ -32,8 +399,8 @@ func TestNormalModeWritesProcessedJavaScriptAndMapOnly(t *testing.T) {
 
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/", outDir)
-	if err := run(cfg); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(cfg); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -55,9 +422,9 @@ func TestRunRequiresNodeBeforeCreatingOutput(t *testing.T) {
 
 	t.Setenv("PATH", "")
 	outDir := filepath.Join(t.TempDir(), "not-created")
-	err := run(testConfig(server.URL+"/", outDir))
+	err := runTest(testConfig(server.URL+"/", outDir))
 	if err == nil || err.Error() != preprocess.NodeRuntimeError {
-		t.Fatalf("run() error = %v", err)
+		t.Fatalf("runTest() error = %v", err)
 	}
 	assertPathMissing(t, outDir)
 }
@@ -67,9 +434,9 @@ func TestRunRejectsInvalidConfigBeforeCreatingOutput(t *testing.T) {
 	cfg := testConfig("https://example.com/", outDir)
 	cfg.Workers = 0
 
-	err := run(cfg)
+	err := runTest(cfg)
 	if err == nil || !strings.Contains(err.Error(), "workers") {
-		t.Fatalf("run() error = %v, want worker validation error", err)
+		t.Fatalf("runTest() error = %v, want worker validation error", err)
 	}
 	assertPathMissing(t, outDir)
 }
@@ -79,9 +446,9 @@ func TestRunReturnsURLFileErrorBeforeCreatingOutput(t *testing.T) {
 	cfg := testConfig("", outDir)
 	cfg.URLList = filepath.Join(t.TempDir(), "missing.txt")
 
-	err := run(cfg)
+	err := runTest(cfg)
 	if err == nil || !strings.Contains(err.Error(), "URL list") {
-		t.Fatalf("run() error = %v, want URL list error", err)
+		t.Fatalf("runTest() error = %v, want URL list error", err)
 	}
 	assertPathMissing(t, outDir)
 }
@@ -104,9 +471,9 @@ func TestRunFailsFor404EntryWithoutAnalyzingItsBody(t *testing.T) {
 	}))
 	defer server.Close()
 
-	err := run(testConfig(server.URL+"/missing", t.TempDir()))
+	err := runTest(testConfig(server.URL+"/missing", t.TempDir()))
 	if err == nil || !strings.Contains(err.Error(), "HTTP 404") {
-		t.Fatalf("run() error = %v, want entry HTTP 404 failure", err)
+		t.Fatalf("runTest() error = %v, want entry HTTP 404 failure", err)
 	}
 	if got := atomic.LoadInt32(&scriptHits); got != 0 {
 		t.Fatalf("script requests = %d, want 0 for failed entry", got)
@@ -140,8 +507,8 @@ func TestRedirectedJavaScriptResolvesNestedChunkAgainstFinalURL(t *testing.T) {
 	defer server.Close()
 
 	outDir := t.TempDir()
-	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(testConfig(server.URL+"/", outDir)); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 	if got := atomic.LoadInt32(&expectedChunkHits); got != 1 {
 		t.Fatalf("final-relative chunk requests = %d, want 1", got)
@@ -181,8 +548,8 @@ func TestLiteralESMImportWithoutExtensionIsFetched(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := run(testConfig(server.URL+"/", t.TempDir())); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(testConfig(server.URL+"/", t.TempDir())); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 	if got := atomic.LoadInt32(&dependencyHits); got != 1 {
 		t.Fatalf("extensionless ESM dependency requests = %d, want 1", got)
@@ -207,8 +574,8 @@ func TestMaxJSOnePerformsOneAttemptEvenWhenItFails(t *testing.T) {
 	cfg := testConfig(server.URL+"/", t.TempDir())
 	cfg.MaxJS = 1
 	cfg.Workers = 4
-	if err := run(cfg); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(cfg); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 	if got := atomic.LoadInt32(&scriptAttempts); got != 1 {
 		t.Fatalf("JavaScript fetch attempts = %d, want exactly 1", got)
@@ -253,8 +620,8 @@ func TestTightBudgetChildMembershipDoesNotDependOnParentCompletionOrder(t *testi
 		cfg := testConfig(server.URL+"/", t.TempDir())
 		cfg.MaxJS = 3
 		cfg.Workers = 2
-		if err := run(cfg); err != nil {
-			t.Fatalf("run() error = %v", err)
+		if err := runTest(cfg); err != nil {
+			t.Fatalf("runTest() error = %v", err)
 		}
 
 		switch {
@@ -295,8 +662,8 @@ func TestNormalModeUsesCompleteSourceMapWithoutAnalyzingOriginalBundle(t *testin
 
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/", outDir)
-	if err := run(cfg); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(cfg); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -358,7 +725,7 @@ func TestSourceMapAnalysisUsesRecoveredOnlyWhenComplete(t *testing.T) {
 			defer server.Close()
 
 			cfg := testConfig(server.URL+"/", t.TempDir())
-			if err := run(cfg); err != nil {
+			if err := runTest(cfg); err != nil {
 				t.Fatal(err)
 			}
 			if partial {
@@ -385,8 +752,8 @@ func TestNormalModeParseFailureSavesOriginalAsOnlyArtifact(t *testing.T) {
 
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/", outDir)
-	if err := run(cfg); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(cfg); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -420,8 +787,8 @@ func TestAllowedCDNJavaScriptBelongsToEntrySite(t *testing.T) {
 	outDir := t.TempDir()
 	cfg := testConfig(entryURL, outDir)
 	cfg.AllowCDN = []string{"127.0.0.1"}
-	if err := run(cfg); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(cfg); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 
 	entrySite := filepath.Join(outDir, urlutil.SanitizeDomain(entryURL))
@@ -460,8 +827,8 @@ func TestRedirectTargetMustRemainAllowedForEntry(t *testing.T) {
 
 	outDir := t.TempDir()
 	cfg := testConfig(entryServer.URL+"/", outDir)
-	if err := run(cfg); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(cfg); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 	if got := atomic.LoadInt32(&internalHits); got != 0 {
 		t.Fatalf("redirect target was fetched %d time(s), want 0", got)
@@ -488,8 +855,8 @@ func TestCookiesAreNotForwardedToCDNOrigins(t *testing.T) {
 	cfg := testConfig(entryURL, outDir)
 	cfg.AllowCDN = []string{"127.0.0.1"}
 	cfg.Cookies = "session=secret"
-	if err := run(cfg); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(cfg); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 	if got, _ := cdnCookie.Load().(string); got != "" {
 		t.Fatalf("CDN Cookie header = %q, want empty", got)
@@ -517,8 +884,8 @@ func TestMultipleEntrySitesAreIsolated(t *testing.T) {
 	outDir := t.TempDir()
 	cfg := testConfig(first.URL+"/", outDir)
 	cfg.URLList = listPath
-	if err := run(cfg); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(cfg); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 
 	firstSite := filepath.Join(outDir, urlutil.SanitizeDomain(first.URL))
@@ -546,7 +913,7 @@ func TestNormalModeWritesEmptyJSMapWhenNoJavaScriptSucceeds(t *testing.T) {
 	defer server.Close()
 
 	outDir := t.TempDir()
-	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
+	if err := runTest(testConfig(server.URL+"/", outDir)); err != nil {
 		t.Fatal(err)
 	}
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -565,7 +932,7 @@ func TestSameContentFromDifferentURLsMapsToOneArtifact(t *testing.T) {
 	defer server.Close()
 
 	outDir := t.TempDir()
-	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
+	if err := runTest(testConfig(server.URL+"/", outDir)); err != nil {
 		t.Fatal(err)
 	}
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -594,7 +961,7 @@ func TestSameSiteMultipleEntriesAccumulateJavaScriptMap(t *testing.T) {
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/first", outDir)
 	cfg.URLList = listPath
-	if err := run(cfg); err != nil {
+	if err := runTest(cfg); err != nil {
 		t.Fatal(err)
 	}
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -626,7 +993,7 @@ func TestHeadlessOnlyWritesJavaScriptMapWithoutAPIArtifacts(t *testing.T) {
 	outDir := t.TempDir()
 	cfg := testConfig(server.URL+"/", outDir)
 	cfg.Headless = true
-	if err := run(cfg); err != nil {
+	if err := runTest(cfg); err != nil {
 		t.Fatal(err)
 	}
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -641,7 +1008,7 @@ func TestFailedJavaScriptDownloadDoesNotCreateMapRow(t *testing.T) {
 	defer server.Close()
 
 	outDir := t.TempDir()
-	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
+	if err := runTest(testConfig(server.URL+"/", outDir)); err != nil {
 		t.Fatal(err)
 	}
 	siteDir := filepath.Join(outDir, urlutil.SanitizeDomain(server.URL))
@@ -700,8 +1067,8 @@ func TestRunRemovesLegacyAndPreviousModeOutputs(t *testing.T) {
 		}
 	}
 
-	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
-		t.Fatalf("run() error = %v", err)
+	if err := runTest(testConfig(server.URL+"/", outDir)); err != nil {
+		t.Fatalf("runTest() error = %v", err)
 	}
 	assertNoLegacyReports(t, outDir)
 	assertPathMissing(t, filepath.Join(outDir, site, "entry.html"))
@@ -733,6 +1100,52 @@ func TestAnalysisDoesNotApplyFetchBudgetAfterScheduling(t *testing.T) {
 	}
 	if got := len(s.GetConfirmedURLs()); got != 3 {
 		t.Fatalf("confirmed JavaScript = %d, want 3", got)
+	}
+}
+
+type fixedResultProcessor struct {
+	result preprocess.FileResult
+}
+
+func (p *fixedResultProcessor) Process(string, string, []byte) preprocess.FileResult { return p.result }
+func (p *fixedResultProcessor) Close() error                                         { return nil }
+
+func TestAnalyzeResultDoesNotConfirmWhenFallbackWriteFailsAfterPartialOutput(t *testing.T) {
+	cfg, s, a, log, _ := analysisHarness(t)
+	partialPath := filepath.Join(cfg.OutDir, "example_com", "js", "partial.ts")
+	if err := os.MkdirAll(filepath.Dir(partialPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partialPath, []byte("export const partial = true;"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	processor := &fixedResultProcessor{result: preprocess.FileResult{
+		Analysis: []preprocess.AnalysisUnit{{
+			SourceName: "https://example.com/app.js", BaseURL: "https://example.com/app.js", Body: []byte(`console.log("original");`),
+		}},
+		Outputs:             []string{"js/partial.ts"},
+		Failed:              true,
+		Error:               "write recovered source and fallback: disk full",
+		FallbackWriteFailed: true,
+	}}
+	queued := map[string]bool{"https://example.com/app.js": true}
+	processed := make(map[string]bool)
+	var queue []fetchReq
+	analyzed, total := 0, 0
+
+	err := analyzeResultWithPreprocess(
+		cfg, s, a, log, processor, nil, successfulFetch("app.js", `console.log("original");`),
+		"https://example.com/", "example_com", queued, processed, &queue, &analyzed, &total,
+	)
+	var fatal *fatalOutputError
+	if !errors.As(err, &fatal) {
+		t.Fatalf("analyzeResultWithPreprocess() error = %v, want fatal fallback write failure", err)
+	}
+	if analyzed != 0 || total != 0 || len(s.GetConfirmedURLs()) != 0 {
+		t.Fatalf("failed persistence was counted: analyzed=%d total=%d confirmed=%v", analyzed, total, s.GetConfirmedURLs())
+	}
+	if entries := s.JSMapEntries("example_com"); len(entries) != 1 || entries[0].Path != "js/partial.ts" {
+		t.Fatalf("truthful partial outputs were lost: %+v", entries)
 	}
 }
 

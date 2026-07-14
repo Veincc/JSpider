@@ -317,7 +317,13 @@ func (f *Fetcher) FetchJS(rawURL string) *Result {
 // FetchJSForEntry downloads a JS resource using entryURL as the same-origin
 // policy anchor for redirects and credential scoping.
 func (f *Fetcher) FetchJSForEntry(rawURL, entryURL string) *Result {
-	result := f.FetchForEntry(rawURL, entryURL)
+	return f.FetchJSForEntryContext(context.Background(), rawURL, entryURL)
+}
+
+// FetchJSForEntryContext validates a JavaScript response while honoring the
+// caller's crawl or batch cancellation.
+func (f *Fetcher) FetchJSForEntryContext(ctx context.Context, rawURL, entryURL string) *Result {
+	result := f.FetchForEntryContext(ctx, rawURL, entryURL)
 	return validateJSResult(result, rawURL)
 }
 

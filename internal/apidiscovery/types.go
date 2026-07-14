@@ -155,6 +155,25 @@ type Summary struct {
 	Bases     int `json:"bases"`
 }
 
+// SourceIdentity preserves the crawl context for a downloaded JavaScript
+// source without changing the URL-keyed matching behavior. A later matching
+// revision can consume the richer identity without forcing callers to recover
+// it from sanitized output paths.
+type SourceIdentity struct {
+	EntryURL     string `json:"entry_url"`
+	RequestedURL string `json:"requested_url"`
+	FinalURL     string `json:"final_url"`
+	ContentHash  string `json:"content_hash"`
+}
+
+// SessionStats is a cheap collection snapshot. It deliberately reports
+// collected sources and runtime API requests only; it never triggers static
+// analysis or builds a report.
+type SessionStats struct {
+	Sources int `json:"sources"`
+	Runtime int `json:"runtime"`
+}
+
 type Report struct {
 	StaticEndpoints []StaticEndpoint
 	RuntimeRequests []RuntimeRequest

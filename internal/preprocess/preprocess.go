@@ -57,11 +57,12 @@ type Processor struct {
 }
 
 type FileResult struct {
-	Analysis []AnalysisUnit
-	Status   string
-	Outputs  []string
-	Failed   bool
-	Error    string
+	Analysis            []AnalysisUnit
+	Status              string
+	Outputs             []string
+	Failed              bool
+	FallbackWriteFailed bool
+	Error               string
 }
 
 type AnalysisUnit struct {
@@ -678,6 +679,7 @@ func (p *Processor) recordFailure(jsURL string, body []byte, errText string) Fil
 func (p *Processor) recordFailureWithOutputs(jsURL string, body []byte, errText string, existingOutputs []string) FileResult {
 	outputs := append([]string(nil), existingOutputs...)
 	rel, writeErr := p.writeGenerated(jsURL, ".js", body)
+	fallbackWriteFailed := writeErr != nil
 	if writeErr != nil {
 		errText += fmt.Sprintf("; write fallback file: %v", writeErr)
 		rel = ""
@@ -687,11 +689,12 @@ func (p *Processor) recordFailureWithOutputs(jsURL string, body []byte, errText 
 	}
 	sort.Strings(outputs)
 	return FileResult{
-		Analysis: originalAnalysis(jsURL, body),
-		Status:   "failed",
-		Outputs:  outputs,
-		Failed:   true,
-		Error:    errText,
+		Analysis:            originalAnalysis(jsURL, body),
+		Status:              "failed",
+		Outputs:             outputs,
+		Failed:              true,
+		FallbackWriteFailed: fallbackWriteFailed,
+		Error:               errText,
 	}
 }
 

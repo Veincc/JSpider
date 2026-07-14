@@ -87,8 +87,12 @@ func (a *Analyzer) AnalyzeJS(jsContent string, jsURL string, fromURL string, dep
 		mergeResults(result, astResult)
 	}
 
-	// 4. Supplementary generic analysis
-	a.supplementWithGeneric(result, jsContent, jsURL, framework)
+	// 4. Supplement framework-specific results with generic path discovery.
+	// Unknown-framework analysis already ran the same generic path scan in
+	// genericAnalysis, so repeating it here only duplicated work.
+	if framework != "unknown" {
+		a.supplementWithGeneric(result, jsContent, jsURL, framework)
+	}
 
 	// 5. Source Map analysis (if not already extracted by the framework analyzer)
 	mapURL := a.sourcemap.ExtractSourceMappingURL(jsContent, jsURL)

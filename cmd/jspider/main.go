@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,6 +55,85 @@ type crawlState struct {
 	processed map[string]bool
 }
 
+type javaScriptProcessor interface {
+	Process(entryURL, jsURL string, body []byte) preprocess.FileResult
+	Close() error
+}
+
+// EntryResult describes one configured entry without conflating a failed
+// crawl with a process-wide initialization or finalization error.
+type EntryResult struct {
+	EntryURL        string
+	CanonicalOrigin string
+	Directory       string
+	Analyzed        int
+	FetchAttempts   int
+	API             apidiscovery.SessionStats
+	Err             error
+	Reason          string
+}
+
+// SiteStats is an origin-scoped snapshot. Directory is included because two
+// origins can intentionally share the same legacy directory base and must be
+// disambiguated before any output is written.
+type SiteStats struct {
+	Origin            string
+	Directory         string
+	Success           int
+	Failure           int
+	Skipped           int
+	FetchAttempts     int
+	Analyzed          int
+	Confirmed         int
+	Candidate         int
+	API               apidiscovery.SessionStats
+	FinalizationError string
+}
+
+type RunResult struct {
+	Success []EntryResult
+	Failure []EntryResult
+	Skipped []EntryResult
+	Sites   map[string]SiteStats
+}
+
+// OrderedSites returns a deterministic view for logs and other derived output.
+func (r RunResult) OrderedSites() []SiteStats {
+	origins := make([]string, 0, len(r.Sites))
+	for origin := range r.Sites {
+		origins = append(origins, origin)
+	}
+	sort.Strings(origins)
+	ordered := make([]SiteStats, 0, len(origins))
+	for _, origin := range origins {
+		ordered = append(ordered, r.Sites[origin])
+	}
+	return ordered
+}
+
+type siteRuntime struct {
+	origin      string
+	directory   string
+	entryURLs   []string
+	state       *crawlState
+	store       *store.Store
+	fetcher     *fetcher.Fetcher
+	analyzer    *analyzer.Analyzer
+	html        *html.Extractor
+	processor   javaScriptProcessor
+	apiSession  *apidiscovery.Session
+	attempts    int
+	analyzed    int
+	finalizeErr error
+}
+
+type fatalOutputError struct {
+	err error
+}
+
+func (e *fatalOutputError) Error() string { return e.err.Error() }
+func (e *fatalOutputError) Unwrap() error { return e.err }
+
 var discoverBrowser = headless.DiscoverWithRuntime
 var checkBrowserAvailable = headless.CheckBrowserAvailable
 
@@ -88,54 +168,79 @@ func buildHeadlessConfig(cfg *config.Config, entryURL string) *headless.Config {
 
 func main() {
 	cfg := config.Parse()
-	if err := run(cfg); err != nil {
+	_, err := run(context.Background(), cfg)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfg *config.Config) error {
+func run(ctx context.Context, cfg *config.Config) (RunResult, error) {
+	result := RunResult{Sites: make(map[string]SiteStats)}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("invalid configuration: %w", err)
+		return result, fmt.Errorf("invalid configuration: %w", err)
 	}
 	urls, err := cfg.URLs()
 	if err != nil {
-		return err
+		return result, err
 	}
 	originDirectories, err := urlutil.OriginDirectoryNames(urls)
 	if err != nil {
-		return fmt.Errorf("plan origin directories: %w", err)
+		return result, fmt.Errorf("plan origin directories: %w", err)
+	}
+	type plannedEntry struct {
+		url       string
+		origin    string
+		directory string
+	}
+	planned := make([]plannedEntry, 0, len(urls))
+	for _, entryURL := range urls {
+		origin, canonicalErr := urlutil.CanonicalOrigin(entryURL)
+		if canonicalErr != nil {
+			return result, fmt.Errorf("canonicalize entry URL %s: %w", entryURL, canonicalErr)
+		}
+		directory := originDirectories[origin]
+		planned = append(planned, plannedEntry{url: entryURL, origin: origin, directory: directory})
+		result.Sites[origin] = SiteStats{Origin: origin, Directory: directory}
+	}
+	if err := ctx.Err(); err != nil {
+		for _, entry := range planned {
+			skipped := EntryResult{
+				EntryURL: entry.url, CanonicalOrigin: entry.origin, Directory: entry.directory,
+				Err: err, Reason: err.Error(),
+			}
+			result.Skipped = append(result.Skipped, skipped)
+			stats := result.Sites[entry.origin]
+			stats.Skipped++
+			result.Sites[entry.origin] = stats
+		}
+		return result, err
 	}
 
 	if cfg.APIDiscovery {
 		if err := apidiscovery.CheckAvailable(); err != nil {
-			return err
+			return result, err
 		}
 	}
 	if err := preprocess.CheckNodeRuntime(); err != nil {
-		return err
+		return result, err
 	}
 	if cfg.Headless {
 		if err := checkBrowserAvailable(); err != nil {
-			return err
+			return result, err
 		}
 	}
 
 	if err := os.MkdirAll(cfg.OutDir, 0755); err != nil {
-		return fmt.Errorf("create output directory: %w", err)
+		return result, fmt.Errorf("create output directory: %w", err)
 	}
 	cleanupLegacyOutputs(cfg.OutDir)
 
 	log := logging.New(cfg.Verbose, cfg.OutDir)
 	defer log.Close()
-
-	f, err := fetcher.New(cfg, log)
-	if err != nil {
-		return fmt.Errorf("configure HTTP client: %w", err)
-	}
-	s := store.New(cfg.OutDir)
-	a := analyzer.NewAnalyzer(log)
-	htmlEx := html.NewExtractor()
 
 	if cfg.APIDiscovery {
 		log.Info("API discovery enabled (headless implied)")
@@ -145,109 +250,156 @@ func run(cfg *config.Config) error {
 
 	log.Info("JSpider started: %d entry URLs, workers %d, output dir %s", len(urls), cfg.Workers, cfg.OutDir)
 
-	initializedSites := make(map[string]bool)
-	processors := make(map[string]*preprocess.Processor)
-	apiSessions := make(map[string]*apidiscovery.Session)
-	siteEntryURLs := make(map[string][]string)
-	states := make(map[string]*crawlState)
-	defer func() {
-		for _, processor := range processors {
-			_ = processor.Close()
+	sites := make(map[string]*siteRuntime)
+	var runErrors []error
+	stopReason := error(nil)
+	for i, entry := range planned {
+		if stopReason == nil {
+			stopReason = ctx.Err()
 		}
-	}()
-	totalAnalyzed := 0
-	totalAttempts := 0
-
-	for i, entryURL := range urls {
-		origin, err := urlutil.CanonicalOrigin(entryURL)
-		if err != nil {
-			return fmt.Errorf("canonicalize entry URL %s: %w", entryURL, err)
-		}
-		site := originDirectories[origin]
-		siteDir := filepath.Join(cfg.OutDir, site)
-		if !initializedSites[site] {
-			if err := os.RemoveAll(siteDir); err != nil {
-				return fmt.Errorf("reset site output %s: %w", site, err)
+		if stopReason != nil {
+			skipped := EntryResult{
+				EntryURL: entry.url, CanonicalOrigin: entry.origin, Directory: entry.directory,
+				Err: stopReason, Reason: stopReason.Error(),
 			}
-			if err := os.MkdirAll(siteDir, 0755); err != nil {
-				return fmt.Errorf("create site output %s: %w", site, err)
-			}
-			initializedSites[site] = true
+			result.Skipped = append(result.Skipped, skipped)
+			stats := result.Sites[entry.origin]
+			stats.Skipped++
+			result.Sites[entry.origin] = stats
+			continue
 		}
 
-		prep := processors[site]
-		if prep == nil {
-			var err error
-			prep, err = preprocess.NewWithTimeout(siteDir, func(ctx context.Context, entryURL, rawURL string) ([]byte, error) {
-				result := f.FetchForEntryContext(ctx, rawURL, entryURL)
-				if result.Err != nil {
-					return nil, result.Err
-				}
-				if result.StatusCode < 200 || result.StatusCode >= 300 {
-					return nil, fmt.Errorf("HTTP %d", result.StatusCode)
-				}
-				return result.Body, nil
-			}, time.Duration(cfg.ProcessTimeoutSeconds)*time.Second)
+		site := sites[entry.origin]
+		if site == nil {
+			site, err = newSiteRuntime(cfg, log, entry.origin, entry.directory)
+			if site != nil {
+				sites[entry.origin] = site
+			}
 			if err != nil {
-				return err
+				entryErr := fmt.Errorf("initialize origin %s: %w", entry.origin, err)
+				failure := EntryResult{EntryURL: entry.url, CanonicalOrigin: entry.origin, Directory: entry.directory, Err: entryErr, Reason: entryErr.Error()}
+				result.Failure = append(result.Failure, failure)
+				stats := result.Sites[entry.origin]
+				stats.Failure++
+				result.Sites[entry.origin] = stats
+				runErrors = append(runErrors, entryErr)
+				stopReason = entryErr
+				continue
 			}
-			processors[site] = prep
-			log.Info("Processed JavaScript will be written to %s", filepath.Join(siteDir, "js"))
 		}
-		siteEntryURLs[site] = append(siteEntryURLs[site], entryURL)
 
-		state := crawlStateForSite(states, site)
-		var apiSession *apidiscovery.Session
-		if cfg.APIDiscovery {
-			apiSession = apiSessions[site]
-			if apiSession == nil {
-				apiSession = apidiscovery.NewSession()
-				apiSessions[site] = apiSession
-			}
-			apiSession.AddEntryURL(entryURL)
+		site.entryURLs = append(site.entryURLs, entry.url)
+		if site.apiSession != nil {
+			site.apiSession.AddEntryURL(entry.url)
 		}
-		log.Info("[%d/%d] Analyzing: %s", i+1, len(urls), entryURL)
-		analyzed, err := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, site, state.queued, state.processed, &totalAnalyzed, &totalAttempts)
-		if err != nil {
-			return fmt.Errorf("analyze entry %s: %w", entryURL, err)
+		attemptsBefore := site.attempts
+		log.Info("[%d/%d] Analyzing: %s", i+1, len(planned), entry.url)
+		analyzed, entryErr := analyzeEntryContext(
+			ctx, cfg, site.store, site.fetcher, site.analyzer, site.html, log, site.processor, site.apiSession,
+			entry.url, site.directory, site.state.queued, site.state.processed, &site.analyzed, &site.attempts,
+		)
+		apiStats := apidiscovery.SessionStats{}
+		if site.apiSession != nil {
+			apiStats = site.apiSession.Stats(entry.url)
 		}
-		if apiSession != nil {
-			if err := apiSession.AnalyzeSources(); err != nil {
-				return fmt.Errorf("analyze discovered JavaScript APIs for %s: %w", entryURL, err)
-			}
-			report := apiSession.Report()
-			log.Info("[%d/%d] API discovery: static=%d runtime=%d matched=%d confirmed=%d bases=%d",
-				i+1, len(urls), report.Summary.Static, report.Summary.Runtime,
-				report.Summary.Matched, report.Summary.Confirmed, report.Summary.Bases)
-			for _, association := range report.Associations {
-				log.Verbose("  [api] match static=%s runtime=%s score=%d confidence=%s evidence=%v",
-					association.StaticRawURL, association.RuntimeURL, association.Score,
-					association.Confidence, association.Evidence)
-			}
-			for _, base := range report.Bases {
-				if base.Confidence == apidiscovery.ConfidenceConfirmed {
-					log.Info("Runtime base confirmed: %s (evidence=%d)", base.RuntimeBase, base.EvidenceCount)
-				}
-			}
+		entryResult := EntryResult{
+			EntryURL: entry.url, CanonicalOrigin: entry.origin, Directory: entry.directory,
+			Analyzed: analyzed, FetchAttempts: site.attempts - attemptsBefore, API: apiStats,
 		}
-		log.Info("[%d/%d] Done: %s (analyzed %d JS)", i+1, len(urls), entryURL, analyzed)
+		stats := result.Sites[entry.origin]
+		stats.FetchAttempts = site.attempts
+		stats.Analyzed = site.analyzed
+		stats.API.Sources += apiStats.Sources
+		stats.API.Runtime += apiStats.Runtime
+		if entryErr != nil {
+			entryErr = fmt.Errorf("analyze entry %s: %w", entry.url, entryErr)
+			entryResult.Err = entryErr
+			entryResult.Reason = entryErr.Error()
+			result.Failure = append(result.Failure, entryResult)
+			stats.Failure++
+			runErrors = append(runErrors, entryErr)
+			var fatal *fatalOutputError
+			if errors.As(entryErr, &fatal) || errors.Is(entryErr, context.Canceled) || errors.Is(entryErr, context.DeadlineExceeded) {
+				stopReason = entryErr
+			}
+		} else {
+			result.Success = append(result.Success, entryResult)
+			stats.Success++
+			log.Info("[%d/%d] Done: %s (analyzed %d JS)", i+1, len(planned), entry.url, analyzed)
+		}
+		result.Sites[entry.origin] = stats
 	}
 
-	if err := finalizeOutputs(cfg.OutDir, s, initializedSites, processors, apiSessions, siteEntryURLs, cfg.APIDiscovery); err != nil {
-		return err
+	finalizeErr := finalizeOutputs(cfg.OutDir, sites, cfg.APIDiscovery, log)
+	if finalizeErr != nil {
+		runErrors = append(runErrors, finalizeErr)
+	}
+	for origin, site := range sites {
+		stats := result.Sites[origin]
+		stats.FetchAttempts = site.attempts
+		stats.Analyzed = site.analyzed
+		stats.Confirmed = len(site.store.GetConfirmedURLs())
+		stats.Candidate = len(site.store.GetCandidateURLs())
+		if site.finalizeErr != nil {
+			stats.FinalizationError = site.finalizeErr.Error()
+		}
+		result.Sites[origin] = stats
 	}
 
-	printSummary(s, totalAnalyzed, log)
-	return nil
+	printSummary(result, log)
+	return result, errors.Join(runErrors...)
+}
+
+func newSiteRuntime(cfg *config.Config, log *logging.Logger, origin, directory string) (*siteRuntime, error) {
+	site := &siteRuntime{
+		origin: origin, directory: directory,
+		state: &crawlState{queued: make(map[string]bool), processed: make(map[string]bool)},
+		store: store.New(cfg.OutDir), analyzer: analyzer.NewAnalyzer(log), html: html.NewExtractor(),
+	}
+	siteDir := filepath.Join(cfg.OutDir, directory)
+	if err := os.RemoveAll(siteDir); err != nil {
+		return site, fmt.Errorf("reset site output %s: %w", directory, err)
+	}
+	if err := os.MkdirAll(siteDir, 0755); err != nil {
+		return site, fmt.Errorf("create site output %s: %w", directory, err)
+	}
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		return site, fmt.Errorf("configure HTTP client: %w", err)
+	}
+	site.fetcher = f
+	processor, err := preprocess.NewWithTimeout(siteDir, func(ctx context.Context, entryURL, rawURL string) ([]byte, error) {
+		fetchResult := f.FetchForEntryContext(ctx, rawURL, entryURL)
+		if fetchResult.Err != nil {
+			return nil, fetchResult.Err
+		}
+		if fetchResult.StatusCode < 200 || fetchResult.StatusCode >= 300 {
+			return nil, fmt.Errorf("HTTP %d", fetchResult.StatusCode)
+		}
+		return fetchResult.Body, nil
+	}, time.Duration(cfg.ProcessTimeoutSeconds)*time.Second)
+	if err != nil {
+		return site, err
+	}
+	site.processor = processor
+	if cfg.APIDiscovery {
+		site.apiSession = apidiscovery.NewSession()
+	}
+	log.Info("Processed JavaScript will be written to %s", filepath.Join(siteDir, "js"))
+	return site, nil
 }
 
 // analyzeEntry analyzes a single entry URL and returns the number of JS files analyzed.
 // It always runs static HTML extraction, and additionally runs headless browser
 // discovery if cfg.Headless is enabled, merging and deduplicating the results.
-func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
+func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession *apidiscovery.Session, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
+	return analyzeEntryContext(context.Background(), cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, site, queued, processed, totalAnalyzed, totalAttempts)
+}
+
+func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession *apidiscovery.Session, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
 	// 1. Static HTML extraction (always)
 	log.Info("Downloading entry HTML: %s", entryURL)
-	htmlResult := f.FetchForEntry(entryURL, entryURL)
+	htmlResult := f.FetchForEntryContext(ctx, entryURL, entryURL)
 	if htmlResult.Err != nil {
 		return 0, fmt.Errorf("download entry HTML: %w", htmlResult.Err)
 	}
@@ -270,14 +422,14 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 	// 2. Headless discovery (optional)
 	if cfg.Headless {
 		log.Info("Running headless discovery: %s", entryURL)
-		discovery, err := discoverBrowser(context.Background(), buildHeadlessConfig(cfg, entryURL), log)
+		discovery, err := discoverBrowser(ctx, buildHeadlessConfig(cfg, entryURL), log)
 		var hlAssets []analyzer.JSAsset
 		if err != nil {
 			log.Warn("Headless discovery failed (continuing with static results): %v", err)
 		} else {
 			hlAssets = discovery.Assets
 			if apiSession != nil {
-				apiSession.AddRuntime(discovery.Requests)
+				apiSession.AddRuntimeForEntry(entryURL, discovery.Requests)
 			}
 			log.Info("Headless discovery found %d JS assets", len(hlAssets))
 		}
@@ -353,11 +505,31 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 		// Reserve the complete batch before any worker can schedule a request.
 		// Failed requests consume the same budget as successful requests.
 		*totalAttempts += len(batch)
-		results := fetchBatch(cfg, f, log, batch, entryURL)
+		batchContext, cancelBatch := context.WithCancel(ctx)
+		results := fetchBatchContext(batchContext, cfg, f, log, batch, entryURL)
 
 		// Serially analyze each result
+		completedAttempts := 0
 		for res := range results {
-			analyzeResultWithPreprocess(cfg, s, a, log, prep, apiSession, res, entryURL, site, queued, processed, &queue, &analyzed, totalAnalyzed)
+			completedAttempts++
+			if err := analyzeResultWithPreprocess(cfg, s, a, log, prep, apiSession, res, entryURL, site, queued, processed, &queue, &analyzed, totalAnalyzed); err != nil {
+				// Cancel before acknowledging the failed ordinal. Acknowledgement
+				// normally advances the sliding launch window.
+				cancelBatch()
+				res.acknowledgeConsumption()
+				for remaining := range results {
+					completedAttempts++
+					remaining.acknowledgeConsumption()
+				}
+				*totalAttempts -= len(batch) - completedAttempts
+				return analyzed, err
+			}
+			res.acknowledgeConsumption()
+		}
+		cancelBatch()
+		*totalAttempts -= len(batch) - completedAttempts
+		if err := ctx.Err(); err != nil {
+			return analyzed, err
 		}
 	}
 
@@ -384,6 +556,13 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 
 // fetchBatch concurrently downloads a batch of URLs
 func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, queue []fetchReq, entryURL string) <-chan fetchRes {
+	return fetchBatchContext(context.Background(), cfg, f, log, queue, entryURL)
+}
+
+func fetchBatchContext(ctx context.Context, cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, queue []fetchReq, entryURL string) <-chan fetchRes {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	workers := cfg.Workers
 	if workers <= 0 {
 		workers = 1
@@ -412,7 +591,7 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 				completed <- fetchRes{
 					ordinal: task.ordinal,
 					req:     task.req,
-					result:  f.FetchJSForEntry(task.req.url, entryURL),
+					result:  f.FetchJSForEntryContext(ctx, task.req.url, entryURL),
 				}
 			}
 		}()
@@ -427,11 +606,13 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 		defer close(results)
 
 		nextLaunch := 0
+		requestsClosed := false
 		launchNext := func() {
 			reqCh <- fetchTask{ordinal: nextLaunch, req: queue[nextLaunch]}
 			nextLaunch++
 			if nextLaunch == len(queue) {
 				close(reqCh)
+				requestsClosed = true
 			}
 		}
 		for i := 0; i < effectiveWorkers; i++ {
@@ -440,8 +621,11 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 
 		pending := make(map[int]fetchRes, effectiveWorkers)
 		nextOrdinal := 0
+		target := len(queue)
+		contextDone := ctx.Done()
+		stopping := false
 		waitingForAcknowledgement := false
-		for nextOrdinal < len(queue) {
+		for nextOrdinal < target {
 			if !waitingForAcknowledgement {
 				if result, ok := pending[nextOrdinal]; ok {
 					delete(pending, nextOrdinal)
@@ -457,6 +641,14 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 			}
 
 			select {
+			case <-contextDone:
+				contextDone = nil
+				stopping = true
+				target = nextLaunch
+				if !requestsClosed {
+					close(reqCh)
+					requestsClosed = true
+				}
 			case result, ok := <-completed:
 				if !ok {
 					completed = nil
@@ -469,7 +661,7 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 				}
 				waitingForAcknowledgement = false
 				nextOrdinal++
-				if nextLaunch < len(queue) {
+				if !stopping && nextLaunch < len(queue) {
 					launchNext()
 				}
 			}
@@ -480,12 +672,11 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 }
 
 // analyzeResultWithPreprocess analyzes a single downloaded JavaScript response.
-func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, res fetchRes, entryURL, site string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
-	defer res.acknowledgeConsumption()
+func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep javaScriptProcessor, apiSession *apidiscovery.Session, res fetchRes, entryURL, site string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) error {
 	item := res.req
 
 	if processed[item.url] {
-		return
+		return nil
 	}
 	processed[item.url] = true
 
@@ -496,7 +687,7 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 			Type: analyzer.TypeUnknownJS, Source: analyzer.SourceRegexCandidate,
 			Confidence: analyzer.ConfLow, Status: analyzer.StatusFailed, Depth: item.depth,
 		})
-		return
+		return nil
 	}
 
 	requestedURL := res.result.RequestedURL
@@ -514,9 +705,18 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 	if prepResult.Failed {
 		log.Warn("JavaScript processing fell back for %s: %s", item.url, prepResult.Error)
 	}
-	s.RecordJSOutputs(site, requestedURL, prepResult.Outputs)
-	if finalURL != requestedURL {
-		s.RecordJSOutputs(site, finalURL, prepResult.Outputs)
+	if len(prepResult.Outputs) > 0 {
+		s.RecordJSOutputs(site, requestedURL, prepResult.Outputs)
+		if finalURL != requestedURL {
+			s.RecordJSOutputs(site, finalURL, prepResult.Outputs)
+		}
+	}
+	if len(prepResult.Outputs) == 0 || prepResult.FallbackWriteFailed {
+		detail := prepResult.Error
+		if detail == "" {
+			detail = "processor returned no persisted output"
+		}
+		return &fatalOutputError{err: fmt.Errorf("persist JavaScript %s: %s", finalURL, detail)}
 	}
 
 	analysisUnits := prepResult.Analysis
@@ -524,8 +724,11 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		analysisUnits = []preprocess.AnalysisUnit{{SourceName: finalURL, BaseURL: finalURL, Body: res.result.Body}}
 	}
 	if cfg.APIDiscovery && apiSession != nil {
+		identity := apidiscovery.SourceIdentity{
+			EntryURL: entryURL, RequestedURL: requestedURL, FinalURL: finalURL, ContentHash: res.result.Hash,
+		}
 		for _, unit := range analysisUnits {
-			apiSession.AddSource(unit.SourceName, unit.Body)
+			apiSession.AddSourceWithIdentity(identity, unit.SourceName, unit.Body)
 		}
 	}
 
@@ -573,6 +776,7 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 			s.AddJS(&newAsset)
 		}
 	}
+	return nil
 }
 
 func addToQueue(url string, depth int, from string, queued, processed map[string]bool, queue *[]fetchReq) {
@@ -587,13 +791,20 @@ func shouldEnqueue(confidence, status string) bool {
 	return confidence == analyzer.ConfHigh || confidence == analyzer.ConfMedium
 }
 
-func printSummary(s *store.Store, totalAnalyzed int, log *logging.Logger) {
-	confirmed := s.GetConfirmedURLs()
-	candidates := s.GetCandidateURLs()
+func printSummary(result RunResult, log *logging.Logger) {
+	confirmed := 0
+	candidates := 0
+	totalAnalyzed := 0
+	for _, site := range result.OrderedSites() {
+		confirmed += site.Confirmed
+		candidates += site.Candidate
+		totalAnalyzed += site.Analyzed
+	}
 	log.Info("Analysis complete!")
-	log.Info("  Confirmed JS: %d", len(confirmed))
-	log.Info("  Candidate JS: %d", len(candidates))
+	log.Info("  Confirmed JS: %d", confirmed)
+	log.Info("  Candidate JS: %d", candidates)
 	log.Info("  Total analyzed: %d", totalAnalyzed)
+	log.Info("  Entries: success=%d failure=%d skipped=%d", len(result.Success), len(result.Failure), len(result.Skipped))
 }
 
 func cleanupLegacyOutputs(outDir string) {
