@@ -888,19 +888,20 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 		want   string
 		wantOK bool
 	}{
-		// The original vite.dev bug: bare "assets/chunks/..." resolved against a JS in /assets/chunks/
+		// Bare references use standard directory-relative resolution, including
+		// repeated path segments.
 		{
-			name:   "bare assets/chunks path from within assets/chunks",
+			name:   "bare assets chunks path preserves repeated prefix",
 			base:   "https://vite.dev/assets/chunks/theme.js",
 			raw:    "assets/chunks/client.BFYbw6Gq.js",
-			want:   "https://vite.dev/assets/chunks/client.BFYbw6Gq.js",
+			want:   "https://vite.dev/assets/chunks/assets/chunks/client.BFYbw6Gq.js",
 			wantOK: true,
 		},
 		{
-			name:   "bare chunks/ path from within assets/chunks",
+			name:   "bare chunks path preserves repeated segment",
 			base:   "https://vite.dev/assets/chunks/theme.js",
 			raw:    "chunks/client.BFYbw6Gq.js",
-			want:   "https://vite.dev/assets/chunks/client.BFYbw6Gq.js",
+			want:   "https://vite.dev/assets/chunks/chunks/client.BFYbw6Gq.js",
 			wantOK: true,
 		},
 		{
@@ -949,12 +950,12 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 			want:   "https://cdn.example.com/lib.js",
 			wantOK: true,
 		},
-		// Deduplication: double assets/chunks
+		// Repeated asset prefixes are not globally rewritten.
 		{
-			name:   "dedup double assets/chunks",
+			name:   "preserve double assets chunks",
 			base:   "https://vite.dev/assets/chunks/theme.js",
 			raw:    "assets/chunks/plugin-vue_export-helper.BDNMzG2s.js",
-			want:   "https://vite.dev/assets/chunks/plugin-vue_export-helper.BDNMzG2s.js",
+			want:   "https://vite.dev/assets/chunks/assets/chunks/plugin-vue_export-helper.BDNMzG2s.js",
 			wantOK: true,
 		},
 		// _nuxt prefix
@@ -962,7 +963,7 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 			name:   "bare _nuxt path",
 			base:   "https://example.com/_nuxt/entry.js",
 			raw:    "_nuxt/chunks/app.js",
-			want:   "https://example.com/_nuxt/chunks/app.js",
+			want:   "https://example.com/_nuxt/_nuxt/chunks/app.js",
 			wantOK: true,
 		},
 		// _next/static prefix
@@ -970,7 +971,7 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 			name:   "bare _next/static path",
 			base:   "https://example.com/_next/static/chunks/app.js",
 			raw:    "_next/static/chunks/pages/index.js",
-			want:   "https://example.com/_next/static/chunks/pages/index.js",
+			want:   "https://example.com/_next/static/chunks/_next/static/chunks/pages/index.js",
 			wantOK: true,
 		},
 		// Empty
@@ -995,15 +996,15 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 	}
 }
 
-func TestDeduplicatePathSegments(t *testing.T) {
+func TestDeduplicatePathSegmentsPreservesLegalPaths(t *testing.T) {
 	tests := []struct {
 		input string
 		want  string
 	}{
-		{"https://vite.dev/assets/chunks/assets/chunks/client.js", "https://vite.dev/assets/chunks/client.js"},
-		{"https://example.com/a/b/a/b/c.js", "https://example.com/a/b/c.js"},
+		{"https://vite.dev/assets/chunks/assets/chunks/client.js", "https://vite.dev/assets/chunks/assets/chunks/client.js"},
+		{"https://example.com/a/b/a/b/c.js", "https://example.com/a/b/a/b/c.js"},
 		{"https://example.com/assets/main.js", "https://example.com/assets/main.js"}, // no dup
-		{"https://example.com/a/a/b/b/c.js", "https://example.com/a/b/c.js"},         // consecutive dups collapsed
+		{"https://example.com/a/a/b/b/c.js", "https://example.com/a/a/b/b/c.js"},     // repeated segments are legal
 		{"https://example.com/a/b/c.js", "https://example.com/a/b/c.js"},             // short path
 	}
 	for _, tt := range tests {
@@ -1025,16 +1026,16 @@ func TestCleanDiscoveredJSURL_BuildPrefix(t *testing.T) {
 		want string
 	}{
 		{
-			name: "bare assets/chunks from within assets/chunks",
+			name: "bare assets chunks from within assets chunks",
 			raw:  "assets/chunks/client.js",
 			base: "https://vite.dev/assets/chunks/theme.js",
-			want: "https://vite.dev/assets/chunks/client.js",
+			want: "https://vite.dev/assets/chunks/assets/chunks/client.js",
 		},
 		{
-			name: "bare chunks/ from within assets/chunks",
+			name: "bare chunks from within assets chunks",
 			raw:  "chunks/client.js",
 			base: "https://vite.dev/assets/chunks/theme.js",
-			want: "https://vite.dev/assets/chunks/client.js",
+			want: "https://vite.dev/assets/chunks/chunks/client.js",
 		},
 	}
 	for _, tt := range tests {

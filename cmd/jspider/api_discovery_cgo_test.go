@@ -76,8 +76,9 @@ func TestAnalyzeEntryKeepsStaticAPIsWhenHeadlessFails(t *testing.T) {
 	t.Cleanup(func() { _ = processor.Close() })
 	session := apidiscovery.NewSession()
 	analyzed := 0
+	attempts := 0
 
-	got := analyzeEntry(
+	got, err := analyzeEntry(
 		cfg,
 		store.New(outDir),
 		f,
@@ -91,7 +92,11 @@ func TestAnalyzeEntryKeepsStaticAPIsWhenHeadlessFails(t *testing.T) {
 		map[string]bool{},
 		map[string]bool{},
 		&analyzed,
+		&attempts,
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got != 1 {
 		t.Fatalf("analyzed JS = %d, want 1", got)
 	}

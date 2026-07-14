@@ -186,12 +186,12 @@ func TestResolveJS(t *testing.T) {
 		raw  string
 		want string
 	}{
-		// The Vite bug: bare "assets/chunks/..." resolved from within /assets/chunks/
+		// Bare paths use ordinary directory-relative URL semantics.
 		{
-			name: "bare assets/chunks from within assets/chunks",
+			name: "bare assets/chunks from within assets/chunks preserves both prefixes",
 			base: "https://vite.dev/assets/chunks/theme.js",
 			raw:  "assets/chunks/client.BFYbw6Gq.js",
-			want: "https://vite.dev/assets/chunks/client.BFYbw6Gq.js",
+			want: "https://vite.dev/assets/chunks/assets/chunks/client.BFYbw6Gq.js",
 		},
 		// Bare "chunks/..." from /assets/app.js
 		{
@@ -200,12 +200,12 @@ func TestResolveJS(t *testing.T) {
 			raw:  "chunks/client.js",
 			want: "https://vite.dev/assets/chunks/client.js",
 		},
-		// Bare "chunks/..." from /assets/chunks/theme.js — should NOT double
+		// Repeated segments are legal and must not be collapsed.
 		{
-			name: "bare chunks/ from assets/chunks/ — no double",
+			name: "bare chunks from assets chunks preserves repeat",
 			base: "https://vite.dev/assets/chunks/theme.js",
 			raw:  "chunks/client.js",
-			want: "https://vite.dev/assets/chunks/client.js",
+			want: "https://vite.dev/assets/chunks/chunks/client.js",
 		},
 		// Absolute path — resolve from origin
 		{
@@ -242,26 +242,26 @@ func TestResolveJS(t *testing.T) {
 			raw:  "//cdn.example.com/lib.js",
 			want: "https://cdn.example.com/lib.js",
 		},
-		// Dedup: double assets/chunks in already-resolved URL
+		// Explicit relative references also preserve repeated prefixes.
 		{
-			name: "dedup double assets/chunks in resolved URL",
+			name: "preserve double assets chunks in resolved URL",
 			base: "https://vite.dev/assets/chunks/theme.js",
 			raw:  "./assets/chunks/client.js",
-			want: "https://vite.dev/assets/chunks/client.js",
+			want: "https://vite.dev/assets/chunks/assets/chunks/client.js",
 		},
 		// _nuxt prefix
 		{
 			name: "bare _nuxt path",
 			base: "https://example.com/_nuxt/entry.js",
 			raw:  "_nuxt/chunks/app.js",
-			want: "https://example.com/_nuxt/chunks/app.js",
+			want: "https://example.com/_nuxt/_nuxt/chunks/app.js",
 		},
 		// _next/static prefix
 		{
 			name: "bare _next/static path",
 			base: "https://example.com/_next/static/chunks/app.js",
 			raw:  "_next/static/chunks/pages/index.js",
-			want: "https://example.com/_next/static/chunks/pages/index.js",
+			want: "https://example.com/_next/static/chunks/_next/static/chunks/pages/index.js",
 		},
 		// Empty
 		{
@@ -285,19 +285,33 @@ func TestResolveJS(t *testing.T) {
 	}
 }
 
-func TestDeduplicatePathSegments(t *testing.T) {
+func TestResolveJSPreservesLegalAdjacentPathSegments(t *testing.T) {
+	got, err := ResolveJS(
+		"https://example.com/releases/releases/main.js",
+		"./chunks/chunks/app.js",
+	)
+	if err != nil {
+		t.Fatalf("ResolveJS() error = %v", err)
+	}
+	want := "https://example.com/releases/releases/chunks/chunks/app.js"
+	if got != want {
+		t.Fatalf("ResolveJS() = %q, want legal path %q", got, want)
+	}
+}
+
+func TestDeduplicatePathSegmentsPreservesInput(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
 		want  string
 	}{
-		{"double assets/chunks", "https://vite.dev/assets/chunks/assets/chunks/client.js", "https://vite.dev/assets/chunks/client.js"},
-		{"triple chunk", "https://example.com/a/b/a/b/a/b/c.js", "https://example.com/a/b/c.js"},
+		{"double assets/chunks", "https://vite.dev/assets/chunks/assets/chunks/client.js", "https://vite.dev/assets/chunks/assets/chunks/client.js"},
+		{"triple chunk", "https://example.com/a/b/a/b/a/b/c.js", "https://example.com/a/b/a/b/a/b/c.js"},
 		{"no dup", "https://example.com/assets/main.js", "https://example.com/assets/main.js"},
-		{"adjacent dup", "https://example.com/a/a/b/b/c.js", "https://example.com/a/b/c.js"},
+		{"adjacent dup", "https://example.com/a/a/b/b/c.js", "https://example.com/a/a/b/b/c.js"},
 		{"short path", "https://example.com/a/b/c.js", "https://example.com/a/b/c.js"},
-		{"_next/static dup", "https://example.com/_next/static/_next/static/chunks/a.js", "https://example.com/_next/static/chunks/a.js"},
-		{"chunks/chunks", "https://vite.dev/assets/chunks/chunks/client.js", "https://vite.dev/assets/chunks/client.js"},
+		{"_next/static dup", "https://example.com/_next/static/_next/static/chunks/a.js", "https://example.com/_next/static/_next/static/chunks/a.js"},
+		{"chunks/chunks", "https://vite.dev/assets/chunks/chunks/client.js", "https://vite.dev/assets/chunks/chunks/client.js"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -140,6 +140,7 @@ func run(cfg *config.Config) error {
 		}
 	}()
 	totalAnalyzed := 0
+	totalAttempts := 0
 
 	for i, entryURL := range urls {
 		origin, err := urlutil.CanonicalOrigin(entryURL)
@@ -166,7 +167,7 @@ func run(cfg *config.Config) error {
 				if result.Err != nil {
 					return nil, result.Err
 				}
-				if result.StatusCode != 200 {
+				if result.StatusCode < 200 || result.StatusCode >= 300 {
 					return nil, fmt.Errorf("HTTP %d", result.StatusCode)
 				}
 				return result.Body, nil
@@ -190,7 +191,10 @@ func run(cfg *config.Config) error {
 			apiSession.AddEntryURL(entryURL)
 		}
 		log.Info("[%d/%d] Analyzing: %s", i+1, len(urls), entryURL)
-		analyzed := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, site, state.queued, state.processed, &totalAnalyzed)
+		analyzed, err := analyzeEntry(cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, site, state.queued, state.processed, &totalAnalyzed, &totalAttempts)
+		if err != nil {
+			return fmt.Errorf("analyze entry %s: %w", entryURL, err)
+		}
 		if apiSession != nil {
 			if err := apiSession.AnalyzeSources(); err != nil {
 				return fmt.Errorf("analyze discovered JavaScript APIs for %s: %w", entryURL, err)
@@ -224,19 +228,25 @@ func run(cfg *config.Config) error {
 // analyzeEntry analyzes a single entry URL and returns the number of JS files analyzed.
 // It always runs static HTML extraction, and additionally runs headless browser
 // discovery if cfg.Headless is enabled, merging and deduplicating the results.
-func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, entryURL, site string, queued, processed map[string]bool, totalAnalyzed *int) int {
+func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep *preprocess.Processor, apiSession *apidiscovery.Session, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
 	// 1. Static HTML extraction (always)
 	log.Info("Downloading entry HTML: %s", entryURL)
 	htmlResult := f.FetchForEntry(entryURL, entryURL)
 	if htmlResult.Err != nil {
-		log.LogError("download entry HTML", "URL=%s error=%v", entryURL, htmlResult.Err)
-		return 0
+		return 0, fmt.Errorf("download entry HTML: %w", htmlResult.Err)
+	}
+	if htmlResult.StatusCode < 200 || htmlResult.StatusCode >= 300 {
+		return 0, fmt.Errorf("download entry HTML: HTTP %d", htmlResult.StatusCode)
 	}
 
 	htmlContent := string(htmlResult.Body)
 	log.Info("Entry HTML size: %d bytes", len(htmlContent))
 
-	staticAssets := htmlEx.ExtractEntryJS(htmlContent, entryURL)
+	htmlBaseURL := htmlResult.FinalURL
+	if htmlBaseURL == "" {
+		htmlBaseURL = entryURL
+	}
+	staticAssets := htmlEx.ExtractEntryJS(htmlContent, htmlBaseURL)
 	log.Info("Static extraction found %d JS assets", len(staticAssets))
 
 	entryAssets := staticAssets
@@ -302,15 +312,23 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 	analyzed := 0
 
 	for len(queue) > 0 {
-		// Check limits
-		if cfg.MaxJS > 0 && *totalAnalyzed >= cfg.MaxJS {
-			log.Info("Reached max analysis count (%d), stopping", cfg.MaxJS)
+		if cfg.MaxJS > 0 && *totalAttempts >= cfg.MaxJS {
+			log.Info("Reached max JavaScript fetch attempts (%d), stopping", cfg.MaxJS)
 			break
 		}
 
-		// Concurrent download this batch
-		results := fetchBatch(cfg, f, log, queue, entryURL)
+		batch := queue
+		if cfg.MaxJS > 0 {
+			remaining := cfg.MaxJS - *totalAttempts
+			if len(batch) > remaining {
+				batch = batch[:remaining]
+			}
+		}
 		queue = nil
+		// Reserve the complete batch before any worker can schedule a request.
+		// Failed requests consume the same budget as successful requests.
+		*totalAttempts += len(batch)
+		results := fetchBatch(cfg, f, log, batch, entryURL)
 
 		// Serially analyze each result
 		for res := range results {
@@ -336,19 +354,16 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 		}
 	}
 
-	return analyzed
+	return analyzed, nil
 }
 
 // fetchBatch concurrently downloads a batch of URLs
 func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, queue []fetchReq, entryURL string) <-chan fetchRes {
-	results := make(chan fetchRes, len(queue))
 	workers := cfg.Workers
 	if workers <= 0 {
 		workers = 1
 	}
-	if workers > len(queue) {
-		workers = len(queue)
-	}
+	results := make(chan fetchRes, workers)
 
 	var wg sync.WaitGroup
 	reqCh := make(chan fetchReq, len(queue))
@@ -385,11 +400,6 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 	}
 	processed[item.url] = true
 
-	// Exact MaxJS limit (serial analysis, no race condition)
-	if cfg.MaxJS > 0 && *totalAnalyzed >= cfg.MaxJS {
-		return
-	}
-
 	if res.result.Err != nil {
 		log.LogError("Download failed", "URL=%s error=%v", item.url, res.result.Err)
 		s.AddJS(&analyzer.JSAsset{
@@ -400,15 +410,29 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		return
 	}
 
-	prepResult := prep.Process(entryURL, item.url, res.result.Body)
+	requestedURL := res.result.RequestedURL
+	if requestedURL == "" {
+		requestedURL = item.url
+	}
+	finalURL := res.result.FinalURL
+	if finalURL == "" {
+		finalURL = requestedURL
+	}
+	processed[requestedURL] = true
+	processed[finalURL] = true
+
+	prepResult := prep.Process(entryURL, finalURL, res.result.Body)
 	analysisData := prepResult.AnalysisBody
 	if prepResult.Failed {
 		log.Warn("JavaScript processing fell back for %s: %s", item.url, prepResult.Error)
 	}
-	s.RecordJSOutputs(site, item.url, prepResult.Outputs)
+	s.RecordJSOutputs(site, requestedURL, prepResult.Outputs)
+	if finalURL != requestedURL {
+		s.RecordJSOutputs(site, finalURL, prepResult.Outputs)
+	}
 
 	if cfg.APIDiscovery && apiSession != nil {
-		apiSession.AddSource(item.url, analysisData)
+		apiSession.AddSource(finalURL, analysisData)
 	}
 
 	*analyzed++
@@ -423,14 +447,15 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		Size: res.result.Size, Hash: res.result.Hash,
 	})
 
-	discovered := a.DiscoverJS(string(analysisData), item.url)
+	discovered := a.DiscoverJS(string(analysisData), finalURL)
 
 	// Add newly discovered JS URLs to the next batch queue
 	for _, newAsset := range discovered {
 		// For static analysis, require IsJSPath. For dynamic sources, allow broader fetch.
 		fromDynamic := newAsset.Source == analyzer.SourceHeadlessNetwork ||
 			newAsset.Source == analyzer.SourceHeadlessDOM ||
-			newAsset.Source == analyzer.SourceHeadlessResponse
+			newAsset.Source == analyzer.SourceHeadlessResponse ||
+			newAsset.Source == analyzer.SourceImportExpr
 		if queued[newAsset.URL] || !urlutil.ShouldAttemptJSFetch(newAsset.URL, fromDynamic) {
 			continue
 		}
@@ -439,7 +464,7 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 			continue
 		}
 		if shouldEnqueue(newAsset.Confidence, newAsset.Status) {
-			newAsset.FromURL = item.url
+			newAsset.FromURL = finalURL
 			newAsset.Depth = item.depth + 1
 			if newAsset.Depth > cfg.MaxDepth {
 				log.Verbose("Skipping (exceeds depth limit %d): %s", cfg.MaxDepth, newAsset.URL)

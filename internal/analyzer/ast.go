@@ -37,6 +37,10 @@ func (v *astVisitor) Enter(n js.INode) js.IVisitor {
 	switch node := n.(type) {
 	case *js.CallExpr:
 		v.handleCallExpr(node)
+	case *js.ImportStmt:
+		v.handleModuleSpecifier(node.Module)
+	case *js.ExportStmt:
+		v.handleModuleSpecifier(node.Module)
 	case *js.Property:
 		v.handleProperty(node)
 	}
@@ -72,6 +76,25 @@ func (v *astVisitor) handleCallExpr(node *js.CallExpr) {
 
 	// Extract string literal
 	raw := extractStringLiteral(arg.Value)
+	if raw == "" {
+		return
+	}
+
+	v.addImport(raw)
+}
+
+func (v *astVisitor) handleModuleSpecifier(module []byte) {
+	if len(module) < 2 {
+		return
+	}
+	quote := module[0]
+	if (quote != '\'' && quote != '"') || module[len(module)-1] != quote {
+		return
+	}
+	v.addImport(string(module[1 : len(module)-1]))
+}
+
+func (v *astVisitor) addImport(raw string) {
 	if raw == "" {
 		return
 	}
@@ -224,6 +247,7 @@ func (a *TdewolffASTAnalyzer) fallbackToRegex(jsContent string, fromJS string, f
 
 	// Use regex analyzer
 	imports := a.regex.ExtractDynamicImports(jsContent, fromJS, framework)
+	imports = append(imports, a.regex.ExtractStaticImports(jsContent, fromJS, framework)...)
 	result.Imports = append(result.Imports, imports...)
 
 	routes := a.regex.ExtractRoutePaths(jsContent, fromJS)

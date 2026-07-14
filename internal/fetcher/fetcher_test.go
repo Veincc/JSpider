@@ -32,7 +32,52 @@ func newTestFetcher(t *testing.T, ts *httptest.Server) *Fetcher {
 	return f
 }
 
-func TestFetch_CacheHit(t *testing.T) {
+func TestFetchRecordsRequestedAndRedirectFinalURLs(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/requested/app.js":
+			http.Redirect(w, r, "/final/nested/app.js", http.StatusFound)
+		case "/final/nested/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = io.WriteString(w, `import("./chunk.js");`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	requested := ts.URL + "/requested/app.js"
+	result := f.Fetch(requested)
+
+	if result.Err != nil {
+		t.Fatalf("Fetch() error = %v", result.Err)
+	}
+	if result.RequestedURL != requested {
+		t.Fatalf("RequestedURL = %q, want %q", result.RequestedURL, requested)
+	}
+	if want := ts.URL + "/final/nested/app.js"; result.FinalURL != want {
+		t.Fatalf("FinalURL = %q, want %q", result.FinalURL, want)
+	}
+}
+
+func TestFetchRecordsRequestedURLWhenRequestCannotBeBuilt(t *testing.T) {
+	f := newTestFetcher(t, nil)
+	const requested = "://invalid"
+	result := f.Fetch(requested)
+
+	if result.Err == nil {
+		t.Fatal("Fetch() error = nil, want malformed URL error")
+	}
+	if result.RequestedURL != requested {
+		t.Fatalf("RequestedURL = %q, want %q", result.RequestedURL, requested)
+	}
+	if result.FinalURL != "" {
+		t.Fatalf("FinalURL = %q, want empty without an HTTP request", result.FinalURL)
+	}
+}
+
+func TestFetch_DoesNotCacheCompletedBodies(t *testing.T) {
 	var count int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&count, 1)
@@ -51,8 +96,8 @@ func TestFetch_CacheHit(t *testing.T) {
 	if r2.Err != nil {
 		t.Fatalf("Fetch 2 error: %v", r2.Err)
 	}
-	if atomic.LoadInt32(&count) != 1 {
-		t.Errorf("Expected 1 HTTP request, got %d", count)
+	if atomic.LoadInt32(&count) != 2 {
+		t.Errorf("HTTP requests = %d, want 2 after the first request completed", count)
 	}
 	if string(r1.Body) != "hello" {
 		t.Errorf("Body: got %q, want %q", r1.Body, "hello")
@@ -219,7 +264,21 @@ func TestFetch_Non200Status(t *testing.T) {
 	}
 }
 
-func TestFetch_PlainTextLikeJS(t *testing.T) {
+func TestFetchJS_AcceptsAnyTwoHundredStatus(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, `const partial = true;`)
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	if result := f.FetchJS(ts.URL + "/partial.js"); result.Err != nil {
+		t.Fatalf("FetchJS() rejected 206 response: %v", result.Err)
+	}
+}
+
+func TestFetchJS_RejectsExplicitNonJavaScriptContentType(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("function hello() { return 'world'; }"))
@@ -229,11 +288,59 @@ func TestFetch_PlainTextLikeJS(t *testing.T) {
 	f := newTestFetcher(t, ts)
 
 	r := f.FetchJS(ts.URL + "/script")
-	if r.Err != nil {
-		t.Fatalf("FetchJS error: %v", r.Err)
+	if r.Err == nil {
+		t.Fatal("FetchJS() accepted explicit text/plain content")
 	}
-	if !r.IsJS {
-		t.Error("Expected IsJS=true for content that looks like JS")
+}
+
+func TestFetchJS_RejectsHTMLAtJavaScriptPath(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, `<script>const looksLikeJavaScript = true;</script>`)
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	result := f.FetchJS(ts.URL + "/app.js")
+
+	if result.Err == nil {
+		t.Fatal("FetchJS() accepted HTML because the URL ended in .js")
+	}
+}
+
+func TestFetchJS_RejectsJSONWhoseParameterMentionsJavaScript(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", `application/json; profile="javascript"`)
+		_, _ = io.WriteString(w, `{"const value":"looks like source"}`)
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	if result := f.FetchJS(ts.URL + "/data.js"); result.Err == nil {
+		t.Fatal("FetchJS() accepted application/json because a parameter mentioned javascript")
+	}
+}
+
+func TestFetchJSWithoutContentTypeRejectsHTMLAndJSONContainingJSSyntax(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "HTML", body: `<!doctype html><script>const value = true;</script>`},
+		{name: "JSON", body: `{"source":"const value = true;"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := validateJSResult(&Result{
+				RequestedURL: "https://example.com/app.js",
+				StatusCode:   http.StatusOK,
+				Body:         []byte(tt.body),
+			}, "https://example.com/app.js")
+			if result.Err == nil {
+				t.Fatalf("FetchJS fallback accepted %s without Content-Type", tt.name)
+			}
+		})
 	}
 }
 

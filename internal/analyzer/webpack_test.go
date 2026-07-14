@@ -33,6 +33,9 @@ __webpack_require__.e(456);
 			if imp.ResolvedURL != "https://example.com/static/js/456.def456.chunk.js" {
 				t.Fatalf("resolved URL = %q, want %q", imp.ResolvedURL, "https://example.com/static/js/456.def456.chunk.js")
 			}
+			if imp.Confidence != ConfHigh {
+				t.Fatalf("literal chunk confidence = %q, want %q", imp.Confidence, ConfHigh)
+			}
 		}
 	}
 	if !found {
@@ -44,6 +47,52 @@ __webpack_require__.e(456);
 	for _, imp := range result.Imports {
 		t.Logf("  import: %s -> %s (source=%s, confidence=%s)",
 			imp.Raw, imp.ResolvedURL, imp.Source, imp.Confidence)
+	}
+}
+
+func TestWebpackAnalyzer_DoesNotScheduleVariableChunkRequests(t *testing.T) {
+	w := NewWebpackAnalyzer(NewRegexAnalyzer())
+	result := w.Analyze(`
+__webpack_require__.p = "/static/";
+function load(chunkId) { return __webpack_require__.e(chunkId); }
+`, "https://example.com/assets/main.js")
+
+	for _, asset := range result.NewURLs {
+		if asset.URL == "https://example.com/static/chunkId.js" {
+			t.Fatalf("variable webpack chunk was scheduled: %+v", asset)
+		}
+	}
+}
+
+func TestWebpackAnalyzer_SchedulesQuotedLiteralChunkNames(t *testing.T) {
+	w := NewWebpackAnalyzer(NewRegexAnalyzer())
+	result := w.Analyze(`
+__webpack_require__.p = "/static/";
+__webpack_require__.e("route-name");
+`, "https://example.com/assets/main.js")
+
+	want := "https://example.com/static/route-name.js"
+	for _, asset := range result.NewURLs {
+		if asset.URL == want && asset.Confidence == ConfHigh {
+			return
+		}
+	}
+	t.Fatalf("literal named webpack chunk %q not scheduled with high confidence: %+v", want, result.NewURLs)
+}
+
+func TestWebpackAnalyzer_IgnoresRequireEInCommentsAndStrings(t *testing.T) {
+	w := NewWebpackAnalyzer(NewRegexAnalyzer())
+	result := w.Analyze(`
+__webpack_require__.p = "/static/";
+const text = '__webpack_require__.e("string-fake")';
+// __webpack_require__.e("line-fake")
+/* __webpack_require__.e("block-fake") */
+__webpack_require__.e("real");
+`, "https://example.com/assets/main.js")
+
+	want := "https://example.com/static/real.js"
+	if len(result.NewURLs) != 1 || result.NewURLs[0].URL != want {
+		t.Fatalf("scheduled webpack URLs = %+v, want only %q", result.NewURLs, want)
 	}
 }
 

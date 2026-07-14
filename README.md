@@ -181,7 +181,7 @@ Browser discovery can trigger page-side requests and limited safe-looking intera
 | `-o <dir>` | `output` | Output directory. |
 | `--headless` | `false` | Add Chrome or Chromium browser discovery. |
 | `--api-discovery` | `false` | Extract static APIs and correlate them with browser XHR/Fetch/EventSource requests; safely clicks bounded elements, requires CGO and Chrome/Chromium, and implies `--headless`. |
-| `-n <count>` | unlimited | Maximum JavaScript files processed across the run. |
+| `-n <count>` | unlimited | Maximum JavaScript fetch attempts across the run; failures count, entry HTML does not. |
 | `-d <depth>` | `10` | Maximum recursive discovery depth. |
 | `-s <mb>` | unlimited | Maximum compressed and decompressed resource size; `0` disables the limit. |
 | `-w <workers>` | `5` | Concurrent download workers. |

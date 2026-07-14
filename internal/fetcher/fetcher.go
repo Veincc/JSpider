@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,8 @@ import (
 	"github.com/Veincc/JSpider/internal/logging"
 	"github.com/Veincc/JSpider/internal/urlutil"
 	"github.com/andybalholm/brotli"
+	"github.com/tdewolff/parse/v2"
+	"github.com/tdewolff/parse/v2/js"
 )
 
 // ErrDecompressTooLarge indicates decompressed content exceeded size limit
@@ -33,17 +36,20 @@ func (e *ErrDecompressTooLarge) Error() string {
 
 // Result represents a download result (immutable, safe to share)
 type Result struct {
-	URL         string
-	StatusCode  int
-	ContentType string
-	Size        int64
-	Hash        string
-	Body        []byte
-	IsJS        bool
-	Err         error
+	URL          string // Deprecated: use RequestedURL or FinalURL.
+	RequestedURL string
+	FinalURL     string
+	StatusCode   int
+	ContentType  string
+	Size         int64
+	Hash         string
+	Body         []byte
+	IsJS         bool
+	Err          error
 }
 
-// clone returns a copy of the Result so FetchJS mutations do not pollute the cache
+// clone returns a copy of the Result so validation does not mutate a shared
+// active-request result.
 func (r *Result) clone() *Result {
 	c := *r
 	return &c
@@ -60,7 +66,6 @@ type Fetcher struct {
 	log     *logging.Logger
 	client  *http.Client
 	mu      sync.Mutex
-	cache   map[string]*Result   // Completed results cache
 	pending map[string]*inflight // In-flight requests (singleflight)
 }
 
@@ -95,12 +100,11 @@ func New(cfg *config.Config, log *logging.Logger) (*Fetcher, error) {
 		cfg:     cfg,
 		log:     log,
 		client:  client,
-		cache:   make(map[string]*Result),
 		pending: make(map[string]*inflight),
 	}, nil
 }
 
-// Fetch downloads URL content with caching and singleflight deduplication
+// Fetch downloads URL content with active-request singleflight deduplication.
 func (f *Fetcher) Fetch(rawURL string) *Result {
 	return f.fetch(rawURL, rawURL)
 }
@@ -119,13 +123,7 @@ func (f *Fetcher) fetch(rawURL, entryURL string) *Result {
 
 	f.mu.Lock()
 
-	// 1. Check completed cache
-	if cached, ok := f.cache[cacheKey]; ok {
-		f.mu.Unlock()
-		return cached
-	}
-
-	// 2. Check for in-flight request
+	// Join an in-flight request for the same URL and entry policy.
 	if inf, ok := f.pending[cacheKey]; ok {
 		f.mu.Unlock()
 		// Wait for the request to complete
@@ -133,17 +131,15 @@ func (f *Fetcher) fetch(rawURL, entryURL string) *Result {
 		return inf.res
 	}
 
-	// 3. Create new in-flight request
+	// Create a new in-flight request. Completed bodies are not retained.
 	inf := &inflight{done: make(chan struct{})}
 	f.pending[cacheKey] = inf
 	f.mu.Unlock()
 
-	// 4. Perform download
 	result := f.doFetch(rawURL, entryURL)
 
-	// 5. Store in cache and notify waiters
+	// Publish to current waiters, then release the request from the active set.
 	f.mu.Lock()
-	f.cache[cacheKey] = result
 	inf.res = result
 	delete(f.pending, cacheKey)
 	f.mu.Unlock()
@@ -153,9 +149,11 @@ func (f *Fetcher) fetch(rawURL, entryURL string) *Result {
 }
 
 func (f *Fetcher) doFetch(rawURL, entryURL string) *Result {
+	result := &Result{URL: rawURL, RequestedURL: rawURL}
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
-		return &Result{URL: rawURL, Err: err}
+		result.Err = err
+		return result
 	}
 	req = req.WithContext(context.WithValue(req.Context(), redirectPolicyKey{}, entryURL))
 
@@ -178,22 +176,24 @@ func (f *Fetcher) doFetch(rawURL, entryURL string) *Result {
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return &Result{URL: rawURL, Err: err}
+		result.Err = err
+		return result
 	}
 	defer resp.Body.Close()
+	result.FinalURL = resp.Request.URL.String()
+	result.StatusCode = resp.StatusCode
+	result.ContentType = resp.Header.Get("Content-Type")
 
 	maxSize := maxSizeBytes(f.cfg.MaxSizeMB)
 	compressedBody, err := readBounded(resp.Body, maxSize)
 	if err != nil {
-		return &Result{URL: rawURL, StatusCode: resp.StatusCode, Err: err}
+		result.Err = err
+		return result
 	}
 
 	if maxSize > 0 && int64(len(compressedBody)) > maxSize {
-		return &Result{
-			URL:        rawURL,
-			StatusCode: resp.StatusCode,
-			Err:        fmt.Errorf("File too large: %d bytes exceeds limit of %d bytes", len(compressedBody), maxSize),
-		}
+		result.Err = fmt.Errorf("File too large: %d bytes exceeds limit of %d bytes", len(compressedBody), maxSize)
+		return result
 	}
 
 	// Decompress (with post-decompression size limit)
@@ -201,27 +201,21 @@ func (f *Fetcher) doFetch(rawURL, entryURL string) *Result {
 	if err != nil {
 		if _, ok := err.(*ErrDecompressTooLarge); ok {
 			// Decompressed content exceeds limit, return error
-			return &Result{URL: rawURL, StatusCode: resp.StatusCode, Err: err}
+			result.Err = err
+			return result
 		}
 		// Other decompression errors (e.g. corrupted format), fall back to raw content
 		f.log.Verbose("Decompression failed %s: %v, using raw content", rawURL, err)
 		body = compressedBody
 	}
 
-	ct := resp.Header.Get("Content-Type")
 	hash := sha256.Sum256(body)
 
-	isJS := urlutil.IsJSPath(rawURL) || urlutil.IsJSContentType(ct)
-
-	return &Result{
-		URL:         rawURL,
-		StatusCode:  resp.StatusCode,
-		ContentType: ct,
-		Size:        int64(len(body)),
-		Hash:        fmt.Sprintf("%x", hash[:8]),
-		Body:        body,
-		IsJS:        isJS,
-	}
+	result.Size = int64(len(body))
+	result.Hash = fmt.Sprintf("%x", hash[:8])
+	result.Body = body
+	result.IsJS = result.ContentType != "" && urlutil.IsJSContentType(result.ContentType)
+	return result
 }
 
 // decompressBounded decompresses content with a size limit
@@ -274,8 +268,8 @@ func readBounded(reader io.Reader, maxSize int64) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(reader, maxSize+1))
 }
 
-// FetchJS downloads a JS resource with status validation.
-// Returns a copy of the Result so mutations do not pollute the cache.
+// FetchJS downloads a JS resource with status and media-type validation.
+// It returns a copy because active singleflight callers can share the raw result.
 func (f *Fetcher) FetchJS(rawURL string) *Result {
 	result := f.Fetch(rawURL)
 	return validateJSResult(result, rawURL)
@@ -293,22 +287,29 @@ func validateJSResult(result *Result, rawURL string) *Result {
 		return result.clone()
 	}
 
-	// Return a copy to avoid mutating the cache
+	// Return a copy to avoid mutating a result shared with active waiters.
 	clone := result.clone()
 
-	if clone.StatusCode != 200 {
+	if clone.StatusCode < http.StatusOK || clone.StatusCode >= http.StatusMultipleChoices {
 		clone.Err = fmt.Errorf("HTTP %d", clone.StatusCode)
 		return clone
 	}
 
-	// Check if JS: by URL path or Content-Type
-	if !clone.IsJS {
-		// Try to check if content looks like JS
-		if looksLikeJS(clone.Body) {
-			clone.IsJS = true
-		} else {
+	// An explicit Content-Type is authoritative. URL suffixes never override a
+	// server that says the response is HTML, JSON, an image, or another type.
+	if strings.TrimSpace(clone.ContentType) != "" {
+		if !clone.IsJS {
 			clone.Err = fmt.Errorf("Not a JS resource: content-type=%s", clone.ContentType)
 		}
+		return clone
+	}
+
+	// Some servers omit Content-Type. Only accept those responses when a small
+	// body sample has clear JavaScript syntax; the URL suffix alone is not proof.
+	if looksLikeJS(clone.Body) {
+		clone.IsJS = true
+	} else {
+		clone.Err = fmt.Errorf("Not a JS resource: content-type missing")
 	}
 
 	return clone
@@ -357,19 +358,45 @@ func shouldSendCookies(rawURL, entryURL string) bool {
 
 // looksLikeJS checks if content looks like JS
 func looksLikeJS(data []byte) bool {
-	if len(data) < 10 {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) < 10 {
 		return false
 	}
-	snippet := string(data[:min(500, len(data))])
+
+	lower := strings.ToLower(string(trimmed[:min(500, len(trimmed))]))
+	for _, prefix := range []string{"<!doctype", "<html", "<script", "<?xml", "<svg"} {
+		if strings.HasPrefix(lower, prefix) {
+			return false
+		}
+	}
+	if json.Valid(trimmed) || hasKnownBinaryMagic(trimmed) {
+		return false
+	}
+
 	indicators := []string{
 		"__webpack_require__", "__vite__", "import(", "export ",
 		"function(", "function ", "var ", "let ", "const ",
 		"self.", "window.", "document.", "(()=>{", "(function(",
 	}
+	hasIndicator := false
 	for _, ind := range indicators {
-		if strings.Contains(snippet, ind) {
-			return true
+		if strings.Contains(lower, ind) {
+			hasIndicator = true
+			break
 		}
 	}
-	return false
+	if !hasIndicator {
+		return false
+	}
+
+	_, err := js.Parse(parse.NewInputBytes(trimmed), js.Options{})
+	return err == nil
+}
+
+func hasKnownBinaryMagic(data []byte) bool {
+	return bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) ||
+		bytes.HasPrefix(data, []byte("\xff\xd8\xff")) ||
+		bytes.HasPrefix(data, []byte("GIF87a")) ||
+		bytes.HasPrefix(data, []byte("GIF89a")) ||
+		(len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")))
 }

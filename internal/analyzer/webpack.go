@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/Veincc/JSpider/internal/urlutil"
+	"github.com/tdewolff/parse/v2"
+	"github.com/tdewolff/parse/v2/js"
 )
 
 var (
@@ -16,7 +18,6 @@ var (
 	wpFilenamePattern            = regexp.MustCompile(`"([^"]*?)"\s*\+\s*\w+\s*\+\s*"([^"]*?)"`)
 	wpFilenameWithHashMapPattern = regexp.MustCompile(`"([^"]*)"\s*\+\s*\w+\s*\+\s*"([^"]*)"\s*\+\s*\{[^}]+\}\[\w+\]\s*\+\s*"([^"]*)"`)
 	wpChunkPushRe                = regexp.MustCompile(`(?:self\.webpackChunk\w*\s*\|\|\s*\[\]\)\.push\s*\(\s*\[\s*\[(\d+)\])|(?:\bwebpackJsonp\s*\w*\s*\.\s*push\s*\(\s*\[\s*\[(\d+)\])`)
-	wpRequireERe                 = regexp.MustCompile(`__webpack_require__\.e\s*\(\s*(?:(\d+)|["'](\w+)["']|(\w+))\s*\)`)
 	wpCssRe                      = regexp.MustCompile(`__webpack_require__\.miniCssExtracPlugin\s*=`)
 )
 
@@ -196,23 +197,19 @@ func (w *WebpackAnalyzer) extractChunkPushes(jsContent string, fromJS string, pu
 func (w *WebpackAnalyzer) extractRequireE(jsContent string, fromJS string, publicPath string, hashes map[string]string, filenameRule string, chunkFilename string) []DynamicImport {
 	var imports []DynamicImport
 
-	for _, m := range wpRequireERe.FindAllStringSubmatch(jsContent, -1) {
-		chunkId := ""
-		if m[1] != "" {
-			chunkId = m[1]
-		} else if m[2] != "" {
-			chunkId = m[2]
-		} else if m[3] != "" {
-			chunkId = m[3]
-		}
-		if chunkId == "" {
-			continue
-		}
+	visitor := &webpackRequireEVisitor{}
+	program, err := js.Parse(parse.NewInputBytes([]byte(jsContent)), js.Options{})
+	if err != nil {
+		return imports
+	}
+	js.Walk(visitor, program)
+
+	for _, chunkId := range visitor.literalChunkIDs {
 
 		chunkURL := w.resolveChunkURL(chunkId, publicPath, hashes, filenameRule, chunkFilename, fromJS)
-		confidence := ConfMedium
-		if chunkURL == "" {
-			confidence = ConfLow
+		confidence := ConfLow
+		if chunkURL != "" {
+			confidence = ConfHigh
 		}
 
 		imports = append(imports, DynamicImport{
@@ -227,6 +224,31 @@ func (w *WebpackAnalyzer) extractRequireE(jsContent string, fromJS string, publi
 
 	return imports
 }
+
+type webpackRequireEVisitor struct {
+	literalChunkIDs []string
+}
+
+func (v *webpackRequireEVisitor) Enter(n js.INode) js.IVisitor {
+	call, ok := n.(*js.CallExpr)
+	if !ok || len(call.Args.List) == 0 {
+		return v
+	}
+	dot, ok := call.X.(*js.DotExpr)
+	if !ok || dot.X.String() != "__webpack_require__" || dot.Y.String() != "e" {
+		return v
+	}
+	literal, ok := call.Args.List[0].Value.(*js.LiteralExpr)
+	if !ok || (literal.TokenType != js.StringToken && literal.TokenType != js.IntegerToken && literal.TokenType != js.DecimalToken) {
+		return v
+	}
+	if chunkID := extractStringLiteral(literal); chunkID != "" {
+		v.literalChunkIDs = append(v.literalChunkIDs, chunkID)
+	}
+	return v
+}
+
+func (v *webpackRequireEVisitor) Exit(js.INode) {}
 
 // resolveChunkURL resolves the full URL for a chunk
 func (w *WebpackAnalyzer) resolveChunkURL(chunkId string, publicPath string, hashes map[string]string, filenameRule string, chunkFilename string, fromJS string) string {
@@ -307,7 +329,7 @@ func (w *WebpackAnalyzer) buildNewURLs(imports []DynamicImport, fromJS string) [
 	seen := make(map[string]bool)
 
 	for _, imp := range imports {
-		if imp.ResolvedURL != "" && !seen[imp.ResolvedURL] && urlutil.IsJSPath(imp.ResolvedURL) {
+		if imp.Confidence == ConfHigh && imp.ResolvedURL != "" && !seen[imp.ResolvedURL] && urlutil.IsJSPath(imp.ResolvedURL) {
 			seen[imp.ResolvedURL] = true
 			assets = append(assets, JSAsset{
 				URL:        imp.ResolvedURL,

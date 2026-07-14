@@ -85,6 +85,135 @@ func TestRunReturnsURLFileErrorBeforeCreatingOutput(t *testing.T) {
 	assertPathMissing(t, outDir)
 }
 
+func TestRunFailsFor404EntryWithoutAnalyzingItsBody(t *testing.T) {
+	var scriptHits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/missing":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`<script src="/must-not-run.js"></script>`))
+		case "/must-not-run.js":
+			atomic.AddInt32(&scriptHits, 1)
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`throw new Error("should not run");`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	err := run(testConfig(server.URL+"/missing", t.TempDir()))
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("run() error = %v, want entry HTTP 404 failure", err)
+	}
+	if got := atomic.LoadInt32(&scriptHits); got != 0 {
+		t.Fatalf("script requests = %d, want 0 for failed entry", got)
+	}
+}
+
+func TestRedirectedJavaScriptResolvesNestedChunkAgainstFinalURL(t *testing.T) {
+	var expectedChunkHits int32
+	var wrongChunkHits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<script src="/bootstrap.js"></script>`))
+		case "/bootstrap.js":
+			http.Redirect(w, r, "/nested/app/main.js", http.StatusFound)
+		case "/nested/app/main.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`import("./chunks/lazy.js");`))
+		case "/nested/app/chunks/lazy.js":
+			atomic.AddInt32(&expectedChunkHits, 1)
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`export const lazy = true;`))
+		case "/chunks/lazy.js":
+			atomic.AddInt32(&wrongChunkHits, 1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	outDir := t.TempDir()
+	if err := run(testConfig(server.URL+"/", outDir)); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&expectedChunkHits); got != 1 {
+		t.Fatalf("final-relative chunk requests = %d, want 1", got)
+	}
+	if got := atomic.LoadInt32(&wrongChunkHits); got != 0 {
+		t.Fatalf("requested-relative chunk requests = %d, want 0", got)
+	}
+	rows := readTabMap(t, filepath.Join(outDir, urlutil.SanitizeDomain(server.URL), "js-map.txt"))
+	mapped := make(map[string]bool)
+	for _, row := range rows {
+		mapped[row[0]] = true
+	}
+	for _, rawURL := range []string{server.URL + "/bootstrap.js", server.URL + "/nested/app/main.js"} {
+		if !mapped[rawURL] {
+			t.Errorf("requested/final URL %s missing from JavaScript map: %+v", rawURL, rows)
+		}
+	}
+}
+
+func TestLiteralESMImportWithoutExtensionIsFetched(t *testing.T) {
+	var dependencyHits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<script type="module" src="/main.js"></script>`))
+		case "/main.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`import "./dep";`))
+		case "/dep":
+			atomic.AddInt32(&dependencyHits, 1)
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`export const dependency = true;`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	if err := run(testConfig(server.URL+"/", t.TempDir())); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&dependencyHits); got != 1 {
+		t.Fatalf("extensionless ESM dependency requests = %d, want 1", got)
+	}
+}
+
+func TestMaxJSOnePerformsOneAttemptEvenWhenItFails(t *testing.T) {
+	var scriptAttempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<script src="/a.js"></script><script src="/b.js"></script><script src="/c.js"></script>`))
+			return
+		}
+		atomic.AddInt32(&scriptAttempts, 1)
+		w.Header().Set("Content-Type", "application/javascript")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`const failed = true;`))
+	}))
+	defer server.Close()
+
+	cfg := testConfig(server.URL+"/", t.TempDir())
+	cfg.MaxJS = 1
+	cfg.Workers = 4
+	if err := run(cfg); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&scriptAttempts); got != 1 {
+		t.Fatalf("JavaScript fetch attempts = %d, want exactly 1", got)
+	}
+}
+
 func TestNormalModeUsesSourceMapsThenFallsBackToReadableBundle(t *testing.T) {
 	if err := preprocess.CheckNodeRuntime(); err != nil {
 		t.Skip(err)
@@ -467,7 +596,7 @@ func TestRunRemovesLegacyAndPreviousModeOutputs(t *testing.T) {
 	assertFileContent(t, filepath.Join(outDir, "other_com", "keep.txt"), "keep other site")
 }
 
-func TestMaxJSPrecisionLimit(t *testing.T) {
+func TestAnalysisDoesNotApplyFetchBudgetAfterScheduling(t *testing.T) {
 	cfg, s, a, log, prep := analysisHarness(t)
 	cfg.MaxJS = 2
 	queued := make(map[string]bool)
@@ -480,11 +609,64 @@ func TestMaxJSPrecisionLimit(t *testing.T) {
 		analyzeResultForTest(cfg, s, a, log, prep, successfulFetch(name, `console.log("ok");`), "https://example.com/", queued, processed, &queue, &analyzed, &total)
 	}
 
-	if total != 2 {
-		t.Fatalf("total analyzed = %d, want 2", total)
+	if total != 3 {
+		t.Fatalf("total analyzed = %d, want all 3 already-fetched results", total)
 	}
-	if got := len(s.GetConfirmedURLs()); got != 2 {
-		t.Fatalf("confirmed JavaScript = %d, want 2", got)
+	if got := len(s.GetConfirmedURLs()); got != 3 {
+		t.Fatalf("confirmed JavaScript = %d, want 3", got)
+	}
+}
+
+func TestFetchBatchResultCapacityEqualsWorkerCount(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/a.js": `const a = true;`,
+		"/b.js": `const b = true;`,
+		"/c.js": `const c = true;`,
+		"/d.js": `const d = true;`,
+	})
+	defer server.Close()
+
+	cfg := testConfig(server.URL+"/", t.TempDir())
+	cfg.Workers = 2
+	log := logging.New(false, cfg.OutDir)
+	defer log.Close()
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue := []fetchReq{
+		{url: server.URL + "/a.js"},
+		{url: server.URL + "/b.js"},
+		{url: server.URL + "/c.js"},
+		{url: server.URL + "/d.js"},
+	}
+
+	results := fetchBatch(cfg, f, log, queue, server.URL+"/")
+	if got := cap(results); got != cfg.Workers {
+		t.Errorf("result channel capacity = %d, want worker count %d", got, cfg.Workers)
+	}
+	for range results {
+	}
+}
+
+func TestFetchBatchResultCapacityUsesConfiguredWorkersForSmallBatch(t *testing.T) {
+	server := newSiteServer(t, map[string]string{"/a.js": `const a = true;`})
+	defer server.Close()
+
+	cfg := testConfig(server.URL+"/", t.TempDir())
+	cfg.Workers = 4
+	log := logging.New(false, cfg.OutDir)
+	defer log.Close()
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	results := fetchBatch(cfg, f, log, []fetchReq{{url: server.URL + "/a.js"}}, server.URL+"/")
+	if got := cap(results); got != cfg.Workers {
+		t.Errorf("small-batch result capacity = %d, want configured workers %d", got, cfg.Workers)
+	}
+	for range results {
 	}
 }
 
