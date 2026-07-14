@@ -194,3 +194,21 @@ export * from "./re-export.js";
 		}
 	}
 }
+
+func TestSecondaryFrameworkDetectionStillSupplementsGenericJSPaths(t *testing.T) {
+	log := logging.New(false, t.TempDir())
+	defer log.Close()
+	a := NewAnalyzer(log)
+
+	assets := a.DiscoverJS(
+		`const lazyChunk = "/chunks/lazy.js";`,
+		"https://example.com/runtime.polyfills.js",
+	)
+
+	for _, asset := range assets {
+		if asset.URL == "https://example.com/chunks/lazy.js" {
+			return
+		}
+	}
+	t.Fatalf("secondary Angular detection lost generic JavaScript path: %+v", assets)
+}

@@ -16,6 +16,30 @@ type closeErrorProcessor struct {
 	err error
 }
 
+type recoverableAPISession struct {
+	analyzeErr   error
+	report       apidiscovery.Report
+	analyzeCalls int
+	reportCalls  int
+}
+
+func (s *recoverableAPISession) AddEntryURL(string) {}
+func (s *recoverableAPISession) AddRuntimeForEntry(string, []apidiscovery.RuntimeRequest) {
+}
+func (s *recoverableAPISession) AddSourceWithIdentity(apidiscovery.SourceIdentity, string, []byte) {
+}
+func (s *recoverableAPISession) Stats(string) apidiscovery.SessionStats {
+	return apidiscovery.SessionStats{}
+}
+func (s *recoverableAPISession) AnalyzeSources() error {
+	s.analyzeCalls++
+	return s.analyzeErr
+}
+func (s *recoverableAPISession) Report() apidiscovery.Report {
+	s.reportCalls++
+	return s.report
+}
+
 func (p *closeErrorProcessor) Process(string, string, []byte) preprocess.FileResult {
 	return preprocess.FileResult{}
 }
@@ -146,5 +170,48 @@ func TestFinalizeOutputsWritesAPIEndpoints(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(outDir, site, "endpoints.txt"))
 	if err != nil || string(data) != "https://example.com/api/runtime\n" {
 		t.Fatalf("endpoints = %q, error = %v", data, err)
+	}
+}
+
+func TestFinalizeOutputsBuildsRecoverableReportAfterAnalysisFailureAndJoinsWriteError(t *testing.T) {
+	outDir := t.TempDir()
+	analysisErr := errors.New("jsluice analysis failed")
+	newSession := func(entryURL, endpointURL string) *recoverableAPISession {
+		return &recoverableAPISession{
+			analyzeErr: analysisErr,
+			report: apidiscovery.BuildReport(nil, []apidiscovery.RuntimeRequest{{
+				RequestID: "runtime", URL: endpointURL, Method: "GET", ResourceType: "Fetch", EntryURL: entryURL,
+			}}),
+		}
+	}
+
+	recoverable := newSession("https://recoverable.example/", "https://recoverable.example/api/runtime")
+	writeFailure := newSession("https://blocked.example/", "https://blocked.example/api/runtime")
+	sites := map[string]*siteRuntime{
+		"recoverable": {
+			origin: "recoverable", directory: "recoverable", store: store.New(outDir),
+			apiSession: recoverable, entryURLs: []string{"https://recoverable.example/"},
+		},
+		"write_failure": {
+			origin: "write_failure", directory: "write_failure", store: store.New(outDir),
+			apiSession: writeFailure, entryURLs: []string{"https://blocked.example/"},
+		},
+	}
+	if err := os.MkdirAll(filepath.Join(outDir, "write_failure", "endpoints.txt"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := finalizeOutputs(outDir, sites, true, nil)
+	if err == nil || !strings.Contains(err.Error(), analysisErr.Error()) || !strings.Contains(err.Error(), "write endpoints") {
+		t.Fatalf("finalizeOutputs() error = %v, want joined analysis and endpoint-write errors", err)
+	}
+	data, readErr := os.ReadFile(filepath.Join(outDir, "recoverable", "endpoints.txt"))
+	if readErr != nil || string(data) != "https://recoverable.example/api/runtime\n" {
+		t.Fatalf("recoverable endpoints = %q, error = %v", data, readErr)
+	}
+	for name, session := range map[string]*recoverableAPISession{"recoverable": recoverable, "write_failure": writeFailure} {
+		if session.analyzeCalls != 1 || session.reportCalls != 1 {
+			t.Errorf("%s calls: AnalyzeSources=%d Report=%d, want once each", name, session.analyzeCalls, session.reportCalls)
+		}
 	}
 }

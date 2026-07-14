@@ -97,6 +97,15 @@ type RunResult struct {
 	Sites   map[string]SiteStats
 }
 
+type apiDiscoverySession interface {
+	AddEntryURL(string)
+	AddRuntimeForEntry(string, []apidiscovery.RuntimeRequest)
+	AddSourceWithIdentity(apidiscovery.SourceIdentity, string, []byte)
+	Stats(string) apidiscovery.SessionStats
+	AnalyzeSources() error
+	Report() apidiscovery.Report
+}
+
 // OrderedSites returns a deterministic view for logs and other derived output.
 func (r RunResult) OrderedSites() []SiteStats {
 	origins := make([]string, 0, len(r.Sites))
@@ -121,7 +130,7 @@ type siteRuntime struct {
 	analyzer    *analyzer.Analyzer
 	html        *html.Extractor
 	processor   javaScriptProcessor
-	apiSession  *apidiscovery.Session
+	apiSession  apiDiscoverySession
 	attempts    int
 	analyzed    int
 	finalizeErr error
@@ -255,7 +264,10 @@ func run(ctx context.Context, cfg *config.Config) (RunResult, error) {
 	stopReason := error(nil)
 	for i, entry := range planned {
 		if stopReason == nil {
-			stopReason = ctx.Err()
+			if contextErr := ctx.Err(); contextErr != nil {
+				stopReason = contextErr
+				runErrors = append(runErrors, contextErr)
+			}
 		}
 		if stopReason != nil {
 			skipped := EntryResult{
@@ -392,11 +404,11 @@ func newSiteRuntime(cfg *config.Config, log *logging.Logger, origin, directory s
 // analyzeEntry analyzes a single entry URL and returns the number of JS files analyzed.
 // It always runs static HTML extraction, and additionally runs headless browser
 // discovery if cfg.Headless is enabled, merging and deduplicating the results.
-func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession *apidiscovery.Session, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
+func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession apiDiscoverySession, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
 	return analyzeEntryContext(context.Background(), cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, site, queued, processed, totalAnalyzed, totalAttempts)
 }
 
-func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession *apidiscovery.Session, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
+func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession apiDiscoverySession, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
 	// 1. Static HTML extraction (always)
 	log.Info("Downloading entry HTML: %s", entryURL)
 	htmlResult := f.FetchForEntryContext(ctx, entryURL, entryURL)
@@ -425,6 +437,9 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 		discovery, err := discoverBrowser(ctx, buildHeadlessConfig(cfg, entryURL), log)
 		var hlAssets []analyzer.JSAsset
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return 0, err
+			}
 			log.Warn("Headless discovery failed (continuing with static results): %v", err)
 		} else {
 			hlAssets = discovery.Assets
@@ -551,6 +566,9 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return analyzed, err
+	}
 	return analyzed, nil
 }
 
@@ -672,7 +690,7 @@ func fetchBatchContext(ctx context.Context, cfg *config.Config, f *fetcher.Fetch
 }
 
 // analyzeResultWithPreprocess analyzes a single downloaded JavaScript response.
-func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep javaScriptProcessor, apiSession *apidiscovery.Session, res fetchRes, entryURL, site string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) error {
+func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep javaScriptProcessor, apiSession apiDiscoverySession, res fetchRes, entryURL, site string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) error {
 	item := res.req
 
 	if processed[item.url] {

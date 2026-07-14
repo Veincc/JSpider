@@ -26,6 +26,7 @@ type Session struct {
 	entryURLs        []string
 	sources          map[string][]byte
 	sourceIdentities map[SourceIdentity]struct{}
+	entryStats       map[string]SessionStats
 	sourceStates     map[string]sourceAnalysisState
 	// sourceVersions changes every time AddSource replaces a URL's bytes.
 	// AnalyzeSources uses it to discard stale analysis results if a source is
@@ -37,6 +38,7 @@ func NewSession() *Session {
 	return &Session{
 		sources:          make(map[string][]byte),
 		sourceIdentities: make(map[SourceIdentity]struct{}),
+		entryStats:       make(map[string]SessionStats),
 		sourceStates:     make(map[string]sourceAnalysisState),
 		sourceVersions:   make(map[string]uint64),
 	}
@@ -78,9 +80,17 @@ func (s *Session) AddRuntimeForEntry(entryURL string, requests []RuntimeRequest)
 	}
 	collected := append([]RuntimeRequest(nil), requests...)
 	s.mu.Lock()
+	if s.entryStats == nil {
+		s.entryStats = make(map[string]SessionStats)
+	}
 	for i := range collected {
 		if collected[i].EntryURL == "" {
 			collected[i].EntryURL = entryURL
+		}
+		if isRuntimeAPI(collected[i].ResourceType) && !collected[i].WebSocket && !collected[i].Preflight {
+			stats := s.entryStats[collected[i].EntryURL]
+			stats.Runtime++
+			s.entryStats[collected[i].EntryURL] = stats
 		}
 	}
 	s.runtime = append(s.runtime, collected...)
@@ -105,7 +115,15 @@ func (s *Session) AddSourceWithIdentity(identity SourceIdentity, sourceURL strin
 	if identity.FinalURL == "" {
 		identity.FinalURL = sourceURL
 	}
-	s.sourceIdentities[identity] = struct{}{}
+	if _, exists := s.sourceIdentities[identity]; !exists {
+		s.sourceIdentities[identity] = struct{}{}
+		if s.entryStats == nil {
+			s.entryStats = make(map[string]SessionStats)
+		}
+		stats := s.entryStats[identity.EntryURL]
+		stats.Sources++
+		s.entryStats[identity.EntryURL] = stats
+	}
 	if s.sources == nil {
 		s.sources = make(map[string][]byte)
 	}
@@ -135,18 +153,7 @@ func (s *Session) Stats(entryURL string) SessionStats {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	stats := SessionStats{}
-	for identity := range s.sourceIdentities {
-		if identity.EntryURL == entryURL {
-			stats.Sources++
-		}
-	}
-	for _, request := range s.runtime {
-		if request.EntryURL == entryURL && isRuntimeAPI(request.ResourceType) && !request.WebSocket && !request.Preflight {
-			stats.Runtime++
-		}
-	}
-	return stats
+	return s.entryStats[entryURL]
 }
 
 func (s *Session) SourceCount() int {

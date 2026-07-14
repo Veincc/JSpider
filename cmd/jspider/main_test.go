@@ -302,6 +302,76 @@ func TestRunCanceledContextSkipsEveryUnstartedEntry(t *testing.T) {
 	}
 }
 
+func TestRunCancellationDuringPreflightSkipsEntriesAndReturnsContextOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	originalCheck := checkBrowserAvailable
+	checkBrowserAvailable = func() error {
+		cancel()
+		return nil
+	}
+	t.Cleanup(func() { checkBrowserAvailable = originalCheck })
+	cfg := testConfig("https://example.invalid/", t.TempDir())
+	cfg.Headless = true
+
+	result, err := run(ctx, cfg)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run() error = %v, want context canceled", err)
+	}
+	if got := strings.Count(err.Error(), context.Canceled.Error()); got != 1 {
+		t.Fatalf("context cancellation occurrences = %d in %q, want exactly 1", got, err)
+	}
+	if len(result.Failure) != 0 || len(result.Skipped) != 1 || result.Skipped[0].EntryURL != cfg.URL {
+		t.Fatalf("preflight cancellation result = %+v", result)
+	}
+}
+
+func TestRunPropagatesBrowserCancellationForStartedEntry(t *testing.T) {
+	server := newSiteServer(t, map[string]string{"/": `<html></html>`})
+	defer server.Close()
+	originalCheck, originalDiscover := checkBrowserAvailable, discoverBrowser
+	checkBrowserAvailable = func() error { return nil }
+	t.Cleanup(func() { checkBrowserAvailable, discoverBrowser = originalCheck, originalDiscover })
+
+	for _, test := range []struct {
+		name     string
+		discover func(context.CancelFunc) func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error)
+	}{
+		{
+			name: "browser returns cancellation",
+			discover: func(context.CancelFunc) func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error) {
+				return func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error) {
+					return headless.DiscoveryResult{}, context.Canceled
+				}
+			},
+		},
+		{
+			name: "browser succeeds after context cancellation",
+			discover: func(cancel context.CancelFunc) func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error) {
+				return func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error) {
+					cancel()
+					return headless.DiscoveryResult{}, nil
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			discoverBrowser = test.discover(cancel)
+			cfg := testConfig(server.URL+"/", t.TempDir())
+			cfg.Headless = true
+
+			result, err := run(ctx, cfg)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("run() error = %v, want context canceled", err)
+			}
+			if len(result.Success) != 0 || len(result.Failure) != 1 || !errors.Is(result.Failure[0].Err, context.Canceled) {
+				t.Fatalf("browser cancellation result = %+v", result)
+			}
+		})
+	}
+}
+
 func TestRunCancellationFailsStartedEntryAndSkipsRemaining(t *testing.T) {
 	started := make(chan struct{})
 	var secondHits atomic.Int32

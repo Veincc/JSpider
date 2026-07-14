@@ -13,6 +13,13 @@ func TestSessionStatsAreCheapAndIsolatedPerEntry(t *testing.T) {
 		FinalURL:     "https://cdn.example.com/assets/app.js",
 		ContentHash:  "hash-first",
 	}, "https://cdn.example.com/assets/app.js", []byte(`fetch("/api/first")`))
+	// Re-observing an identical fetch identity must not inflate collection stats.
+	session.AddSourceWithIdentity(SourceIdentity{
+		EntryURL:     firstEntry,
+		RequestedURL: "https://example.com/app.js",
+		FinalURL:     "https://cdn.example.com/assets/app.js",
+		ContentHash:  "hash-first",
+	}, "https://cdn.example.com/assets/app.js", []byte(`fetch("/api/first")`))
 	session.AddSourceWithIdentity(SourceIdentity{
 		EntryURL:     secondEntry,
 		RequestedURL: "https://example.com/app.js",
@@ -23,6 +30,11 @@ func TestSessionStatsAreCheapAndIsolatedPerEntry(t *testing.T) {
 		RequestID: "first", URL: "https://example.com/api/first", ResourceType: "Fetch",
 	}}
 	session.AddRuntimeForEntry(firstEntry, firstRequests)
+	session.AddRuntimeForEntry(firstEntry, []RuntimeRequest{
+		{RequestID: "document", URL: firstEntry, ResourceType: "Document"},
+		{RequestID: "preflight", URL: "https://example.com/api/first", ResourceType: "Fetch", Preflight: true},
+		{RequestID: "websocket", URL: "wss://example.com/socket", ResourceType: "Fetch", WebSocket: true},
+	})
 	if firstRequests[0].EntryURL != "" {
 		t.Fatalf("AddRuntimeForEntry mutated caller request: %+v", firstRequests[0])
 	}

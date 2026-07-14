@@ -43,11 +43,12 @@ func finalizeOutputs(outDir string, sites map[string]*siteRuntime, apiEnabled bo
 			session := site.apiSession
 			if session == nil {
 				siteErrors = append(siteErrors, fmt.Errorf("missing API discovery session for %s", site.directory))
-			} else if err := session.AnalyzeSources(); err != nil {
-				// Call AnalyzeSources exactly once here, after crawl collection is
-				// complete. Capture its error without building a partial report.
-				siteErrors = append(siteErrors, fmt.Errorf("analyze discovered JavaScript APIs for %s: %w", site.directory, err))
 			} else {
+				// Analysis may fail after producing useful partial static results. Build
+				// the report once regardless so independent runtime evidence is retained.
+				if err := session.AnalyzeSources(); err != nil {
+					siteErrors = append(siteErrors, fmt.Errorf("analyze discovered JavaScript APIs for %s: %w", site.directory, err))
+				}
 				report := session.Report()
 				logAPIReport(log, site.directory, report)
 				urls := apidiscovery.EndpointURLs(report, site.entryURLs)
