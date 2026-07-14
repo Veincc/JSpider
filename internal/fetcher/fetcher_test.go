@@ -321,22 +321,58 @@ func TestFetchJS_RejectsJSONWhoseParameterMentionsJavaScript(t *testing.T) {
 	}
 }
 
-func TestFetchJSWithoutContentTypeRejectsHTMLAndJSONContainingJSSyntax(t *testing.T) {
+func TestFetchJSWithoutContentTypeAcceptsStaticESM(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
 	}{
-		{name: "HTML", body: `<!doctype html><script>const value = true;</script>`},
-		{name: "JSON", body: `{"source":"const value = true;"}`},
+		{name: "static import", body: `import "./dep.js";`},
+		{name: "compact re-export", body: `export{value}from"./dep.js";`},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := validateJSResult(&Result{
-				RequestedURL: "https://example.com/app.js",
-				StatusCode:   http.StatusOK,
-				Body:         []byte(tt.body),
-			}, "https://example.com/app.js")
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header()["Content-Type"] = nil
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer ts.Close()
+
+			result := newTestFetcher(t, ts).FetchJS(ts.URL + "/module")
+			if result.ContentType != "" {
+				t.Fatalf("response Content-Type = %q, want absent", result.ContentType)
+			}
+			if result.Err != nil || !result.IsJS {
+				t.Fatalf("FetchJS() rejected static ESM without Content-Type: %+v", result)
+			}
+		})
+	}
+}
+
+func TestFetchJSWithoutContentTypeRejectsHTMLJSONAndBinary(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "HTML", body: []byte(`<!doctype html><script>const value = true;</script>`)},
+		{name: "JSON", body: []byte(`{"source":"const value = true;"}`)},
+		{name: "binary", body: append([]byte("\x89PNG\r\n\x1a\n"), []byte("const value = true;")...)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header()["Content-Type"] = nil
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(tt.body)
+			}))
+			defer ts.Close()
+
+			result := newTestFetcher(t, ts).FetchJS(ts.URL + "/app.js")
+			if result.ContentType != "" {
+				t.Fatalf("response Content-Type = %q, want absent", result.ContentType)
+			}
 			if result.Err == nil {
 				t.Fatalf("FetchJS fallback accepted %s without Content-Type", tt.name)
 			}

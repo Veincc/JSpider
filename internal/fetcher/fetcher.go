@@ -372,6 +372,15 @@ func looksLikeJS(data []byte) bool {
 	if json.Valid(trimmed) || hasKnownBinaryMagic(trimmed) {
 		return false
 	}
+	program, err := js.Parse(parse.NewInputBytes(trimmed), js.Options{})
+	if err != nil {
+		return false
+	}
+	moduleEvidence := &moduleSyntaxEvidenceVisitor{}
+	js.Walk(moduleEvidence, program)
+	if moduleEvidence.found {
+		return true
+	}
 
 	indicators := []string{
 		"__webpack_require__", "__vite__", "import(", "export ",
@@ -388,10 +397,22 @@ func looksLikeJS(data []byte) bool {
 	if !hasIndicator {
 		return false
 	}
-
-	_, err := js.Parse(parse.NewInputBytes(trimmed), js.Options{})
-	return err == nil
+	return true
 }
+
+type moduleSyntaxEvidenceVisitor struct {
+	found bool
+}
+
+func (v *moduleSyntaxEvidenceVisitor) Enter(n js.INode) js.IVisitor {
+	switch n.(type) {
+	case *js.ImportStmt, *js.ExportStmt:
+		v.found = true
+	}
+	return v
+}
+
+func (v *moduleSyntaxEvidenceVisitor) Exit(js.INode) {}
 
 func hasKnownBinaryMagic(data []byte) bool {
 	return bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) ||

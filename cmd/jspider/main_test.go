@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
 	"github.com/Veincc/JSpider/internal/config"
@@ -211,6 +212,66 @@ func TestMaxJSOnePerformsOneAttemptEvenWhenItFails(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&scriptAttempts); got != 1 {
 		t.Fatalf("JavaScript fetch attempts = %d, want exactly 1", got)
+	}
+}
+
+func TestTightBudgetChildMembershipDoesNotDependOnParentCompletionOrder(t *testing.T) {
+	crawl := func(t *testing.T, delayedParent string) string {
+		t.Helper()
+		var childAHits, childBHits int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/":
+				w.Header().Set("Content-Type", "text/html")
+				_, _ = w.Write([]byte(`<script src="/parent-a.js"></script><script src="/parent-b.js"></script>`))
+			case "/parent-a.js":
+				if delayedParent == r.URL.Path {
+					time.Sleep(100 * time.Millisecond)
+				}
+				w.Header().Set("Content-Type", "application/javascript")
+				_, _ = w.Write([]byte(`import("./child-a.js");`))
+			case "/parent-b.js":
+				if delayedParent == r.URL.Path {
+					time.Sleep(100 * time.Millisecond)
+				}
+				w.Header().Set("Content-Type", "application/javascript")
+				_, _ = w.Write([]byte(`import("./child-b.js");`))
+			case "/child-a.js":
+				atomic.AddInt32(&childAHits, 1)
+				w.Header().Set("Content-Type", "application/javascript")
+				_, _ = w.Write([]byte(`export const child = "a";`))
+			case "/child-b.js":
+				atomic.AddInt32(&childBHits, 1)
+				w.Header().Set("Content-Type", "application/javascript")
+				_, _ = w.Write([]byte(`export const child = "b";`))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		cfg := testConfig(server.URL+"/", t.TempDir())
+		cfg.MaxJS = 3
+		cfg.Workers = 2
+		if err := run(cfg); err != nil {
+			t.Fatalf("run() error = %v", err)
+		}
+
+		switch {
+		case childAHits == 1 && childBHits == 0:
+			return "a"
+		case childAHits == 0 && childBHits == 1:
+			return "b"
+		default:
+			t.Fatalf("child hits = (a=%d, b=%d), want exactly one child", childAHits, childBHits)
+			return ""
+		}
+	}
+
+	whenAIsSlow := crawl(t, "/parent-a.js")
+	whenBIsSlow := crawl(t, "/parent-b.js")
+	if whenAIsSlow != whenBIsSlow {
+		t.Fatalf("selected child changed with completion order: slow A selected %q, slow B selected %q", whenAIsSlow, whenBIsSlow)
 	}
 }
 
@@ -667,6 +728,36 @@ func TestFetchBatchResultCapacityUsesConfiguredWorkersForSmallBatch(t *testing.T
 		t.Errorf("small-batch result capacity = %d, want configured workers %d", got, cfg.Workers)
 	}
 	for range results {
+	}
+}
+
+func TestFetchBatchEmitsOriginalRequestOrder(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/first.js" {
+			time.Sleep(100 * time.Millisecond)
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = w.Write([]byte(`const ok = true;`))
+	}))
+	defer server.Close()
+
+	cfg := testConfig(server.URL+"/", t.TempDir())
+	cfg.Workers = 2
+	log := logging.New(false, cfg.OutDir)
+	defer log.Close()
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	queue := []fetchReq{{url: server.URL + "/first.js"}, {url: server.URL + "/second.js"}}
+	var got []string
+	for result := range fetchBatch(cfg, f, log, queue, server.URL+"/") {
+		got = append(got, result.req.url)
+	}
+	want := []string{queue[0].url, queue[1].url}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("result order = %v, want request order %v", got, want)
 	}
 }
 

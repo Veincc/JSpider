@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -29,8 +30,14 @@ type fetchReq struct {
 
 // fetchRes represents a download result
 type fetchRes struct {
-	req    fetchReq
-	result *fetcher.Result
+	ordinal int
+	req     fetchReq
+	result  *fetcher.Result
+}
+
+type fetchTask struct {
+	ordinal int
+	req     fetchReq
 }
 
 type crawlState struct {
@@ -287,6 +294,15 @@ func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *ana
 		}
 		log.Info("Merged: %d unique JS assets", len(entryAssets))
 	}
+	sort.SliceStable(entryAssets, func(i, j int) bool {
+		if entryAssets[i].URL != entryAssets[j].URL {
+			return entryAssets[i].URL < entryAssets[j].URL
+		}
+		if entryAssets[i].Source != entryAssets[j].Source {
+			return entryAssets[i].Source < entryAssets[j].Source
+		}
+		return entryAssets[i].Type < entryAssets[j].Type
+	})
 
 	// Add entry JS assets to store
 	for i := range entryAssets {
@@ -364,11 +380,12 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 		workers = 1
 	}
 	results := make(chan fetchRes, workers)
+	completed := make(chan fetchRes, workers)
 
 	var wg sync.WaitGroup
-	reqCh := make(chan fetchReq, len(queue))
-	for _, req := range queue {
-		reqCh <- req
+	reqCh := make(chan fetchTask, len(queue))
+	for ordinal, req := range queue {
+		reqCh <- fetchTask{ordinal: ordinal, req: req}
 	}
 	close(reqCh)
 
@@ -376,15 +393,30 @@ func fetchBatch(cfg *config.Config, f *fetcher.Fetcher, log *logging.Logger, que
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for req := range reqCh {
-				log.Verbose("Downloading: %s (depth=%d)", req.url, req.depth)
-				results <- fetchRes{req: req, result: f.FetchJSForEntry(req.url, entryURL)}
+			for task := range reqCh {
+				log.Verbose("Downloading: %s (depth=%d)", task.req.url, task.req.depth)
+				completed <- fetchRes{
+					ordinal: task.ordinal,
+					req:     task.req,
+					result:  f.FetchJSForEntry(task.req.url, entryURL),
+				}
 			}
 		}()
 	}
 
 	go func() {
 		wg.Wait()
+		close(completed)
+	}()
+
+	go func() {
+		ordered := make([]fetchRes, len(queue))
+		for result := range completed {
+			ordered[result.ordinal] = result
+		}
+		for _, result := range ordered {
+			results <- result
+		}
 		close(results)
 	}()
 
