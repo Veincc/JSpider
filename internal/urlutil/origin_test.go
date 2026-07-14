@@ -71,6 +71,16 @@ func TestOriginDirectoryNamesDefaultAndNonDefaultPorts(t *testing.T) {
 	}
 }
 
+func TestOriginDirectoryNamesPreservesLegacyHostnameHyphens(t *testing.T) {
+	names, err := OriginDirectoryNames([]string{"https://api-v2.example.com/path"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names["https://api-v2.example.com"]; got != "api-v2_example_com" {
+		t.Fatalf("directory = %q, want %q", got, "api-v2_example_com")
+	}
+}
+
 func TestOriginDirectoryNamesHashesEveryHTTPHTTPSCollision(t *testing.T) {
 	raw := []string{"http://example.com/a", "https://example.com/b"}
 	names, err := OriginDirectoryNames(raw)
@@ -86,16 +96,52 @@ func TestOriginDirectoryNamesHashesEveryHTTPHTTPSCollision(t *testing.T) {
 }
 
 func TestOriginDirectoryNamesHashesEverySanitizedHostCollision(t *testing.T) {
-	raw := []string{"https://a-b.example/one", "https://a.b.example/two"}
+	raw := []string{"https://a.b/one", "https://a_b/two"}
 	names, err := OriginDirectoryNames(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, origin := range []string{"https://a-b.example", "https://a.b.example"} {
-		want := "a_b_example_" + originHash8(origin)
+	for _, origin := range []string{"https://a.b", "https://a_b"} {
+		want := "a_b_" + originHash8(origin)
 		if names[origin] != want {
 			t.Fatalf("directory for %s = %q, want %q", origin, names[origin], want)
 		}
+	}
+}
+
+func TestOriginDirectoryNamesResolvesSecondaryCollisionsDeterministically(t *testing.T) {
+	firstOrigin := "https://a.b"
+	secondOrigin := "https://a_b"
+	shadowOrigin := "https://a.b_" + originHash8(firstOrigin)
+	forward := []string{firstOrigin + "/one", secondOrigin + "/two", shadowOrigin + "/three"}
+	reverse := []string{forward[2], forward[1], forward[0]}
+
+	first, err := OriginDirectoryNames(forward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OriginDirectoryNames(reverse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("secondary collision result depends on input order: %#v vs %#v", first, second)
+	}
+
+	want := map[string]string{
+		firstOrigin:  "a_b_" + originHash8(firstOrigin),
+		secondOrigin: "a_b_" + originHash8(secondOrigin),
+		shadowOrigin: "a_b_" + originHash8(firstOrigin) + "_" + originHash8(shadowOrigin),
+	}
+	if !reflect.DeepEqual(first, want) {
+		t.Fatalf("secondary collision names = %#v, want %#v", first, want)
+	}
+	seen := make(map[string]string)
+	for origin, name := range first {
+		if previous := seen[name]; previous != "" {
+			t.Fatalf("origins %s and %s share directory %q", previous, origin, name)
+		}
+		seen[name] = origin
 	}
 }
 

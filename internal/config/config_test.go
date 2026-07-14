@@ -209,6 +209,22 @@ func TestParseProcessAndHeadlessBodyOverrides(t *testing.T) {
 	}
 }
 
+func TestDepthFlagDocumentsZeroAsNoRecursion(t *testing.T) {
+	originalFlags, originalArgs := flag.CommandLine, os.Args
+	flag.CommandLine = flag.NewFlagSet("jspider-test", flag.ContinueOnError)
+	os.Args = []string{"jspider", "-u", "https://example.com"}
+	t.Cleanup(func() {
+		flag.CommandLine = originalFlags
+		os.Args = originalArgs
+	})
+
+	_ = Parse()
+	depthFlag := flag.Lookup("d")
+	if depthFlag == nil || !strings.Contains(depthFlag.Usage, "0=no recursion") {
+		t.Fatalf("-d usage = %v, want 0=no recursion", depthFlag)
+	}
+}
+
 func TestValidateRejectsImpossibleValues(t *testing.T) {
 	valid := Config{
 		URL:                   "https://example.com",

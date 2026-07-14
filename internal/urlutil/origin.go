@@ -5,10 +5,19 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
 	"golang.org/x/net/idna"
+)
+
+var originIDNA = idna.New(
+	idna.MapForLookup(),
+	idna.BidiRule(),
+	idna.CheckHyphens(true),
+	idna.CheckJoiners(true),
+	idna.StrictDomainName(false),
 )
 
 // CanonicalOrigin returns the normalized HTTP(S) origin for rawURL.
@@ -40,11 +49,14 @@ func CanonicalOrigin(rawURL string) (string, error) {
 		if isIPv6 {
 			return "", fmt.Errorf("invalid IPv6 hostname %q", host)
 		}
-		host, err = idna.Lookup.ToASCII(host)
+		host, err = originIDNA.ToASCII(host)
 		if err != nil {
 			return "", fmt.Errorf("invalid IDNA hostname %q: %w", parsed.Hostname(), err)
 		}
 		host = strings.ToLower(host)
+		if !isSupportedASCIIHostname(host) {
+			return "", fmt.Errorf("invalid hostname %q", parsed.Hostname())
+		}
 	}
 
 	port := parsed.Port()
@@ -94,15 +106,59 @@ func OriginDirectoryNames(rawURLs []string) (map[string]string, error) {
 		baseCounts[base]++
 	}
 
-	names := make(map[string]string, len(bases))
+	origins := make([]string, 0, len(bases))
+	hashed := make(map[string]bool, len(bases))
 	for origin, base := range bases {
-		if baseCounts[base] > 1 {
-			sum := sha256.Sum256([]byte(origin))
-			base = fmt.Sprintf("%s_%x", base, sum[:4])
-		}
-		names[origin] = base
+		origins = append(origins, origin)
+		hashed[origin] = baseCounts[base] > 1
 	}
-	return names, nil
+	sort.Strings(origins)
+
+	for {
+		names := make(map[string]string, len(origins))
+		originsByName := make(map[string][]string, len(origins))
+		for _, origin := range origins {
+			name := bases[origin]
+			if hashed[origin] {
+				name = hashedOriginDirectory(name, origin)
+			}
+			names[origin] = name
+			originsByName[name] = append(originsByName[name], origin)
+		}
+
+		finalNames := make([]string, 0, len(originsByName))
+		for name := range originsByName {
+			finalNames = append(finalNames, name)
+		}
+		sort.Strings(finalNames)
+
+		collisionFound := false
+		for _, name := range finalNames {
+			collidingOrigins := originsByName[name]
+			if len(collidingOrigins) < 2 {
+				continue
+			}
+			collisionFound = true
+			canResolve := false
+			for _, origin := range collidingOrigins {
+				if !hashed[origin] {
+					hashed[origin] = true
+					canResolve = true
+				}
+			}
+			if !canResolve {
+				return nil, fmt.Errorf("canonical origins %s still collide on directory %q after hashing", strings.Join(collidingOrigins, ", "), name)
+			}
+		}
+		if !collisionFound {
+			return names, nil
+		}
+	}
+}
+
+func hashedOriginDirectory(base, origin string) string {
+	sum := sha256.Sum256([]byte(origin))
+	return fmt.Sprintf("%s_%x", base, sum[:4])
 }
 
 func originDirectoryBase(origin string) (string, error) {
@@ -128,9 +184,24 @@ func sanitizeOriginHost(host string) string {
 			result.WriteRune(r)
 		case r >= '0' && r <= '9':
 			result.WriteRune(r)
+		case r == '-' || r == '_':
+			result.WriteRune(r)
 		default:
 			result.WriteByte('_')
 		}
 	}
 	return strings.Trim(result.String(), "_")
+}
+
+func isSupportedASCIIHostname(host string) bool {
+	for _, r := range host {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
