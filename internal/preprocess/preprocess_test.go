@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -286,6 +287,110 @@ func TestInlineAndIndexedSourceMaps(t *testing.T) {
 	assertMissing(t, filepath.Join(siteDir, "audit"))
 }
 
+func TestIndexedSourceMapAcceptsOrderedNonNegativeIntegerOffsets(t *testing.T) {
+	if err := CheckNodeRuntime(); err != nil {
+		t.Skip(err)
+	}
+
+	p := newTestProcessor(t, t.TempDir(), func(string) ([]byte, error) {
+		return []byte(`{
+			"version":3,
+			"sections":[
+				{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/first.ts"],"sourcesContent":["export const first = true;"]}},
+				{"offset":{"line":10,"column":0},"map":{"version":3,"sources":["src/second.ts"],"sourcesContent":["export const second = true;"]}}
+			]
+		}`), nil
+	})
+	result := p.Process(
+		"https://example.com/",
+		"https://example.com/app.js",
+		[]byte("bundle\n//# sourceMappingURL=app.js.map"),
+	)
+	if result.Failed || result.Status != "sourcemap" || len(result.Analysis) != 2 {
+		t.Fatalf("Process() = %+v", result)
+	}
+	if result.Analysis[0].SourceName != "src/first.ts" || result.Analysis[1].SourceName != "src/second.ts" {
+		t.Fatalf("analysis = %#v", result.Analysis)
+	}
+}
+
+func TestInvalidIndexedOffsetsFallBackButPersistRecoveredSources(t *testing.T) {
+	if err := CheckNodeRuntime(); err != nil {
+		t.Skip(err)
+	}
+
+	tests := []struct {
+		name     string
+		sections string
+	}{
+		{
+			name: "missing offset",
+			sections: `
+				{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/first.ts"],"sourcesContent":["export const first = true;"]}},
+				{"map":{"version":3,"sources":["src/second.ts"],"sourcesContent":["export const second = true;"]}}`,
+		},
+		{
+			name: "negative offset",
+			sections: `
+				{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/first.ts"],"sourcesContent":["export const first = true;"]}},
+				{"offset":{"line":-1,"column":0},"map":{"version":3,"sources":["src/second.ts"],"sourcesContent":["export const second = true;"]}}`,
+		},
+		{
+			name: "fractional offset",
+			sections: `
+				{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/first.ts"],"sourcesContent":["export const first = true;"]}},
+				{"offset":{"line":10,"column":0.5},"map":{"version":3,"sources":["src/second.ts"],"sourcesContent":["export const second = true;"]}}`,
+		},
+		{
+			name: "non-monotonic offset",
+			sections: `
+				{"offset":{"line":10,"column":0},"map":{"version":3,"sources":["src/first.ts"],"sourcesContent":["export const first = true;"]}},
+				{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/second.ts"],"sourcesContent":["export const second = true;"]}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			siteDir := t.TempDir()
+			p := newTestProcessor(t, siteDir, func(string) ([]byte, error) {
+				return []byte(`{"version":3,"sections":[` + test.sections + `]}`), nil
+			})
+			body := []byte("const original = true;\n//# sourceMappingURL=app.js.map")
+			result := p.Process("https://example.com/", "https://example.com/app.js", body)
+			assertOriginalAnalysis(t, result, "https://example.com/app.js", body)
+			if len(result.Outputs) != 2 {
+				t.Fatalf("persisted outputs = %v, want both usable recovered files", result.Outputs)
+			}
+			assertOutputFile(t, siteDir, "js/src/first.ts")
+			assertOutputFile(t, siteDir, "js/src/second.ts")
+		})
+	}
+}
+
+func TestIndexedSectionRequiresExactlyOneMapOrURL(t *testing.T) {
+	if err := CheckNodeRuntime(); err != nil {
+		t.Skip(err)
+	}
+
+	for _, invalidSection := range []string{
+		`{"offset":{"line":10,"column":0}}`,
+		`{"offset":{"line":10,"column":0},"map":{"version":3,"sources":["src/ignored.ts"],"sourcesContent":["ignored"]},"url":"ignored.map"}`,
+	} {
+		siteDir := t.TempDir()
+		p := newTestProcessor(t, siteDir, func(string) ([]byte, error) {
+			return []byte(`{"version":3,"sections":[
+				{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/available.ts"],"sourcesContent":["export const available = true;"]}},
+				` + invalidSection + `
+			]}`), nil
+		})
+		body := []byte("const original = true;\n//# sourceMappingURL=app.js.map")
+		result := p.Process("https://example.com/", "https://example.com/app.js", body)
+		assertOriginalAnalysis(t, result, "https://example.com/app.js", body)
+		if len(result.Outputs) != 1 || readOutputFile(t, siteDir, result.Outputs[0]) != "export const available = true;" {
+			t.Fatalf("invalid exclusive section outputs = %v", result.Outputs)
+		}
+	}
+}
+
 func TestIndexedSourceMapResolvesSectionURLsRelativeToEachParent(t *testing.T) {
 	if err := CheckNodeRuntime(); err != nil {
 		t.Skip(err)
@@ -295,13 +400,13 @@ func TestIndexedSourceMapResolvesSectionURLsRelativeToEachParent(t *testing.T) {
 		"https://example.com/maps/root.map": []byte(`{
 			"version":3,
 			"sections":[
-				{"map":{"version":3,"sources":["src/embedded.ts"],"sourcesContent":["export const embedded = true;"]}},
-				{"url":"chunks/child.map"}
+				{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/embedded.ts"],"sourcesContent":["export const embedded = true;"]}},
+				{"offset":{"line":10,"column":0},"url":"chunks/child.map"}
 			]
 		}`),
 		"https://example.com/maps/chunks/child.map": []byte(`{
 			"version":3,
-			"sections":[{"url":"grandchild.map"}]
+			"sections":[{"offset":{"line":0,"column":0},"url":"grandchild.map"}]
 		}`),
 		"https://example.com/maps/chunks/grandchild.map": []byte(`{
 			"version":3,
@@ -338,8 +443,8 @@ func TestIndexedSourceMapUnresolvedSectionFallsBackButPersistsRecoveredSources(t
 	root := []byte(`{
 		"version":3,
 		"sections":[
-			{"map":{"version":3,"sources":["src/available.ts"],"sourcesContent":["export const available = true;"]}},
-			{"url":"missing.map"}
+			{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/available.ts"],"sourcesContent":["export const available = true;"]}},
+			{"offset":{"line":10,"column":0},"url":"missing.map"}
 		]
 	}`)
 	siteDir := t.TempDir()
@@ -370,13 +475,13 @@ func TestInvalidIndexedSectionFallsBackButPersistsRecoveredSources(t *testing.T)
 		{
 			name: "embedded empty object",
 			root: `{"version":3,"sections":[
-				{"map":{"version":3,"sources":["src/available.ts"],"sourcesContent":["export const available = true;"]}},
-				{"map":{}}
+				{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/available.ts"],"sourcesContent":["export const available = true;"]}},
+				{"offset":{"line":10,"column":0},"map":{}}
 			]}`,
 		},
 		{
 			name:  "section URL null",
-			root:  `{"version":3,"sections":[{"map":{"version":3,"sources":["src/available.ts"],"sourcesContent":["export const available = true;"]}},{"url":"child.map"}]}`,
+			root:  `{"version":3,"sections":[{"offset":{"line":0,"column":0},"map":{"version":3,"sources":["src/available.ts"],"sourcesContent":["export const available = true;"]}},{"offset":{"line":10,"column":0},"url":"child.map"}]}`,
 			child: []byte(`null`),
 		},
 	}
@@ -409,13 +514,13 @@ func TestIndexedSourceMapDepthCapFallsBackButKeepsShallowerSources(t *testing.T)
 
 	leaf := `{"version":3,"sources":["src/too-deep.ts"],"sourcesContent":["too deep"]}`
 	for i := 0; i < 5; i++ {
-		leaf = `{"version":3,"sections":[{"map":` + leaf + `}]}`
+		leaf = `{"version":3,"sections":[{"offset":{"line":0,"column":0},"map":` + leaf + `}]}`
 	}
 	root := `{
 		"version":3,
 		"sources":["src/shallow.ts"],
 		"sourcesContent":["export const shallow = true;"],
-		"sections":[{"map":` + leaf + `}]
+		"sections":[{"offset":{"line":0,"column":0},"map":` + leaf + `}]
 	}`
 	siteDir := t.TempDir()
 	p := newTestProcessor(t, siteDir, func(string) ([]byte, error) { return []byte(root), nil })
@@ -436,7 +541,7 @@ func TestIndexedSourceMapCycleFallsBackButPersistsRecoveredSources(t *testing.T)
 		"version":3,
 		"sources":["src/available.ts"],
 		"sourcesContent":["export const available = true;"],
-		"sections":[{"url":"root.map"}]
+		"sections":[{"offset":{"line":0,"column":0},"url":"root.map"}]
 	}`)
 	siteDir := t.TempDir()
 	fetches := 0
@@ -806,6 +911,77 @@ func TestSourcePathCollisionPreservesBothContents(t *testing.T) {
 	}
 	if got := readOutputFile(t, siteDir, second.Outputs[0]); got != "export const value = 2;" {
 		t.Fatalf("second collision output = %q", got)
+	}
+}
+
+func TestRecoveredWriteFailureReportsPriorOutputsAndFallback(t *testing.T) {
+	if err := CheckNodeRuntime(); err != nil {
+		t.Skip(err)
+	}
+
+	siteDir := t.TempDir()
+	p := newTestProcessor(t, siteDir, func(string) ([]byte, error) {
+		return []byte(`{
+			"version":3,
+			"sources":["src/first.js","blocked/second.js"],
+			"sourcesContent":["export const first = true;","export const second = true;"]
+		}`), nil
+	})
+	blocker := filepath.Join(siteDir, "js", "blocked")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte("const original = true;\n//# sourceMappingURL=app.js.map")
+	result := p.Process("https://example.com/", "https://example.com/app.js", body)
+	if !result.Failed || result.Status != "failed" {
+		t.Fatalf("Process() = %+v", result)
+	}
+	assertOriginalAnalysis(t, result, "https://example.com/app.js", body)
+	if !contains(result.Outputs, "js/src/first.js") {
+		t.Fatalf("outputs hide successfully persisted recovered source: %v", result.Outputs)
+	}
+	if len(result.Outputs) != 2 {
+		t.Fatalf("outputs = %v, want recovered source and original fallback", result.Outputs)
+	}
+
+	diskOutputs := make([]string, 0, 2)
+	err := filepath.WalkDir(filepath.Join(siteDir, "js"), func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || path == blocker {
+			return nil
+		}
+		rel, err := filepath.Rel(siteDir, path)
+		if err != nil {
+			return err
+		}
+		diskOutputs = append(diskOutputs, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(diskOutputs)
+	returnedOutputs := append([]string(nil), result.Outputs...)
+	sort.Strings(returnedOutputs)
+	if !reflect.DeepEqual(returnedOutputs, diskOutputs) {
+		t.Fatalf("returned outputs = %v, files on disk = %v", returnedOutputs, diskOutputs)
+	}
+
+	fallbackFound := false
+	for _, rel := range result.Outputs {
+		content := readOutputFile(t, siteDir, rel)
+		if rel != "js/src/first.js" && content == string(body) {
+			fallbackFound = true
+		}
+	}
+	if !fallbackFound {
+		t.Fatalf("outputs do not identify original fallback: %v", result.Outputs)
+	}
+	if _, err := os.Stat(filepath.Join(siteDir, "js", "blocked", "second.js")); err == nil {
+		t.Fatal("failed recovered source unexpectedly exists beneath blocker")
 	}
 }
 

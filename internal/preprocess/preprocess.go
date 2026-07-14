@@ -141,6 +141,11 @@ type sourceMapCollection struct {
 	Complete bool
 }
 
+type sourceMapOffset struct {
+	Line   int
+	Column int
+}
+
 type sourceMapResolver struct {
 	p        *Processor
 	entryURL string
@@ -260,7 +265,7 @@ func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
 		for _, source := range recovery.Files {
 			rel, err := p.writeSource(source.OutputPath, []byte(source.Content))
 			if err != nil {
-				return p.recordFailure(jsURL, body, fmt.Sprintf("write recovered source: %v", err))
+				return p.recordFailureWithOutputs(jsURL, body, fmt.Sprintf("write recovered source: %v", err), outputs)
 			}
 			if !contains(outputs, rel) {
 				outputs = append(outputs, rel)
@@ -464,8 +469,9 @@ func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, 
 		}
 	}
 	var sections []struct {
-		Map json.RawMessage `json:"map"`
-		URL string          `json:"url"`
+		Offset json.RawMessage `json:"offset"`
+		Map    json.RawMessage `json:"map"`
+		URL    string          `json:"url"`
 	}
 	hasSections := len(envelope.Sections) > 0 && !bytes.Equal(bytes.TrimSpace(envelope.Sections), []byte("null"))
 	if hasSections {
@@ -486,8 +492,20 @@ func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, 
 		}
 		collection.Files = append(collection.Files, file)
 	}
+	var previousOffset *sourceMapOffset
 	for _, section := range sections {
-		hasMap := len(section.Map) > 0 && string(section.Map) != "null"
+		offset, validOffset := parseSourceMapOffset(section.Offset)
+		if !validOffset {
+			collection.Complete = false
+		} else {
+			if previousOffset != nil && sourceMapOffsetLess(offset, *previousOffset) {
+				collection.Complete = false
+			}
+			previousOffset = &offset
+		}
+
+		trimmedMap := bytes.TrimSpace(section.Map)
+		hasMap := len(trimmedMap) > 0 && !bytes.Equal(trimmedMap, []byte("null"))
 		hasURL := strings.TrimSpace(section.URL) != ""
 		if hasMap == hasURL {
 			collection.Complete = false
@@ -504,6 +522,28 @@ func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, 
 		collection.Complete = collection.Complete && nested.Complete
 	}
 	return collection
+}
+
+func parseSourceMapOffset(raw json.RawMessage) (sourceMapOffset, bool) {
+	var wire struct {
+		Line   json.RawMessage `json:"line"`
+		Column json.RawMessage `json:"column"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &wire) != nil {
+		return sourceMapOffset{}, false
+	}
+	var offset sourceMapOffset
+	if len(wire.Line) == 0 || len(wire.Column) == 0 ||
+		json.Unmarshal(wire.Line, &offset.Line) != nil ||
+		json.Unmarshal(wire.Column, &offset.Column) != nil ||
+		offset.Line < 0 || offset.Column < 0 {
+		return sourceMapOffset{}, false
+	}
+	return offset, true
+}
+
+func sourceMapOffsetLess(left, right sourceMapOffset) bool {
+	return left.Line < right.Line || (left.Line == right.Line && left.Column < right.Column)
 }
 
 func (r sourceMapResolver) collectURLSection(reference, parentMapURL string, depth int, active map[string]bool) sourceMapCollection {
@@ -632,15 +672,20 @@ func (p *Processor) writeContent(preferredRel string, data []byte) (string, erro
 }
 
 func (p *Processor) recordFailure(jsURL string, body []byte, errText string) FileResult {
+	return p.recordFailureWithOutputs(jsURL, body, errText, nil)
+}
+
+func (p *Processor) recordFailureWithOutputs(jsURL string, body []byte, errText string, existingOutputs []string) FileResult {
+	outputs := append([]string(nil), existingOutputs...)
 	rel, writeErr := p.writeGenerated(jsURL, ".js", body)
 	if writeErr != nil {
 		errText += fmt.Sprintf("; write fallback file: %v", writeErr)
 		rel = ""
 	}
-	outputs := make([]string, 0, 1)
-	if rel != "" {
+	if rel != "" && !contains(outputs, rel) {
 		outputs = append(outputs, rel)
 	}
+	sort.Strings(outputs)
 	return FileResult{
 		Analysis: originalAnalysis(jsURL, body),
 		Status:   "failed",
