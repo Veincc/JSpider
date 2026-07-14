@@ -296,6 +296,7 @@ func TestURLsReturnsHTTPParseErrors(t *testing.T) {
 		"http://",
 		"https://example.com:invalid",
 		"https://\u200d.example",
+		"https://\u00ad",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			cfg := &Config{URL: raw}

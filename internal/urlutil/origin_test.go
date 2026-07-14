@@ -52,6 +52,12 @@ func TestCanonicalOriginRejectsInvalidAuthorities(t *testing.T) {
 	}
 }
 
+func TestCanonicalOriginRejectsHostnameRemovedByIDNA(t *testing.T) {
+	if _, err := CanonicalOrigin("https://\u00ad"); err == nil {
+		t.Fatal("CanonicalOrigin() accepted a hostname removed entirely by IDNA mapping")
+	}
+}
+
 func TestOriginDirectoryNamesDefaultAndNonDefaultPorts(t *testing.T) {
 	names, err := OriginDirectoryNames([]string{
 		"https://example.com:443/one",
@@ -78,6 +84,44 @@ func TestOriginDirectoryNamesPreservesLegacyHostnameHyphens(t *testing.T) {
 	}
 	if got := names["https://api-v2.example.com"]; got != "api-v2_example_com" {
 		t.Fatalf("directory = %q, want %q", got, "api-v2_example_com")
+	}
+}
+
+func TestOriginDirectoryNamesPreservesLegacyEdgeUnderscores(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawURL string
+		origin string
+		want   string
+	}{
+		{name: "trailing dot", rawURL: "https://example.com./path", origin: "https://example.com.", want: "example_com_"},
+		{name: "leading underscore", rawURL: "https://_service.example.com/path", origin: "https://_service.example.com", want: "_service_example_com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			names, err := OriginDirectoryNames([]string{tt.rawURL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := names[tt.origin]; got != tt.want {
+				t.Fatalf("directory = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOriginDirectoryNamesDoesNotInventTrailingDotCollision(t *testing.T) {
+	names, err := OriginDirectoryNames([]string{"https://example.com./one", "https://example.com/two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"https://example.com.": "example_com_",
+		"https://example.com":  "example_com",
+	}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("directory names = %#v, want %#v", names, want)
 	}
 }
 

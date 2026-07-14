@@ -54,6 +54,9 @@ func CanonicalOrigin(rawURL string) (string, error) {
 			return "", fmt.Errorf("invalid IDNA hostname %q: %w", parsed.Hostname(), err)
 		}
 		host = strings.ToLower(host)
+		if host == "" {
+			return "", fmt.Errorf("IDNA hostname %q maps to an empty hostname", parsed.Hostname())
+		}
 		if !isSupportedASCIIHostname(host) {
 			return "", fmt.Errorf("invalid hostname %q", parsed.Hostname())
 		}
@@ -190,7 +193,7 @@ func sanitizeOriginHost(host string) string {
 			result.WriteByte('_')
 		}
 	}
-	return strings.Trim(result.String(), "_")
+	return result.String()
 }
 
 func isSupportedASCIIHostname(host string) bool {
