@@ -1583,6 +1583,7 @@ func TestBuildHeadlessConfigIncludesNetworkOptions(t *testing.T) {
 		UserAgent:          "JSpider-Test-UA",
 		Cookies:            "session=test",
 		Headers:            map[string]string{"X-Test": "yes"},
+		HeadlessBodyMB:     12,
 	}
 
 	got := buildHeadlessConfig(cfg, "https://example.com")
@@ -1600,6 +1601,9 @@ func TestBuildHeadlessConfigIncludesNetworkOptions(t *testing.T) {
 	}
 	if got.UserAgent != cfg.UserAgent || got.Cookies != cfg.Cookies || got.Headers["X-Test"] != "yes" {
 		t.Fatalf("browser request config = %+v", got)
+	}
+	if got.HeadlessBodyMB != cfg.HeadlessBodyMB {
+		t.Fatalf("HeadlessBodyMB = %d, want %d", got.HeadlessBodyMB, cfg.HeadlessBodyMB)
 	}
 }
 

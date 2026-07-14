@@ -18,7 +18,8 @@ import (
 type trackedRuntimeRequest struct {
 	request    apidiscovery.RuntimeRequest
 	requestURL string
-	body       []byte
+	order      uint64
+	startedAt  time.Time
 }
 
 type runtimeCapture struct {
@@ -39,7 +40,10 @@ type runtimeCapture struct {
 	activity        chan struct{}
 	postDataPending int
 	postDataIdle    chan struct{}
+	nextOrder       uint64
 }
+
+const networkQuietRequestMaxAge = 5 * time.Second
 
 func newRuntimeCapture(entryURL string) *runtimeCapture {
 	return &runtimeCapture{
@@ -113,9 +117,17 @@ func (c *runtimeCapture) handleRequest(event *network.EventRequestWillBeSent) bo
 		RedirectFrom:  redirectFrom,
 		Preflight:     strings.EqualFold(event.Request.Method, "OPTIONS"),
 	}
-	tracked := &trackedRuntimeRequest{request: request, requestURL: event.Request.URL}
+	tracked := &trackedRuntimeRequest{
+		request:    request,
+		requestURL: event.Request.URL,
+		order:      c.nextOrder,
+		startedAt:  time.Now(),
+	}
+	c.nextOrder++
 	c.active[event.RequestID] = tracked
-	c.trackedByKey[runtimeRequestKey(event.RequestID, event.Request.URL)] = tracked
+	if event.Request.HasPostData {
+		c.trackedByKey[runtimeRequestKey(event.RequestID, event.Request.URL)] = tracked
+	}
 	c.markActivityLocked()
 	return true
 }
@@ -126,22 +138,41 @@ func (c *runtimeCapture) setPostData(requestID network.RequestID, requestURL str
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	tracked := c.trackedByKey[runtimeRequestKey(requestID, requestURL)]
+	key := runtimeRequestKey(requestID, requestURL)
+	tracked := c.trackedByKey[key]
 	if tracked == nil {
+		c.mu.Unlock()
 		return
 	}
+	request := tracked.request
+	request.Headers = cloneHeaders(tracked.request.Headers)
+	c.mu.Unlock()
+
 	// RequestWillBeSent can arrive before post data is retrievable. Re-parse the
 	// request after the async body fetch finishes, even if the request already
 	// moved from active to completed.
-	tracked.body = append([]byte(nil), body...)
-	data := apidiscovery.ParseRequestData(tracked.request.URL, tracked.request.Headers, tracked.body, true)
-	tracked.request.QueryParams = data.QueryParams
+	data := apidiscovery.ParseRequestData(request.URL, request.Headers, body, true)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.trackedByKey[key] != tracked {
+		return
+	}
 	tracked.request.BodyParams = data.Body.Params
 	tracked.request.ContentType = data.Body.ContentType
 	tracked.request.HasBody = data.Body.HasBody
 	tracked.request.BodySample = data.Body.Sample
 	tracked.request.GraphQL = data.Body.GraphQL
+	delete(c.trackedByKey, key)
+}
+
+func (c *runtimeCapture) releasePostDataLookup(requestID network.RequestID, requestURL string) {
+	c.mu.Lock()
+	key := runtimeRequestKey(requestID, requestURL)
+	if c.trackedByKey[key] != nil {
+		delete(c.trackedByKey, key)
+	}
+	c.mu.Unlock()
 }
 
 func (c *runtimeCapture) stageName() string {
@@ -154,17 +185,18 @@ func (c *runtimeCapture) handleResponse(event *network.EventResponseReceived) {
 	if event == nil || event.Response == nil {
 		return
 	}
+	sanitizedURL := apidiscovery.SanitizeURL(event.Response.URL)
+	queryParams := apidiscovery.ParseRequestData(sanitizedURL, nil, nil, false).QueryParams
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	tracked := c.active[event.RequestID]
 	if tracked == nil {
 		return
 	}
-	tracked.request.URL = apidiscovery.SanitizeURL(event.Response.URL)
+	tracked.request.URL = sanitizedURL
 	tracked.request.StatusCode = event.Response.Status
 	tracked.request.MimeType = event.Response.MimeType
-	data := apidiscovery.ParseRequestData(tracked.request.URL, tracked.request.Headers, tracked.body, tracked.request.HasBody)
-	tracked.request.QueryParams = data.QueryParams
+	tracked.request.QueryParams = queryParams
 	c.markActivityLocked()
 }
 
@@ -227,7 +259,8 @@ func (c *runtimeCapture) handleWebSocketCreated(event *network.EventWebSocketCre
 		BodyParams:   []apidiscovery.Parameter{},
 		Initiator:    convertInitiator(event.Initiator),
 		WebSocket:    true,
-	}}
+	}, order: c.nextOrder, startedAt: time.Now()}
+	c.nextOrder++
 	c.webSockets[event.RequestID] = tracked
 	c.completed = append(c.completed, tracked)
 	c.markActivityLocked()
@@ -256,20 +289,23 @@ func (c *runtimeCapture) snapshot() []apidiscovery.RuntimeRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	requests := make([]apidiscovery.RuntimeRequest, 0, len(c.completed)+len(c.active))
-	for _, tracked := range c.completed {
+	trackedRequests := make([]*trackedRuntimeRequest, 0, len(c.completed)+len(c.active))
+	trackedRequests = append(trackedRequests, c.completed...)
+	for _, tracked := range c.active {
+		trackedRequests = append(trackedRequests, tracked)
+	}
+	sort.Slice(trackedRequests, func(i, j int) bool {
+		if trackedRequests[i].order != trackedRequests[j].order {
+			return trackedRequests[i].order < trackedRequests[j].order
+		}
+		if trackedRequests[i].request.RequestID != trackedRequests[j].request.RequestID {
+			return trackedRequests[i].request.RequestID < trackedRequests[j].request.RequestID
+		}
+		return trackedRequests[i].request.RedirectIndex < trackedRequests[j].request.RedirectIndex
+	})
+	requests := make([]apidiscovery.RuntimeRequest, 0, len(trackedRequests))
+	for _, tracked := range trackedRequests {
 		requests = append(requests, tracked.request)
-	}
-	activeIDs := make([]string, 0, len(c.active))
-	byID := make(map[string]apidiscovery.RuntimeRequest)
-	for requestID, tracked := range c.active {
-		id := string(requestID)
-		activeIDs = append(activeIDs, id)
-		byID[id] = tracked.request
-	}
-	sort.Strings(activeIDs)
-	for _, id := range activeIDs {
-		requests = append(requests, byID[id])
 	}
 	return requests
 }
@@ -294,7 +330,7 @@ func (c *runtimeCapture) endPostDataFetch() {
 	c.mu.Unlock()
 }
 
-func (c *runtimeCapture) waitForPostData(timeout time.Duration) bool {
+func (c *runtimeCapture) waitForPostDataContext(ctx context.Context) bool {
 	c.mu.Lock()
 	if c.postDataPending == 0 {
 		c.mu.Unlock()
@@ -302,21 +338,10 @@ func (c *runtimeCapture) waitForPostData(timeout time.Duration) bool {
 	}
 	idle := c.postDataIdle
 	c.mu.Unlock()
-
-	if timeout <= 0 {
-		select {
-		case <-idle:
-			return true
-		default:
-			return false
-		}
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 	select {
 	case <-idle:
 		return true
-	case <-timer.C:
+	case <-ctx.Done():
 		return false
 	}
 }
@@ -331,7 +356,7 @@ func (c *runtimeCapture) waitForAPIIdle(ctx context.Context, quiet time.Duration
 
 	for {
 		c.mu.Lock()
-		inFlight := c.inFlight
+		inFlight, nextExpiry := c.idleBlockersLocked(time.Now())
 		lastActivity := c.lastActivity
 		c.mu.Unlock()
 
@@ -346,7 +371,11 @@ func (c *runtimeCapture) waitForAPIIdle(ctx context.Context, quiet time.Duration
 			}
 			resetTimer(timer, remaining)
 		} else {
-			resetTimer(timer, quiet)
+			wait := quiet
+			if nextExpiry > 0 && nextExpiry < wait {
+				wait = nextExpiry
+			}
+			resetTimer(timer, wait)
 		}
 
 		select {
@@ -356,6 +385,26 @@ func (c *runtimeCapture) waitForAPIIdle(ctx context.Context, quiet time.Duration
 		case <-timer.C:
 		}
 	}
+}
+
+func (c *runtimeCapture) idleBlockersLocked(now time.Time) (int, time.Duration) {
+	blockers := 0
+	var nextExpiry time.Duration
+	for _, tracked := range c.active {
+		if !countsForIdleString(tracked.request.ResourceType) {
+			continue
+		}
+		age := now.Sub(tracked.startedAt)
+		if age >= networkQuietRequestMaxAge {
+			continue
+		}
+		blockers++
+		untilExpiry := networkQuietRequestMaxAge - age
+		if nextExpiry == 0 || untilExpiry < nextExpiry {
+			nextExpiry = untilExpiry
+		}
+	}
+	return blockers, nextExpiry
 }
 
 func (c *runtimeCapture) markActivityLocked() {
@@ -411,6 +460,17 @@ func networkHeaders(headers network.Headers) map[string]string {
 	out := make(map[string]string, len(headers))
 	for name, value := range headers {
 		out[name] = fmt.Sprint(value)
+	}
+	return out
+}
+
+func cloneHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for name, value := range headers {
+		out[name] = value
 	}
 	return out
 }

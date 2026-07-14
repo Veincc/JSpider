@@ -172,6 +172,7 @@ func buildHeadlessConfig(cfg *config.Config, entryURL string) *headless.Config {
 		UserAgent:          cfg.UserAgent,
 		Cookies:            cfg.Cookies,
 		Headers:            cfg.Headers,
+		HeadlessBodyMB:     cfg.HeadlessBodyMB,
 	}
 }
 

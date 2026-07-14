@@ -1,8 +1,11 @@
 package headless
 
 import (
+	"context"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/chromedp/cdproto/network"
 	cdpRuntime "github.com/chromedp/cdproto/runtime"
@@ -99,6 +102,41 @@ func TestRuntimeCaptureAppliesPostDataAfterRequestCompletes(t *testing.T) {
 	}
 }
 
+func TestRuntimeCaptureReleasesPostDataLookupAfterParsing(t *testing.T) {
+	capture := newRuntimeCapture("https://example.com/")
+	capture.handleRequest(&network.EventRequestWillBeSent{
+		RequestID: "post", Type: network.ResourceTypeFetch,
+		Request: &network.Request{
+			URL: "https://example.com/api", Method: "POST",
+			Headers: network.Headers{"Content-Type": "application/json"}, HasPostData: true,
+		},
+	})
+	capture.setPostData("post", "https://example.com/api", []byte(`{"name":"alice"}`))
+
+	capture.mu.Lock()
+	lookups := len(capture.trackedByKey)
+	capture.mu.Unlock()
+	if lookups != 0 {
+		t.Fatalf("post-data lookup entries=%d, want 0 (body must not be retained)", lookups)
+	}
+}
+
+func TestRuntimeCaptureReleasesPostDataLookupWhenFetchFails(t *testing.T) {
+	capture := newRuntimeCapture("https://example.com/")
+	capture.handleRequest(&network.EventRequestWillBeSent{
+		RequestID: "post-error", Type: network.ResourceTypeFetch,
+		Request: &network.Request{URL: "https://example.com/api", Method: "POST", HasPostData: true},
+	})
+	capture.releasePostDataLookup("post-error", "https://example.com/api")
+
+	capture.mu.Lock()
+	lookups := len(capture.trackedByKey)
+	capture.mu.Unlock()
+	if lookups != 0 {
+		t.Fatalf("post-data lookup entries after fetch failure = %d, want 0", lookups)
+	}
+}
+
 func TestRuntimeCaptureRecordsFailureAndRedirectChain(t *testing.T) {
 	capture := newRuntimeCapture("https://example.com/")
 	capture.setStage("navigate")
@@ -151,6 +189,58 @@ func TestRuntimeCaptureRedirectToNonIdleResourceReleasesIdleCounter(t *testing.T
 
 	if capture.inFlight != 0 {
 		t.Fatalf("inFlight after XHR redirects to EventSource = %d, want 0", capture.inFlight)
+	}
+}
+
+func TestRuntimeCaptureOldLongPollDoesNotBlockNetworkQuiet(t *testing.T) {
+	capture := newRuntimeCapture("https://example.com/")
+	capture.handleRequest(&network.EventRequestWillBeSent{
+		RequestID: "poll", Type: network.ResourceTypeFetch,
+		Request: &network.Request{URL: "https://example.com/poll", Method: "GET"},
+	})
+	capture.mu.Lock()
+	capture.active["poll"].startedAt = time.Now().Add(-6 * time.Second)
+	capture.lastActivity = time.Now().Add(-6 * time.Second)
+	capture.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if !capture.waitForAPIIdle(ctx, 20*time.Millisecond) {
+		t.Fatal("request older than five seconds prevented network quiet")
+	}
+}
+
+func TestRuntimeCaptureSnapshotKeepsRequestArrivalOrderAcrossConcurrentFinishes(t *testing.T) {
+	capture := newRuntimeCapture("https://example.com/")
+	const count = 32
+	for i := 0; i < count; i++ {
+		id := network.RequestID(string(rune('A' + i)))
+		capture.handleRequest(&network.EventRequestWillBeSent{
+			RequestID: id, Type: network.ResourceTypeFetch,
+			Request: &network.Request{URL: "https://example.com/" + string(id), Method: "GET"},
+		})
+	}
+
+	var wg sync.WaitGroup
+	for i := count - 1; i >= 0; i-- {
+		id := network.RequestID(string(rune('A' + i)))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			capture.handleFinished(&network.EventLoadingFinished{RequestID: id})
+		}()
+	}
+	wg.Wait()
+
+	requests := capture.snapshot()
+	if len(requests) != count {
+		t.Fatalf("snapshot count = %d, want %d", len(requests), count)
+	}
+	for i, request := range requests {
+		want := string(rune('A' + i))
+		if request.RequestID != want {
+			t.Fatalf("snapshot[%d].RequestID = %q, want arrival-order %q", i, request.RequestID, want)
+		}
 	}
 }
 
