@@ -84,7 +84,7 @@ JSpider is not a redaction boundary. Run it only on systems you are authorized t
 - Full request URLs, query values, headers, request bodies, and body samples may remain in memory. Treat verbose logs as potentially containing the same raw data, including credentials and session values.
 - `endpoints.txt` deliberately preserves full query strings. `js-map.txt` likewise records complete JavaScript URLs, including queries.
 - JSpider does not create separate raw-header or raw-request-body artifacts. That does not make the in-memory data, verbose logs, downloaded code, or URL-bearing output files safe to share.
-- Output artifacts are created with restrictive file permissions, but directory access, backups, copied logs, and retention are still the operator's responsibility. Avoid `-v` for credentialed runs unless required, and remove outputs and logs according to your data-handling policy.
+- Output permissions are mixed. On Unix, `endpoints.txt` and `js-map.txt` are written as `0600`, but downloaded, generated, and recovered JavaScript uses `0644` and normal output directories use `0755`; Windows access is governed by its ACLs. Put `-o` beneath a protected parent directory and use an appropriate umask/ACLs. Backups, copied logs, and retention remain the operator's responsibility. Avoid `-v` for credentialed runs unless required, and remove outputs and logs according to your data-handling policy.
 
 ## Runtime API Discovery
 
