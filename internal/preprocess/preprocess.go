@@ -1,11 +1,9 @@
 package preprocess
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	_ "embed"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -233,44 +231,44 @@ func newProcessor(siteDir string, fetch FetchFunc, processTimeout, startupTimeou
 }
 
 func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
+	return p.ProcessContext(context.Background(), entryURL, jsURL, body)
+}
+
+func (p *Processor) ProcessContext(parent context.Context, entryURL, jsURL string, body []byte) FileResult {
 	p.stateMu.Lock()
 	closed := p.closed
 	p.stateMu.Unlock()
 	if closed {
 		return p.recordFailure(jsURL, body, "audit-prep processor is closed")
 	}
+	parent = processingContext(parent)
+	ctx, cancel := context.WithTimeout(parent, p.processTimeout)
+	defer cancel()
 
 	result := FileResult{Analysis: originalAnalysis(jsURL, body), Outputs: make([]string, 0)}
-	reference := extractSourceMapReference(string(body))
-	sourceMapTimeout := p.processTimeout
-	if reference == "" {
-		sourceMapTimeout = 3 * time.Second
+	recovery, recoveryErr := p.recoverForBundle(ctx, entryURL, jsURL, body)
+	if recoveryErr != nil {
+		return p.recordFailure(jsURL, body, recoveryErr.Error())
 	}
-	sourceMapContext, cancelSourceMap := context.WithTimeout(context.Background(), sourceMapTimeout)
-	var recovery sourceMapRecovery
-	acquiredSourceMapSlot := false
-	select {
-	case sourceMapWorkSlots <- struct{}{}:
-		acquiredSourceMapSlot = true
-		_, _, recovery = p.recoverSourceMap(sourceMapContext, entryURL, jsURL, reference)
-	case <-sourceMapContext.Done():
-	}
-	cancelSourceMap()
 	if len(recovery.Files) > 0 {
-		defer func() {
-			if acquiredSourceMapSlot {
-				<-sourceMapWorkSlots
-			}
-		}()
 		outputs := make([]string, 0, len(recovery.Files))
 		for _, source := range recovery.Files {
-			rel, err := p.writeSource(source.OutputPath, []byte(source.Content))
+			if err := ctx.Err(); err != nil {
+				return p.recordFailureWithOutputs(jsURL, body, err.Error(), outputs)
+			}
+			rel, err := p.writeSourceContext(ctx, source.OutputPath, []byte(source.Content))
 			if err != nil {
+				if rel != "" && !contains(outputs, rel) {
+					outputs = append(outputs, rel)
+				}
 				return p.recordFailureWithOutputs(jsURL, body, fmt.Sprintf("write recovered source: %v", err), outputs)
 			}
 			if !contains(outputs, rel) {
 				outputs = append(outputs, rel)
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return p.recordFailureWithOutputs(jsURL, body, err.Error(), outputs)
 		}
 		sort.Strings(outputs)
 		result.Status = "sourcemap"
@@ -278,38 +276,81 @@ func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
 		if recovery.Complete {
 			result.Analysis = recoveredAnalysis(jsURL, recovery.Files)
 		}
+		if err := ctx.Err(); err != nil {
+			return p.recordFailureWithOutputs(jsURL, body, err.Error(), outputs)
+		}
 		return result
 	}
-	if acquiredSourceMapSlot {
-		<-sourceMapWorkSlots
+	if err := ctx.Err(); err != nil {
+		return p.recordFailure(jsURL, body, err.Error())
 	}
-
-	code, err := p.actor.process(body)
+	code, err := p.actor.processContext(ctx, body)
 	if err != nil {
 		return p.recordFailure(jsURL, body, err.Error())
 	}
 	if len(code) == 0 {
 		code = body
 	}
-	rel, err := p.writeGenerated(jsURL, ".js", code)
+	if err := ctx.Err(); err != nil {
+		return p.recordFailure(jsURL, body, err.Error())
+	}
+	rel, err := p.writeGeneratedContext(ctx, jsURL, ".js", code)
 	if err != nil {
+		if rel != "" {
+			return p.recordFailureWithOutputs(jsURL, body, fmt.Sprintf("write processed bundle: %v", err), []string{rel})
+		}
 		return p.recordFailure(jsURL, body, fmt.Sprintf("write processed bundle: %v", err))
+	}
+	if err := ctx.Err(); err != nil {
+		return p.recordFailureWithOutputs(jsURL, body, err.Error(), []string{rel})
 	}
 	result.Status = "processed"
 	result.Outputs = []string{rel}
 	return result
 }
 
-func (p *Processor) recoverSourceMap(ctx context.Context, entryURL, jsURL, reference string) (string, string, sourceMapRecovery) {
-	if strings.HasPrefix(reference, "data:") {
-		data, err := decodeDataURL(reference)
+func (p *Processor) recoverForBundle(ctx context.Context, entryURL, jsURL string, body []byte) (sourceMapRecovery, error) {
+	return runSourceMapAttempt(ctx, func(operationContext context.Context) (sourceMapRecovery, error) {
+		reference, err := extractSourceMapReferenceContext(operationContext, body)
 		if err != nil {
-			return "inline", "parse_error", sourceMapRecovery{}
+			return sourceMapRecovery{}, err
+		}
+
+		mapContext := operationContext
+		cancelMap := func() {}
+		if reference == "" {
+			mapContext, cancelMap = context.WithTimeout(operationContext, 3*time.Second)
+		}
+		defer cancelMap()
+
+		_, _, recovery, err := p.recoverSourceMap(mapContext, entryURL, jsURL, reference)
+		if reference == "" && errors.Is(err, context.DeadlineExceeded) && operationContext.Err() == nil {
+			return sourceMapRecovery{}, nil
+		}
+		return recovery, err
+	})
+}
+
+func (p *Processor) recoverSourceMap(ctx context.Context, entryURL, jsURL, reference string) (string, string, sourceMapRecovery, error) {
+	ctx = processingContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return "", "canceled", sourceMapRecovery{}, err
+	}
+	if strings.HasPrefix(reference, "data:") {
+		data, err := decodeSourceMapDataURL(ctx, reference)
+		if err != nil {
+			if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+				return "inline", "parse_error", sourceMapRecovery{}, operationErr
+			}
+			return "inline", "parse_error", sourceMapRecovery{}, nil
 		}
 		resolver := sourceMapResolver{p: p, entryURL: entryURL, ctx: ctx}
-		collection := resolver.collect(data, jsURL, 0, map[string]bool{reference: true})
-		recovery, status := applicationRecovery(collection)
-		return "inline", status, recovery
+		collection, err := resolver.collect(data, jsURL, 0, map[string]bool{reference: true})
+		if err != nil {
+			return "inline", "parse_error", sourceMapRecovery{}, err
+		}
+		recovery, status, err := applicationRecoveryContext(ctx, collection)
+		return "inline", status, recovery, err
 	}
 
 	mapURL := ""
@@ -317,38 +358,74 @@ func (p *Processor) recoverSourceMap(ctx context.Context, entryURL, jsURL, refer
 	if explicit {
 		resolved, err := urlutil.Resolve(jsURL, reference)
 		if err != nil || resolved == "" {
-			return reference, "invalid_url", sourceMapRecovery{}
+			return reference, "invalid_url", sourceMapRecovery{}, nil
 		}
 		mapURL = resolved
 	} else {
 		mapURL = adjacentMapURL(jsURL)
 	}
 	if mapURL == "" || p.fetch == nil {
-		return mapURL, "not_found", sourceMapRecovery{}
+		return mapURL, "not_found", sourceMapRecovery{}, nil
 	}
 
 	data, err := p.fetchSourceMap(ctx, entryURL, mapURL)
 	if err != nil {
-		if explicit {
-			return mapURL, "fetch_error", sourceMapRecovery{}
+		if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+			return mapURL, "fetch_error", sourceMapRecovery{}, operationErr
 		}
-		return mapURL, "not_found", sourceMapRecovery{}
+		if explicit {
+			return mapURL, "fetch_error", sourceMapRecovery{}, nil
+		}
+		return mapURL, "not_found", sourceMapRecovery{}, nil
 	}
 	resolver := sourceMapResolver{p: p, entryURL: entryURL, ctx: ctx}
 	active := map[string]bool{mapURL: true}
-	collection := resolver.collect(data, mapURL, 0, active)
-	recovery, status := applicationRecovery(collection)
-	return mapURL, status, recovery
+	collection, err := resolver.collect(data, mapURL, 0, active)
+	if err != nil {
+		return mapURL, "parse_error", sourceMapRecovery{}, err
+	}
+	recovery, status, err := applicationRecoveryContext(ctx, collection)
+	return mapURL, status, recovery, err
+}
+
+func sourceMapOperationError(ctx context.Context, err error) error {
+	if ctx != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
+	}
+	if errors.Is(err, errSourceMapTooLarge) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
 }
 
 func (p *Processor) fetchSourceMap(ctx context.Context, entryURL, mapURL string) ([]byte, error) {
-	return p.fetch(ctx, entryURL, mapURL)
+	data, err := p.fetch(ctx, entryURL, mapURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkSourceMapInputLength(len(data)); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func extractSourceMapReference(source string) string {
-	lexer := jslexer.NewLexer(parsepkg.NewInputString(source))
+	reference, _ := extractSourceMapReferenceContext(context.Background(), []byte(source))
+	return reference
+}
+
+func extractSourceMapReferenceContext(ctx context.Context, source []byte) (string, error) {
+	ctx = processingContext(ctx)
+	input := parsepkg.NewInputBytes(source)
+	defer input.Restore()
+	lexer := jslexer.NewLexer(input)
 	reference := ""
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		tokenType, data := lexer.Next()
 		if tokenType == jslexer.ErrorToken && len(data) == 0 {
 			break
@@ -367,7 +444,10 @@ func extractSourceMapReference(source string) string {
 			reference = strings.TrimSpace(last[2])
 		}
 	}
-	return reference
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return reference, nil
 }
 
 func adjacentMapURL(jsURL string) string {
@@ -382,34 +462,40 @@ func adjacentMapURL(jsURL string) string {
 }
 
 func decodeDataURL(value string) ([]byte, error) {
-	comma := strings.IndexByte(value, ',')
-	if comma < 0 {
-		return nil, errors.New("invalid source map data URL")
-	}
-	metadata := strings.ToLower(value[:comma])
-	payload := value[comma+1:]
-	if strings.Contains(metadata, ";base64") {
-		return base64.StdEncoding.DecodeString(payload)
-	}
-	decoded, err := url.PathUnescape(payload)
-	if err != nil {
-		return nil, err
-	}
-	return []byte(decoded), nil
+	return decodeSourceMapDataURL(context.Background(), value)
 }
 
 func parseApplicationSources(data []byte) (sourceMapRecovery, string) {
-	resolver := sourceMapResolver{}
-	collection := resolver.collect(data, "", 0, make(map[string]bool))
-	return applicationRecovery(collection)
+	recovery, status, _ := parseApplicationSourcesContext(context.Background(), data)
+	return recovery, status
+}
+
+func parseApplicationSourcesContext(ctx context.Context, data []byte) (sourceMapRecovery, string, error) {
+	ctx = processingContext(ctx)
+	resolver := sourceMapResolver{ctx: ctx}
+	collection, err := resolver.collect(data, "", 0, make(map[string]bool))
+	if err != nil {
+		return sourceMapRecovery{}, "parse_error", err
+	}
+	recovery, status, err := applicationRecoveryContext(ctx, collection)
+	return recovery, status, err
 }
 
 func applicationRecovery(collection sourceMapCollection) (sourceMapRecovery, string) {
+	recovery, status, _ := applicationRecoveryContext(context.Background(), collection)
+	return recovery, status
+}
+
+func applicationRecoveryContext(ctx context.Context, collection sourceMapCollection) (sourceMapRecovery, string, error) {
+	ctx = processingContext(ctx)
 	recovery := sourceMapRecovery{
 		Files:    make([]sourceFile, 0, len(collection.Files)),
 		Complete: collection.Complete,
 	}
 	for _, file := range collection.Files {
+		if err := ctx.Err(); err != nil {
+			return sourceMapRecovery{}, "canceled", err
+		}
 		safeName := safeApplicationSourcePath(file.Name)
 		if safeName == "" {
 			continue
@@ -420,6 +506,10 @@ func applicationRecovery(collection sourceMapCollection) (sourceMapRecovery, str
 			continue
 		}
 		recovery.ContentSize += int64(len(file.Content))
+		if len(recovery.Files) >= 512 || recovery.ContentSize > 64*1024*1024 {
+			recovery.Complete = false
+			continue
+		}
 		recovery.Files = append(recovery.Files, sourceFile{
 			Name:       file.Name,
 			OutputPath: safeName,
@@ -429,17 +519,24 @@ func applicationRecovery(collection sourceMapCollection) (sourceMapRecovery, str
 	}
 	if recovery.SourceCount == 0 || len(recovery.Files) == 0 {
 		recovery.Complete = false
-		return recovery, "no_application_sources"
+		return recovery, "no_application_sources", ctx.Err()
 	}
 	if recovery.SourceCount > 512 || recovery.ContentSize > 64*1024*1024 {
 		recovery.Complete = false
 	}
-	return recovery, "used"
+	if err := ctx.Err(); err != nil {
+		return sourceMapRecovery{}, "canceled", err
+	}
+	return recovery, "used", nil
 }
 
-func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, active map[string]bool) sourceMapCollection {
+func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, active map[string]bool) (sourceMapCollection, error) {
+	ctx := processingContext(r.ctx)
+	if err := ctx.Err(); err != nil {
+		return sourceMapCollection{}, err
+	}
 	if depth > 4 {
-		return sourceMapCollection{Complete: false}
+		return sourceMapCollection{Complete: false}, nil
 	}
 	var envelope struct {
 		Version        json.RawMessage `json:"version"`
@@ -448,25 +545,44 @@ func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, 
 		SourcesContent json.RawMessage `json:"sourcesContent"`
 		Sections       json.RawMessage `json:"sections"`
 	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return sourceMapCollection{Complete: false}
+	if err := decodeSourceMapJSON(ctx, data, &envelope); err != nil {
+		if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+			return sourceMapCollection{}, operationErr
+		}
+		return sourceMapCollection{Complete: false}, nil
 	}
 	var version int
-	if len(envelope.Version) == 0 || json.Unmarshal(envelope.Version, &version) != nil || version != 3 {
-		return sourceMapCollection{Complete: false}
+	if len(envelope.Version) == 0 || decodeSourceMapJSON(ctx, envelope.Version, &version) != nil || version != 3 {
+		if err := ctx.Err(); err != nil {
+			return sourceMapCollection{}, err
+		}
+		return sourceMapCollection{Complete: false}, nil
 	}
 
 	var sources []string
-	hasSources := len(envelope.Sources) > 0 && !bytes.Equal(bytes.TrimSpace(envelope.Sources), []byte("null"))
+	hasSources, err := sourceMapJSONPresent(ctx, envelope.Sources)
+	if err != nil {
+		return sourceMapCollection{}, err
+	}
 	if hasSources {
-		if err := json.Unmarshal(envelope.Sources, &sources); err != nil {
-			return sourceMapCollection{Complete: false}
+		if err := decodeSourceMapJSON(ctx, envelope.Sources, &sources); err != nil {
+			if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+				return sourceMapCollection{}, operationErr
+			}
+			return sourceMapCollection{Complete: false}, nil
 		}
 	}
 	var sourcesContent []*string
-	if len(envelope.SourcesContent) > 0 && !bytes.Equal(bytes.TrimSpace(envelope.SourcesContent), []byte("null")) {
-		if err := json.Unmarshal(envelope.SourcesContent, &sourcesContent); err != nil {
-			return sourceMapCollection{Complete: false}
+	hasSourcesContent, err := sourceMapJSONPresent(ctx, envelope.SourcesContent)
+	if err != nil {
+		return sourceMapCollection{}, err
+	}
+	if hasSourcesContent {
+		if err := decodeSourceMapJSON(ctx, envelope.SourcesContent, &sourcesContent); err != nil {
+			if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+				return sourceMapCollection{}, operationErr
+			}
+			return sourceMapCollection{Complete: false}, nil
 		}
 	}
 	var sections []struct {
@@ -474,18 +590,27 @@ func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, 
 		Map    json.RawMessage `json:"map"`
 		URL    string          `json:"url"`
 	}
-	hasSections := len(envelope.Sections) > 0 && !bytes.Equal(bytes.TrimSpace(envelope.Sections), []byte("null"))
+	hasSections, err := sourceMapJSONPresent(ctx, envelope.Sections)
+	if err != nil {
+		return sourceMapCollection{}, err
+	}
 	if hasSections {
-		if err := json.Unmarshal(envelope.Sections, &sections); err != nil {
-			return sourceMapCollection{Complete: false}
+		if err := decodeSourceMapJSON(ctx, envelope.Sections, &sections); err != nil {
+			if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+				return sourceMapCollection{}, operationErr
+			}
+			return sourceMapCollection{Complete: false}, nil
 		}
 	}
 	if !hasSources && !hasSections {
-		return sourceMapCollection{Complete: false}
+		return sourceMapCollection{Complete: false}, nil
 	}
 
 	collection := sourceMapCollection{Files: make([]sourceFile, 0, len(sources)), Complete: true}
 	for i, name := range sources {
+		if err := ctx.Err(); err != nil {
+			return sourceMapCollection{}, err
+		}
 		file := sourceFile{Name: joinSourceRoot(envelope.SourceRoot, name)}
 		if i < len(sourcesContent) && sourcesContent[i] != nil {
 			file.Content = *sourcesContent[i]
@@ -495,7 +620,13 @@ func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, 
 	}
 	var previousOffset *sourceMapOffset
 	for _, section := range sections {
-		offset, validOffset := parseSourceMapOffset(section.Offset)
+		if err := ctx.Err(); err != nil {
+			return sourceMapCollection{}, err
+		}
+		offset, validOffset, err := parseSourceMapOffsetContext(ctx, section.Offset)
+		if err != nil {
+			return sourceMapCollection{}, err
+		}
 		if !validOffset {
 			collection.Complete = false
 		} else {
@@ -505,9 +636,14 @@ func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, 
 			previousOffset = &offset
 		}
 
-		trimmedMap := bytes.TrimSpace(section.Map)
-		hasMap := len(trimmedMap) > 0 && !bytes.Equal(trimmedMap, []byte("null"))
-		hasURL := strings.TrimSpace(section.URL) != ""
+		hasMap, err := sourceMapJSONPresent(ctx, section.Map)
+		if err != nil {
+			return sourceMapCollection{}, err
+		}
+		hasURL, err := sourceMapStringPresent(ctx, section.URL)
+		if err != nil {
+			return sourceMapCollection{}, err
+		}
 		if hasMap == hasURL {
 			collection.Complete = false
 			continue
@@ -515,41 +651,65 @@ func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, 
 
 		var nested sourceMapCollection
 		if hasMap {
-			nested = r.collect(section.Map, parentMapURL, depth+1, active)
+			nested, err = r.collect(section.Map, parentMapURL, depth+1, active)
 		} else {
-			nested = r.collectURLSection(section.URL, parentMapURL, depth+1, active)
+			nested, err = r.collectURLSection(section.URL, parentMapURL, depth+1, active)
+		}
+		if err != nil {
+			return sourceMapCollection{}, err
 		}
 		collection.Files = append(collection.Files, nested.Files...)
 		collection.Complete = collection.Complete && nested.Complete
 	}
-	return collection
+	if err := ctx.Err(); err != nil {
+		return sourceMapCollection{}, err
+	}
+	return collection, nil
 }
 
 func parseSourceMapOffset(raw json.RawMessage) (sourceMapOffset, bool) {
+	offset, ok, _ := parseSourceMapOffsetContext(context.Background(), raw)
+	return offset, ok
+}
+
+func parseSourceMapOffsetContext(ctx context.Context, raw json.RawMessage) (sourceMapOffset, bool, error) {
 	var wire struct {
 		Line   json.RawMessage `json:"line"`
 		Column json.RawMessage `json:"column"`
 	}
-	if len(raw) == 0 || json.Unmarshal(raw, &wire) != nil {
-		return sourceMapOffset{}, false
+	if len(raw) == 0 {
+		return sourceMapOffset{}, false, nil
+	}
+	if err := decodeSourceMapJSON(ctx, raw, &wire); err != nil {
+		if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+			return sourceMapOffset{}, false, operationErr
+		}
+		return sourceMapOffset{}, false, nil
 	}
 	var offset sourceMapOffset
 	if len(wire.Line) == 0 || len(wire.Column) == 0 ||
-		json.Unmarshal(wire.Line, &offset.Line) != nil ||
-		json.Unmarshal(wire.Column, &offset.Column) != nil ||
+		decodeSourceMapJSON(ctx, wire.Line, &offset.Line) != nil ||
+		decodeSourceMapJSON(ctx, wire.Column, &offset.Column) != nil ||
 		offset.Line < 0 || offset.Column < 0 {
-		return sourceMapOffset{}, false
+		if err := ctx.Err(); err != nil {
+			return sourceMapOffset{}, false, err
+		}
+		return sourceMapOffset{}, false, nil
 	}
-	return offset, true
+	return offset, true, nil
 }
 
 func sourceMapOffsetLess(left, right sourceMapOffset) bool {
 	return left.Line < right.Line || (left.Line == right.Line && left.Column < right.Column)
 }
 
-func (r sourceMapResolver) collectURLSection(reference, parentMapURL string, depth int, active map[string]bool) sourceMapCollection {
+func (r sourceMapResolver) collectURLSection(reference, parentMapURL string, depth int, active map[string]bool) (sourceMapCollection, error) {
+	ctx := processingContext(r.ctx)
+	if err := ctx.Err(); err != nil {
+		return sourceMapCollection{}, err
+	}
 	if depth > 4 {
-		return sourceMapCollection{Complete: false}
+		return sourceMapCollection{Complete: false}, nil
 	}
 
 	mapURL := reference
@@ -558,14 +718,14 @@ func (r sourceMapResolver) collectURLSection(reference, parentMapURL string, dep
 	var err error
 	if strings.HasPrefix(reference, "data:") {
 		if active[mapURL] {
-			return sourceMapCollection{Complete: false}
+			return sourceMapCollection{Complete: false}, nil
 		}
-		data, err = decodeDataURL(reference)
+		data, err = decodeSourceMapDataURL(ctx, reference)
 	} else {
 		mapURL, err = urlutil.Resolve(parentMapURL, reference)
 		nestedParentURL = mapURL
 		if err == nil && mapURL != "" && active[mapURL] {
-			return sourceMapCollection{Complete: false}
+			return sourceMapCollection{Complete: false}, nil
 		}
 		if err == nil && mapURL != "" && r.p != nil && r.p.fetch != nil {
 			data, err = r.p.fetchSourceMap(r.ctx, r.entryURL, mapURL)
@@ -573,14 +733,20 @@ func (r sourceMapResolver) collectURLSection(reference, parentMapURL string, dep
 			err = errors.New("source map section fetch unavailable")
 		}
 	}
-	if err != nil || mapURL == "" {
-		return sourceMapCollection{Complete: false}
+	if err != nil {
+		if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+			return sourceMapCollection{}, operationErr
+		}
+		return sourceMapCollection{Complete: false}, nil
+	}
+	if mapURL == "" {
+		return sourceMapCollection{Complete: false}, nil
 	}
 
 	active[mapURL] = true
-	nested := r.collect(data, nestedParentURL, depth, active)
+	nested, err := r.collect(data, nestedParentURL, depth, active)
 	delete(active, mapURL)
-	return nested
+	return nested, err
 }
 
 func joinSourceRoot(root, name string) string {
@@ -642,17 +808,34 @@ func (p *Processor) writeSource(name string, data []byte) (string, error) {
 	return p.writeContent(filepath.ToSlash(filepath.FromSlash(name)), data)
 }
 
+func (p *Processor) writeSourceContext(ctx context.Context, name string, data []byte) (string, error) {
+	return p.writeContentContext(ctx, filepath.ToSlash(filepath.FromSlash(name)), data)
+}
+
 func (p *Processor) writeGenerated(sourceURL, fallbackExt string, data []byte) (string, error) {
 	return p.writeContent(urlutil.ArtifactFilename(sourceURL, fallbackExt, "script"), data)
 }
 
+func (p *Processor) writeGeneratedContext(ctx context.Context, sourceURL, fallbackExt string, data []byte) (string, error) {
+	return p.writeContentContext(ctx, urlutil.ArtifactFilename(sourceURL, fallbackExt, "script"), data)
+}
+
 func (p *Processor) writeContent(preferredRel string, data []byte) (string, error) {
+	return p.writeContentContext(context.Background(), preferredRel, data)
+}
+
+func (p *Processor) writeContentContext(ctx context.Context, preferredRel string, data []byte) (string, error) {
+	ctx = processingContext(ctx)
 	p.outputMu.Lock()
 	defer p.outputMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	hash := fullHash(data)
 	if rel, ok := p.contentRefs[hash]; ok {
-		return filepath.ToSlash(filepath.Join("js", rel)), nil
+		output := filepath.ToSlash(filepath.Join("js", rel))
+		return output, ctx.Err()
 	}
 
 	rel := filepath.ToSlash(preferredRel)
@@ -669,7 +852,8 @@ func (p *Processor) writeContent(preferredRel string, data []byte) (string, erro
 	}
 	p.contentRefs[hash] = rel
 	p.pathHashes[rel] = hash
-	return filepath.ToSlash(filepath.Join("js", rel)), nil
+	output := filepath.ToSlash(filepath.Join("js", rel))
+	return output, ctx.Err()
 }
 
 func (p *Processor) recordFailure(jsURL string, body []byte, errText string) FileResult {

@@ -1,6 +1,7 @@
 package preprocess
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 )
 
 type actorRequest struct {
+	ctx    context.Context
 	warmup bool
 	source []byte
 	reply  chan actorResult
@@ -50,18 +52,25 @@ func newWorkerActor(nodePath, helperPath string, processTimeout, startupTimeout 
 }
 
 func (a *workerActor) warmup() error {
-	result := a.submit(actorRequest{warmup: true, reply: make(chan actorResult, 1)})
+	result := a.submit(actorRequest{ctx: context.Background(), warmup: true, reply: make(chan actorResult, 1)})
 	return result.err
 }
 
 func (a *workerActor) process(source []byte) ([]byte, error) {
-	result := a.submit(actorRequest{source: source, reply: make(chan actorResult, 1)})
+	return a.processContext(context.Background(), source)
+}
+
+func (a *workerActor) processContext(ctx context.Context, source []byte) ([]byte, error) {
+	result := a.submit(actorRequest{ctx: processingContext(ctx), source: source, reply: make(chan actorResult, 1)})
 	return result.code, result.err
 }
 
 func (a *workerActor) submit(request actorRequest) actorResult {
+	request.ctx = processingContext(request.ctx)
 	select {
 	case a.requests <- request:
+	case <-request.ctx.Done():
+		return actorResult{err: request.ctx.Err()}
 	case <-a.stop:
 		return actorResult{err: errors.New("audit-prep processor is closed")}
 	case <-a.done:
@@ -70,7 +79,12 @@ func (a *workerActor) submit(request actorRequest) actorResult {
 
 	select {
 	case result := <-request.reply:
+		if err := request.ctx.Err(); err != nil {
+			return actorResult{err: err}
+		}
 		return result
+	case <-request.ctx.Done():
+		return actorResult{err: request.ctx.Err()}
 	case <-a.done:
 		return actorResult{err: errors.New("audit-prep worker actor stopped")}
 	}
@@ -96,11 +110,16 @@ func (a *workerActor) run() {
 		case <-a.stop:
 			return
 		case request := <-a.requests:
+			request.ctx = processingContext(request.ctx)
+			if err := request.ctx.Err(); err != nil {
+				request.reply <- actorResult{err: err}
+				continue
+			}
 			if worker == nil {
 				var err error
 				worker, err = startNodeWorker(a.nodePath, a.helperPath)
 				if err == nil {
-					err = a.checkWorker(worker)
+					err = a.checkWorker(request.ctx, worker)
 				}
 				if err != nil {
 					if worker != nil {
@@ -113,11 +132,16 @@ func (a *workerActor) run() {
 			}
 
 			if request.warmup {
+				if err := request.ctx.Err(); err != nil {
+					request.reply <- actorResult{err: err}
+					continue
+				}
 				request.reply <- actorResult{}
 				continue
 			}
 
 			response, fatal, err := worker.exchange(
+				request.ctx,
 				workerRequest{ID: worker.nextRequestID(), Source: string(request.source)},
 				a.processTimeout,
 				a.stop,
@@ -147,8 +171,8 @@ func (a *workerActor) run() {
 	}
 }
 
-func (a *workerActor) checkWorker(worker *nodeWorker) error {
-	response, _, err := worker.exchange(workerRequest{Command: "ping"}, a.startupTimeout, a.stop)
+func (a *workerActor) checkWorker(ctx context.Context, worker *nodeWorker) error {
+	response, _, err := worker.exchange(ctx, workerRequest{Command: "ping"}, a.startupTimeout, a.stop)
 	if err != nil {
 		return fmt.Errorf("start audit-prep worker: %w", err)
 	}
@@ -225,7 +249,22 @@ type exchangeResult struct {
 	err      error
 }
 
-func (w *nodeWorker) exchange(request workerRequest, timeout time.Duration, stop <-chan struct{}) (workerResponse, bool, error) {
+func (w *nodeWorker) exchange(ctx context.Context, request workerRequest, timeout time.Duration, stop <-chan struct{}) (workerResponse, bool, error) {
+	ctx = processingContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return workerResponse{}, true, err
+	}
+	deadlineLimited := false
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return workerResponse{}, true, context.DeadlineExceeded
+		}
+		if remaining < timeout {
+			timeout = remaining
+			deadlineLimited = true
+		}
+	}
 	result := make(chan exchangeResult, 1)
 	go func() {
 		if err := json.NewEncoder(w.stdin).Encode(request); err != nil {
@@ -258,7 +297,16 @@ func (w *nodeWorker) exchange(request workerRequest, timeout time.Duration, stop
 		return exchange.response, exchange.err != nil, exchange.err
 	case <-timer.C:
 		w.finish(false)
+		if deadlineLimited {
+			if err := ctx.Err(); err != nil {
+				return workerResponse{}, true, err
+			}
+			return workerResponse{}, true, context.DeadlineExceeded
+		}
 		return workerResponse{}, true, fmt.Errorf("audit-prep worker timeout after %s", timeout)
+	case <-ctx.Done():
+		w.finish(false)
+		return workerResponse{}, true, ctx.Err()
 	case <-stop:
 		w.finish(false)
 		return workerResponse{}, true, errors.New("audit-prep processor closed while worker was running")

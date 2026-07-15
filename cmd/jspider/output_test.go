@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -42,7 +43,7 @@ func (s *recoverableAPISession) Report() apidiscovery.Report {
 	return s.report
 }
 
-func (p *closeErrorProcessor) Process(string, string, []byte) preprocess.FileResult {
+func (p *closeErrorProcessor) ProcessContext(context.Context, string, string, []byte) preprocess.FileResult {
 	return preprocess.FileResult{}
 }
 

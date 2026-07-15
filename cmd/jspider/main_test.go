@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Veincc/JSpider/internal/analyzer"
+	"github.com/Veincc/JSpider/internal/apidiscovery"
 	"github.com/Veincc/JSpider/internal/config"
 	"github.com/Veincc/JSpider/internal/fetcher"
 	"github.com/Veincc/JSpider/internal/headless"
@@ -1280,11 +1281,31 @@ func TestAnalysisDoesNotApplyFetchBudgetAfterScheduling(t *testing.T) {
 }
 
 type fixedResultProcessor struct {
-	result preprocess.FileResult
+	result     preprocess.FileResult
+	contextErr error
 }
 
-func (p *fixedResultProcessor) Process(string, string, []byte) preprocess.FileResult { return p.result }
-func (p *fixedResultProcessor) Close() error                                         { return nil }
+func (p *fixedResultProcessor) ProcessContext(ctx context.Context, _ string, _ string, _ []byte) preprocess.FileResult {
+	p.contextErr = ctx.Err()
+	return p.result
+}
+func (p *fixedResultProcessor) Close() error { return nil }
+
+type sourceCountingAPISession struct {
+	sourceCalls int
+}
+
+func (s *sourceCountingAPISession) AddEntryURL(string) {}
+func (s *sourceCountingAPISession) AddRuntimeForEntry(string, []apidiscovery.RuntimeRequest) {
+}
+func (s *sourceCountingAPISession) AddSourceWithIdentity(apidiscovery.SourceIdentity, string, []byte) {
+	s.sourceCalls++
+}
+func (s *sourceCountingAPISession) Stats(string) apidiscovery.SessionStats {
+	return apidiscovery.SessionStats{}
+}
+func (s *sourceCountingAPISession) AnalyzeSources() error       { return nil }
+func (s *sourceCountingAPISession) Report() apidiscovery.Report { return apidiscovery.Report{} }
 
 func TestAnalyzeResultDoesNotConfirmWhenFallbackWriteFailsAfterPartialOutput(t *testing.T) {
 	cfg, s, a, log, _ := analysisHarness(t)
@@ -1309,19 +1330,66 @@ func TestAnalyzeResultDoesNotConfirmWhenFallbackWriteFailsAfterPartialOutput(t *
 	var queue []fetchReq
 	analyzed, total := 0, 0
 
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 	err := analyzeResultWithPreprocess(
-		cfg, s, a, log, processor, nil, successfulFetch("app.js", `console.log("original");`),
+		ctx, cfg, s, a, log, processor, nil, successfulFetch("app.js", `console.log("original");`),
 		"https://example.com/", "example_com", queued, processed, &queue, &analyzed, &total,
 	)
 	var fatal *fatalOutputError
 	if !errors.As(err, &fatal) {
 		t.Fatalf("analyzeResultWithPreprocess() error = %v, want fatal fallback write failure", err)
 	}
+	if !errors.Is(processor.contextErr, context.Canceled) {
+		t.Fatalf("processor context error = %v, want caller cancellation", processor.contextErr)
+	}
 	if analyzed != 0 || total != 0 || len(s.GetConfirmedURLs()) != 0 {
 		t.Fatalf("failed persistence was counted: analyzed=%d total=%d confirmed=%v", analyzed, total, s.GetConfirmedURLs())
 	}
 	if entries := s.JSMapEntries("example_com"); len(entries) != 1 || entries[0].Path != "js/partial.ts" {
 		t.Fatalf("truthful partial outputs were lost: %+v", entries)
+	}
+}
+
+func TestAnalyzeResultStopsAfterSuccessfulFallbackWhenCallerIsCanceled(t *testing.T) {
+	cfg, s, a, log, _ := analysisHarness(t)
+	cfg.APIDiscovery = true
+	processor := &fixedResultProcessor{result: preprocess.FileResult{
+		Analysis: []preprocess.AnalysisUnit{{
+			SourceName: "https://example.com/app.js",
+			BaseURL:    "https://example.com/app.js",
+			Body:       []byte(`import "./child.js";`),
+		}},
+		Outputs: []string{"js/app.js"},
+		Failed:  true,
+		Error:   context.Canceled.Error(),
+	}}
+	session := &sourceCountingAPISession{}
+	queued := map[string]bool{"https://example.com/app.js": true}
+	processed := make(map[string]bool)
+	var queue []fetchReq
+	analyzed, total := 0, 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := analyzeResultWithPreprocess(
+		ctx, cfg, s, a, log, processor, session, successfulFetch("app.js", `import "./child.js";`),
+		"https://example.com/", "example_com", queued, processed, &queue, &analyzed, &total,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("analyzeResultWithPreprocess() error = %v, want context.Canceled", err)
+	}
+	if session.sourceCalls != 0 {
+		t.Fatalf("API source submissions after cancellation = %d, want 0", session.sourceCalls)
+	}
+	if analyzed != 0 || total != 0 || len(s.GetConfirmedURLs()) != 0 {
+		t.Fatalf("canceled result was counted: analyzed=%d total=%d confirmed=%v", analyzed, total, s.GetConfirmedURLs())
+	}
+	if len(queue) != 0 {
+		t.Fatalf("recursive queue after cancellation = %+v, want empty", queue)
+	}
+	if entries := s.JSMapEntries("example_com"); len(entries) != 1 || entries[0].Path != "js/app.js" {
+		t.Fatalf("persisted fallback output was not recorded truthfully: %+v", entries)
 	}
 }
 
@@ -1744,7 +1812,7 @@ func successfulFetch(name, body string) fetchRes {
 }
 
 func analyzeResultForTest(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep *preprocess.Processor, res fetchRes, entryURL string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) {
-	analyzeResultWithPreprocess(cfg, s, a, log, prep, nil, res, entryURL, urlutil.SanitizeDomain(entryURL), queued, processed, queue, analyzed, totalAnalyzed)
+	analyzeResultWithPreprocess(context.Background(), cfg, s, a, log, prep, nil, res, entryURL, urlutil.SanitizeDomain(entryURL), queued, processed, queue, analyzed, totalAnalyzed)
 }
 
 func testConfig(entryURL, outDir string) *config.Config {

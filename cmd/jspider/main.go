@@ -56,7 +56,7 @@ type crawlState struct {
 }
 
 type javaScriptProcessor interface {
-	Process(entryURL, jsURL string, body []byte) preprocess.FileResult
+	ProcessContext(context.Context, string, string, []byte) preprocess.FileResult
 	Close() error
 }
 
@@ -543,7 +543,7 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 		completedAttempts := 0
 		for res := range results {
 			completedAttempts++
-			if err := analyzeResultWithPreprocess(cfg, s, a, log, prep, apiSession, res, entryURL, site, queued, processed, &queue, &analyzed, totalAnalyzed); err != nil {
+			if err := analyzeResultWithPreprocess(ctx, cfg, s, a, log, prep, apiSession, res, entryURL, site, queued, processed, &queue, &analyzed, totalAnalyzed); err != nil {
 				// Cancel before acknowledging the failed ordinal. Acknowledgement
 				// normally advances the sliding launch window.
 				cancelBatch()
@@ -706,7 +706,10 @@ func fetchBatchContext(ctx context.Context, cfg *config.Config, f *fetcher.Fetch
 }
 
 // analyzeResultWithPreprocess analyzes a single downloaded JavaScript response.
-func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep javaScriptProcessor, apiSession apiDiscoverySession, res fetchRes, entryURL, site string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) error {
+func analyzeResultWithPreprocess(ctx context.Context, cfg *config.Config, s *store.Store, a *analyzer.Analyzer, log *logging.Logger, prep javaScriptProcessor, apiSession apiDiscoverySession, res fetchRes, entryURL, site string, queued, processed map[string]bool, queue *[]fetchReq, analyzed, totalAnalyzed *int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	item := res.req
 
 	if processed[item.url] {
@@ -735,7 +738,7 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 	processed[requestedURL] = true
 	processed[finalURL] = true
 
-	prepResult := prep.Process(entryURL, finalURL, res.result.Body)
+	prepResult := prep.ProcessContext(ctx, entryURL, finalURL, res.result.Body)
 	if prepResult.Failed {
 		log.Warn("JavaScript processing fell back for %s: %s", item.url, prepResult.Error)
 	}
@@ -752,6 +755,9 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		}
 		return &fatalOutputError{err: fmt.Errorf("persist JavaScript %s: %s", finalURL, detail)}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	analysisUnits := prepResult.Analysis
 	if len(analysisUnits) == 0 {
@@ -762,14 +768,31 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 			EntryURL: entryURL, RequestedURL: requestedURL, FinalURL: finalURL, ContentHash: res.result.Hash,
 		}
 		for _, unit := range analysisUnits {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			apiSession.AddSourceWithIdentity(identity, unit.SourceName, unit.Body)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	discovered := make([]analyzer.JSAsset, 0)
+	for _, unit := range analysisUnits {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		discovered = append(discovered, a.DiscoverJS(string(unit.Body), unit.BaseURL)...)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	*analyzed++
 	*totalAnalyzed++
 
-	// Mark as confirmed
+	// Mark as confirmed only after all caller-cancellable analysis completed.
 	s.AddJS(&analyzer.JSAsset{
 		URL: item.url, FromURL: item.from,
 		Type: analyzer.TypeUnknownJS, Source: analyzer.SourceRegexCandidate,
@@ -778,13 +801,11 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 		Size: res.result.Size, Hash: res.result.Hash,
 	})
 
-	discovered := make([]analyzer.JSAsset, 0)
-	for _, unit := range analysisUnits {
-		discovered = append(discovered, a.DiscoverJS(string(unit.Body), unit.BaseURL)...)
-	}
-
 	// Add newly discovered JS URLs to the next batch queue
 	for _, newAsset := range discovered {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// For static analysis, require IsJSPath. For dynamic sources, allow broader fetch.
 		fromDynamic := newAsset.Source == analyzer.SourceHeadlessNetwork ||
 			newAsset.Source == analyzer.SourceHeadlessDOM ||
@@ -810,7 +831,7 @@ func analyzeResultWithPreprocess(cfg *config.Config, s *store.Store, a *analyzer
 			s.AddJS(&newAsset)
 		}
 	}
-	return nil
+	return ctx.Err()
 }
 
 func addToQueue(url string, depth int, from string, queued, processed map[string]bool, queue *[]fetchReq) {

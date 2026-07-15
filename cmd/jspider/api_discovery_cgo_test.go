@@ -360,6 +360,7 @@ func TestAnalyzeResultUsesInMemoryAnalysisDataForStaticAPI(t *testing.T) {
 	total := 0
 
 	analyzeResultWithPreprocess(
+		context.Background(),
 		cfg,
 		s,
 		a,

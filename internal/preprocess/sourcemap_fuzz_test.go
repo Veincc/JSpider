@@ -1,6 +1,9 @@
 package preprocess
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func FuzzParseApplicationSourceMap(f *testing.F) {
 	for _, seed := range [][]byte{
@@ -17,7 +20,10 @@ func FuzzParseApplicationSourceMap(f *testing.F) {
 		if len(data) > 2*1024*1024 {
 			t.Skip()
 		}
-		recovery, status := parseApplicationSources(data)
+		recovery, status, err := parseApplicationSourcesContext(context.Background(), data)
+		if err != nil {
+			t.Fatalf("background source-map parse error = %v", err)
+		}
 		if status != "used" && status != "no_application_sources" {
 			t.Fatalf("unexpected source-map status %q", status)
 		}

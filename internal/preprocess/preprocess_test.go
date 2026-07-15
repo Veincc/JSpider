@@ -200,8 +200,8 @@ func TestSourceMapFileCapFallsBackToOriginalAnalysis(t *testing.T) {
 	body := []byte("const original = true;\n//# sourceMappingURL=app.js.map")
 	result := p.Process("https://example.com/", "https://example.com/app.js", body)
 	assertOriginalAnalysis(t, result, "https://example.com/app.js", body)
-	if len(result.Outputs) != 513 {
-		t.Fatalf("persisted outputs = %d, want 513", len(result.Outputs))
+	if len(result.Outputs) != 512 {
+		t.Fatalf("persisted outputs = %d, want capped prefix of 512", len(result.Outputs))
 	}
 }
 
@@ -221,6 +221,28 @@ func TestSourceMapAggregateContentCapRejectsRecoveredAnalysis(t *testing.T) {
 	}
 	if recovery.ContentSize != 65*1024*1024 {
 		t.Fatalf("aggregate content = %d", recovery.ContentSize)
+	}
+	if len(recovery.Files) != 64 {
+		t.Fatalf("persistable recovered files = %d, want 64 MiB prefix", len(recovery.Files))
+	}
+}
+
+func TestSourceMapFilePersistenceCapCountsUsableContentFiles(t *testing.T) {
+	collection := sourceMapCollection{Complete: true, Files: make([]sourceFile, 600+513)}
+	for i := 0; i < 600; i++ {
+		collection.Files[i] = sourceFile{Name: fmt.Sprintf("src/missing-%03d.js", i)}
+	}
+	for i := 0; i < 513; i++ {
+		collection.Files[600+i] = sourceFile{
+			Name: fmt.Sprintf("src/usable-%03d.js", i), Content: "x", HasContent: true,
+		}
+	}
+	recovery, _ := applicationRecovery(collection)
+	if recovery.Complete {
+		t.Fatal("source map above the source cap remained complete")
+	}
+	if recovery.SourceCount != 1113 || len(recovery.Files) != 512 {
+		t.Fatalf("recovery counts = sources %d files %d, want 1113/512", recovery.SourceCount, len(recovery.Files))
 	}
 }
 
@@ -708,7 +730,8 @@ func TestSourceMapQueueWaitConsumesProcessingDeadline(t *testing.T) {
 	}
 
 	queuedFetches := 0
-	queued := newContextTestProcessor(t, t.TempDir(), 50*time.Millisecond, func(context.Context, string) ([]byte, error) {
+	queuedSiteDir := t.TempDir()
+	queued := newContextTestProcessor(t, queuedSiteDir, 50*time.Millisecond, func(context.Context, string) ([]byte, error) {
 		queuedFetches++
 		return nil, errors.New("unexpected fetch after queue deadline")
 	})
@@ -724,14 +747,276 @@ func TestSourceMapQueueWaitConsumesProcessingDeadline(t *testing.T) {
 		close(release)
 	}
 	wg.Wait()
-	if result.Failed {
-		t.Fatalf("queued Process() = %+v", result)
+	if !result.Failed || !strings.Contains(result.Error, context.DeadlineExceeded.Error()) {
+		t.Fatalf("queued Process() = %+v, want deadline fallback", result)
+	}
+	if len(result.Outputs) != 1 || readOutputFile(t, queuedSiteDir, result.Outputs[0]) != "bundle\n//# sourceMappingURL=queued.map" {
+		t.Fatalf("queued fallback outputs = %v", result.Outputs)
 	}
 	if elapsed > 300*time.Millisecond {
 		t.Fatalf("source-map queue ignored 50ms processing deadline: %s", elapsed)
 	}
 	if queuedFetches != 0 {
 		t.Fatalf("queued source-map fetches = %d, want no fetch after queue deadline", queuedFetches)
+	}
+}
+
+func TestProcessContextCancellationFallsBackAndReleasesSourceMapSlot(t *testing.T) {
+	installFakeNode(t, "normal")
+	siteDir := t.TempDir()
+	started := make(chan struct{}, 1)
+	releaseWorker := make(chan struct{})
+	p, err := newProcessor(siteDir, func(ctx context.Context, _, _ string) ([]byte, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		<-releaseWorker
+		// Returning usable data after cancellation verifies that traversal checks
+		// the context again before any recovered source can be persisted.
+		return []byte(`{"version":3,"sources":["src/app.js"],"sourcesContent":["export default true;"]}`), nil
+	}, 5*time.Second, workerStartupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan FileResult, 1)
+	body := []byte("bundle\n//# sourceMappingURL=app.js.map")
+	go func() {
+		done <- p.ProcessContext(ctx, "https://example.com/", "https://example.com/app.js", body)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("source-map fetch did not start")
+	}
+	startedAt := time.Now()
+	cancel()
+	var result FileResult
+	select {
+	case result = <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("canceled processing did not return promptly")
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("canceled processing took %s", elapsed)
+	}
+	if !result.Failed || !strings.Contains(result.Error, context.Canceled.Error()) {
+		t.Fatalf("canceled ProcessContext() = %+v", result)
+	}
+	assertOriginalAnalysis(t, result, "https://example.com/app.js", body)
+	if len(result.Outputs) != 1 || readOutputFile(t, siteDir, result.Outputs[0]) != string(body) {
+		t.Fatalf("canceled fallback outputs = %v", result.Outputs)
+	}
+	if got := len(sourceMapWorkSlots); got != 1 {
+		t.Fatalf("source-map slots after caller returned = %d, want worker-owned slot retained", got)
+	}
+	close(releaseWorker)
+	deadline := time.Now().Add(time.Second)
+	for len(sourceMapWorkSlots) != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(sourceMapWorkSlots); got != 0 {
+		t.Fatalf("source-map slots still occupied after cancellation: %d", got)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if got := countOutputFiles(t, filepath.Join(siteDir, "js")); got != 1 {
+		t.Fatalf("post-cancellation output files = %d, want original fallback only", got)
+	}
+}
+
+func TestProcessContextAlreadyCanceledFallsBackWithoutStartingRecovery(t *testing.T) {
+	installFakeNode(t, "normal")
+	siteDir := t.TempDir()
+	fetches := 0
+	p, err := newProcessor(siteDir, func(context.Context, string, string) ([]byte, error) {
+		fetches++
+		return nil, errors.New("unexpected source-map fetch")
+	}, 5*time.Second, workerStartupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	body := []byte("bundle\n//# sourceMappingURL=app.js.map")
+	result := p.ProcessContext(ctx, "https://example.com/", "https://example.com/app.js", body)
+	if !result.Failed || !strings.Contains(result.Error, context.Canceled.Error()) {
+		t.Fatalf("already-canceled ProcessContext() = %+v", result)
+	}
+	if fetches != 0 {
+		t.Fatalf("already-canceled source-map fetches = %d, want 0", fetches)
+	}
+	assertOriginalAnalysis(t, result, "https://example.com/app.js", body)
+	if len(result.Outputs) != 1 || readOutputFile(t, siteDir, result.Outputs[0]) != string(body) {
+		t.Fatalf("already-canceled fallback outputs = %v", result.Outputs)
+	}
+}
+
+func TestProcessContextCancellationKillsWorkerAndLazilyRestarts(t *testing.T) {
+	stateFile, requestFile := installFakeNode(t, "process_hang_first")
+	siteDir := t.TempDir()
+	p, err := newProcessor(siteDir, nil, 10*time.Second, workerStartupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	firstBody := []byte("const first = true;")
+	first := p.ProcessContext(ctx, "https://example.com/", "https://example.com/first.js", firstBody)
+	if !first.Failed || !strings.Contains(first.Error, context.DeadlineExceeded.Error()) {
+		t.Fatalf("canceled worker result = %+v", first)
+	}
+	assertOriginalAnalysis(t, first, "https://example.com/first.js", firstBody)
+	if _, err := os.Stat(requestFile); err != nil {
+		t.Fatalf("fake worker did not receive first request: %v", err)
+	}
+
+	second := p.ProcessContext(context.Background(), "https://example.com/", "https://example.com/second.js", []byte("const second = true;"))
+	if second.Failed || second.Status != "processed" {
+		t.Fatalf("post-cancellation ProcessContext() = %+v", second)
+	}
+	if got := readFakeNodeStarts(t, stateFile); got != 2 {
+		t.Fatalf("worker starts = %d, want lazy restart count 2", got)
+	}
+}
+
+func TestProcessContextNestedSourceMapTimeoutFallsBackToOriginal(t *testing.T) {
+	installFakeNode(t, "normal")
+	siteDir := t.TempDir()
+	p, err := newProcessor(siteDir, func(ctx context.Context, _, rawURL string) ([]byte, error) {
+		if strings.HasSuffix(rawURL, "/root.map") {
+			return []byte(`{"version":3,"sections":[{"offset":{"line":0,"column":0},"url":"nested.map"}]}`), nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, 5*time.Second, workerStartupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	body := []byte("bundle\n//# sourceMappingURL=root.map")
+	result := p.ProcessContext(ctx, "https://example.com/", "https://example.com/app.js", body)
+	if !result.Failed || !strings.Contains(result.Error, context.DeadlineExceeded.Error()) {
+		t.Fatalf("nested timeout result = %+v", result)
+	}
+	assertOriginalAnalysis(t, result, "https://example.com/app.js", body)
+	if len(result.Outputs) != 1 || readOutputFile(t, siteDir, result.Outputs[0]) != string(body) {
+		t.Fatalf("nested timeout fallback outputs = %v", result.Outputs)
+	}
+}
+
+func TestProcessContextRechecksCancellationAfterWaitingForOutputLock(t *testing.T) {
+	installFakeNode(t, "normal")
+	siteDir := t.TempDir()
+	p, err := newProcessor(siteDir, nil, 5*time.Second, workerStartupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	mapJSON := `{"version":3,"sources":["src/app.js"],"sourcesContent":["export default true;"]}`
+	body := []byte("bundle\n//# sourceMappingURL=data:application/json;base64," + base64.StdEncoding.EncodeToString([]byte(mapJSON)))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan FileResult, 1)
+	p.outputMu.Lock()
+	go func() {
+		done <- p.ProcessContext(ctx, "https://example.com/", "https://example.com/app.js", body)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	p.outputMu.Unlock()
+
+	var result FileResult
+	select {
+	case result = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled output-lock waiter did not return")
+	}
+	if !result.Failed || !strings.Contains(result.Error, context.Canceled.Error()) {
+		t.Fatalf("output-lock cancellation result = %+v", result)
+	}
+	assertOriginalAnalysis(t, result, "https://example.com/app.js", body)
+	if len(result.Outputs) != 1 || readOutputFile(t, siteDir, result.Outputs[0]) != string(body) {
+		t.Fatalf("output-lock fallback outputs = %v", result.Outputs)
+	}
+	if got := countOutputFiles(t, filepath.Join(siteDir, "js")); got != 1 {
+		t.Fatalf("output files after lock cancellation = %d, want fallback only", got)
+	}
+}
+
+func TestWorkerActorRejectsCanceledRequestWhileAnotherRequestRuns(t *testing.T) {
+	_, requestFile := installFakeNode(t, "process_hang_first")
+	p, err := newProcessor(t.TempDir(), nil, 10*time.Second, workerStartupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstDone := make(chan FileResult, 1)
+	go func() {
+		firstDone <- p.ProcessContext(firstCtx, "https://example.com/", "https://example.com/first.js", []byte("const first = true;"))
+	}()
+	waitForFile(t, requestFile)
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	started := time.Now()
+	secondDone := make(chan FileResult, 1)
+	go func() {
+		secondDone <- p.ProcessContext(secondCtx, "https://example.com/", "https://example.com/second.js", []byte("const second = true;"))
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancelSecond()
+	var second FileResult
+	select {
+	case second = <-secondDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("queued canceled request did not return")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("queued canceled request took %s", elapsed)
+	}
+	if !second.Failed || !strings.Contains(second.Error, context.Canceled.Error()) {
+		t.Fatalf("queued canceled result = %+v", second)
+	}
+
+	cancelFirst()
+	select {
+	case first := <-firstDone:
+		if !first.Failed {
+			t.Fatalf("first canceled result = %+v", first)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first worker request did not stop after cancellation")
+	}
+}
+
+func TestInferredSourceMapSubdeadlineContinuesWithNodeProcessing(t *testing.T) {
+	installFakeNode(t, "normal")
+	p, err := newProcessor(t.TempDir(), func(ctx context.Context, _, _ string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, 5*time.Second, workerStartupTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	started := time.Now()
+	result := p.ProcessContext(context.Background(), "https://example.com/", "https://example.com/app.js", []byte("const value = true;"))
+	elapsed := time.Since(started)
+	if result.Failed || result.Status != "processed" {
+		t.Fatalf("inferred-probe result = %+v", result)
+	}
+	if elapsed < 2500*time.Millisecond || elapsed > 4500*time.Millisecond {
+		t.Fatalf("inferred probe elapsed = %s, want three-second subdeadline then Node processing", elapsed)
 	}
 }
 
