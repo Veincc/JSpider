@@ -71,7 +71,10 @@ func (c *runtimeCapture) handleRequest(event *network.EventRequestWillBeSent) bo
 	}
 
 	headers := networkHeaders(event.Request.Headers)
-	data := apidiscovery.ParseRequestData(event.Request.URL, headers, nil, event.Request.HasPostData)
+	// The request event only tells us that post data exists; its bytes arrive
+	// asynchronously through Network.getRequestPostData. Parsing a nil body as
+	// JSON here would fabricate an EOF error when Chrome cannot return the data.
+	data := apidiscovery.ParseRequestData(event.Request.URL, headers, nil, false)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -110,7 +113,7 @@ func (c *runtimeCapture) handleRequest(event *network.EventRequestWillBeSent) bo
 		QueryParams:    data.QueryParams,
 		BodyParams:     data.Body.Params,
 		ContentType:    data.Body.ContentType,
-		HasBody:        data.Body.HasBody,
+		HasBody:        event.Request.HasPostData,
 		BodyTruncated:  data.Body.Truncated,
 		BodyParseError: data.Body.ParseError,
 		BodySample:     data.Body.Sample,

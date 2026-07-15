@@ -53,6 +53,35 @@ func TestEndpointURLsFiltersInvalidAndDeduplicatesAcrossEntries(t *testing.T) {
 	}
 }
 
+func TestEndpointURLsFiltersOnlyWholeEXPRPathSegments(t *testing.T) {
+	report := Report{Endpoints: []Endpoint{
+		{Kind: EndpointStaticOnly, ResolvedCandidates: []string{"https://example.com/api/preEXPRpost/users"}},
+		{Kind: EndpointRuntimeOnly, ResolvedURL: "https://example.com/runtime/preEXPRpost/orders"},
+		{Kind: EndpointStaticOnly, ResolvedCandidates: []string{"https://example.com/api/EXPR/users"}},
+	}}
+	want := []string{
+		"https://example.com/api/preEXPRpost/users",
+		"https://example.com/runtime/preEXPRpost/orders",
+	}
+	got := EndpointURLs(report, nil)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs() = %v, want concrete EXPR substrings retained as %v", got, want)
+	}
+
+	dir := t.TempDir()
+	if err := WriteEndpointURLs(dir, got); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "endpoints.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFile := strings.Join(want, "\n") + "\n"
+	if string(data) != wantFile {
+		t.Fatalf("endpoints.txt = %q, want %q", data, wantFile)
+	}
+}
+
 func TestEndpointURLsResolvesRelativeStaticOnlyWithinOwnSourceEntry(t *testing.T) {
 	firstEntry := "https://first.example/app/page"
 	secondEntry := "https://second.example/root/page"

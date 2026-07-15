@@ -160,6 +160,36 @@ func TestRuntimeCaptureReleasesPostDataLookupWhenFetchFails(t *testing.T) {
 	}
 }
 
+func TestRuntimeCaptureDefersJSONBodyParsingUntilPostDataIsRetrieved(t *testing.T) {
+	unavailable := newRuntimeCapture("https://example.com/")
+	unavailable.handleRequest(&network.EventRequestWillBeSent{
+		RequestID: "unavailable", Type: network.ResourceTypeFetch,
+		Request: &network.Request{
+			URL: "https://example.com/api", Method: "POST",
+			Headers: network.Headers{"Content-Type": "application/json"}, HasPostData: true,
+		},
+	})
+	unavailable.releasePostDataLookup("unavailable", "https://example.com/api")
+	requests := unavailable.snapshot()
+	if len(requests) != 1 || !requests[0].HasBody || requests[0].BodyParseError != "" {
+		t.Fatalf("unavailable post data = %+v, want HasBody with no fabricated parse error", requests)
+	}
+
+	empty := newRuntimeCapture("https://example.com/")
+	empty.handleRequest(&network.EventRequestWillBeSent{
+		RequestID: "empty", Type: network.ResourceTypeFetch,
+		Request: &network.Request{
+			URL: "https://example.com/api", Method: "POST",
+			Headers: network.Headers{"Content-Type": "application/json"}, HasPostData: true,
+		},
+	})
+	empty.setPostData("empty", "https://example.com/api", []byte{})
+	requests = empty.snapshot()
+	if len(requests) != 1 || !requests[0].HasBody || requests[0].BodyParseError == "" {
+		t.Fatalf("retrieved empty JSON = %+v, want a real parse error", requests)
+	}
+}
+
 func TestRuntimeCaptureRecordsFailureAndRedirectChain(t *testing.T) {
 	capture := newRuntimeCapture("https://example.com/")
 	capture.setStage("navigate")

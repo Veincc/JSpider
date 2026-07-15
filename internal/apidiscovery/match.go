@@ -4,7 +4,6 @@ import (
 	"net/url"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/Veincc/JSpider/internal/urlutil"
@@ -55,7 +54,7 @@ func buildReport(static []StaticEndpoint, runtime []RuntimeRequest, entryURLs []
 	records := make([]associationRecord, 0)
 	matchedStatic := make(map[int]bool)
 	matchedRuntime := make(map[int]bool)
-	runtimeIndex := newRuntimeAssociationIndex(runtime)
+	runtimeIndex := newRuntimeAssociationIndex(static, runtime)
 	for staticIndex := range static {
 		for _, runtimeCandidate := range runtimeIndex.candidates(static[staticIndex]) {
 			association, ok := associateOne(static[staticIndex], runtime[runtimeCandidate])
@@ -120,8 +119,11 @@ func associateOne(static StaticEndpoint, runtime RuntimeRequest) (Association, b
 	if err != nil || runtimeURL.Scheme == "" || runtimeURL.Host == "" {
 		return Association{}, false
 	}
-	staticURL, err := url.Parse(strings.TrimSpace(static.RawURL))
-	if err != nil {
+	staticURL, sourceRelative, ok := parseStaticReference(static)
+	if !ok {
+		return Association{}, false
+	}
+	if sourceRelative && static.SourceIdentity.EntryURL != "" && runtime.EntryURL != static.SourceIdentity.EntryURL {
 		return Association{}, false
 	}
 	if staticURL.Host != "" {
@@ -131,8 +133,6 @@ func associateOne(static StaticEndpoint, runtime RuntimeRequest) (Association, b
 		if staticURL.Scheme != "" && !strings.EqualFold(staticURL.Scheme, runtimeURL.Scheme) {
 			return Association{}, false
 		}
-	} else if static.SourceIdentity.EntryURL != "" && runtime.EntryURL != static.SourceIdentity.EntryURL {
-		return Association{}, false
 	}
 	runtimePath := normalizePath(runtimeURL.EscapedPath())
 	// Match on whole path segments only. A suffix match can infer a gateway
@@ -273,18 +273,21 @@ func normalizePath(raw string) normalizedPath {
 	return normalizedPath{segments: segments}
 }
 
+func hasExpressionSegment(path normalizedPath) bool {
+	for _, segment := range path.segments {
+		if segment == "EXPR" {
+			return true
+		}
+	}
+	return false
+}
+
 func matchPath(static, runtime normalizedPath) (int, []string, bool, bool) {
 	if len(static.segments) == 0 || len(runtime.segments) < len(static.segments) {
 		return 0, nil, false, false
 	}
 	offset := len(runtime.segments) - len(static.segments)
-	usedExpression := false
-	for _, segment := range static.segments {
-		if segment == "EXPR" {
-			usedExpression = true
-			break
-		}
-	}
+	usedExpression := hasExpressionSegment(static)
 	if usedExpression && (static.segments[0] == "EXPR" || static.segments[len(static.segments)-1] == "EXPR") {
 		return 0, nil, false, false
 	}
@@ -306,23 +309,23 @@ func matchPath(static, runtime normalizedPath) (int, []string, bool, bool) {
 }
 
 type runtimeAssociationIndex struct {
-	exactAnyMethod      map[string][]int
-	exactByMethod       map[string][]int
-	exactWithoutMethod  map[string][]int
-	expressionAnyMethod map[string][]int
-	expressionByMethod  map[string][]int
-	expressionNoMethod  map[string][]int
+	anyMethod     map[string][]int
+	byMethod      map[string][]int
+	withoutMethod map[string][]int
 }
 
-func newRuntimeAssociationIndex(runtime []RuntimeRequest) runtimeAssociationIndex {
+type associationPathTrie struct {
+	children       map[string]*associationPathTrie
+	associationKey string
+}
+
+func newRuntimeAssociationIndex(static []StaticEndpoint, runtime []RuntimeRequest) runtimeAssociationIndex {
 	index := runtimeAssociationIndex{
-		exactAnyMethod:      make(map[string][]int),
-		exactByMethod:       make(map[string][]int),
-		exactWithoutMethod:  make(map[string][]int),
-		expressionAnyMethod: make(map[string][]int),
-		expressionByMethod:  make(map[string][]int),
-		expressionNoMethod:  make(map[string][]int),
+		anyMethod:     make(map[string][]int),
+		byMethod:      make(map[string][]int),
+		withoutMethod: make(map[string][]int),
 	}
+	trie := buildAssociationPathTrie(static)
 	for runtimeIndex, request := range runtime {
 		parsed, err := url.Parse(request.URL)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -333,33 +336,15 @@ func newRuntimeAssociationIndex(runtime []RuntimeRequest) runtimeAssociationInde
 			continue
 		}
 		method := strings.ToUpper(strings.TrimSpace(request.Method))
-		for start := range pathValue.segments {
-			suffix := pathValue.segments[start:]
-			exactKey := strings.Join(suffix, "\x1f")
-			index.exactAnyMethod[exactKey] = append(index.exactAnyMethod[exactKey], runtimeIndex)
+		walkAssociationPathTrie(trie, pathValue.segments, len(pathValue.segments)-1, func(associationKey string) {
+			index.anyMethod[associationKey] = append(index.anyMethod[associationKey], runtimeIndex)
 			if method == "" {
-				index.exactWithoutMethod[exactKey] = append(index.exactWithoutMethod[exactKey], runtimeIndex)
+				index.withoutMethod[associationKey] = append(index.withoutMethod[associationKey], runtimeIndex)
 			} else {
-				key := method + "\x00" + exactKey
-				index.exactByMethod[key] = append(index.exactByMethod[key], runtimeIndex)
+				key := method + "\x00" + associationKey
+				index.byMethod[key] = append(index.byMethod[key], runtimeIndex)
 			}
-
-			// Expression candidates are keyed by their fixed prefix before the
-			// first EXPR segment, the exact suffix length, and the final segment.
-			// Generate each possible fixed-prefix length for this runtime suffix;
-			// the paths are short and this avoids scanning every request sharing a
-			// generic last segment.
-			for prefixLength := 1; prefixLength < len(suffix); prefixLength++ {
-				expressionKey := expressionAssociationKey(len(suffix), suffix[:prefixLength], suffix[len(suffix)-1])
-				index.expressionAnyMethod[expressionKey] = append(index.expressionAnyMethod[expressionKey], runtimeIndex)
-				if method == "" {
-					index.expressionNoMethod[expressionKey] = append(index.expressionNoMethod[expressionKey], runtimeIndex)
-				} else {
-					key := method + "\x00" + expressionKey
-					index.expressionByMethod[key] = append(index.expressionByMethod[key], runtimeIndex)
-				}
-			}
-		}
+		})
 	}
 	return index
 }
@@ -369,33 +354,62 @@ func (index runtimeAssociationIndex) candidates(static StaticEndpoint) []int {
 	if !ok || len(staticPath.segments) == 0 {
 		return nil
 	}
+	if hasExpressionSegment(staticPath) {
+		if staticPath.segments[0] == "EXPR" || staticPath.segments[len(staticPath.segments)-1] == "EXPR" {
+			return nil
+		}
+	}
 	method := strings.ToUpper(strings.TrimSpace(static.Method))
-	firstExpression := -1
-	for segmentIndex, segment := range staticPath.segments {
-		if segment == "EXPR" {
-			firstExpression = segmentIndex
-			break
-		}
-	}
-	if firstExpression < 0 {
-		key := strings.Join(staticPath.segments, "\x1f")
-		if method == "" {
-			return index.exactAnyMethod[key]
-		}
-		return combineRuntimeCandidates(index.exactByMethod[method+"\x00"+key], index.exactWithoutMethod[key])
-	}
-	if firstExpression == 0 || staticPath.segments[len(staticPath.segments)-1] == "EXPR" {
-		return nil
-	}
-	key := expressionAssociationKey(len(staticPath.segments), staticPath.segments[:firstExpression], staticPath.segments[len(staticPath.segments)-1])
+	key := strings.Join(staticPath.segments, "\x1f")
 	if method == "" {
-		return index.expressionAnyMethod[key]
+		return index.anyMethod[key]
 	}
-	return combineRuntimeCandidates(index.expressionByMethod[method+"\x00"+key], index.expressionNoMethod[key])
+	return combineRuntimeCandidates(index.byMethod[method+"\x00"+key], index.withoutMethod[key])
 }
 
-func expressionAssociationKey(pathLength int, fixedPrefix []string, lastSegment string) string {
-	return strconv.Itoa(pathLength) + "\x00" + strings.Join(fixedPrefix, "\x1f") + "\x00" + lastSegment
+func buildAssociationPathTrie(static []StaticEndpoint) *associationPathTrie {
+	root := &associationPathTrie{}
+	for _, endpoint := range static {
+		pathValue, ok := normalizeStaticPath(endpoint.RawURL)
+		if !ok || len(pathValue.segments) == 0 {
+			continue
+		}
+		if hasExpressionSegment(pathValue) && (pathValue.segments[0] == "EXPR" || pathValue.segments[len(pathValue.segments)-1] == "EXPR") {
+			continue
+		}
+		node := root
+		for segmentIndex := len(pathValue.segments) - 1; segmentIndex >= 0; segmentIndex-- {
+			if node.children == nil {
+				node.children = make(map[string]*associationPathTrie)
+			}
+			segment := pathValue.segments[segmentIndex]
+			child := node.children[segment]
+			if child == nil {
+				child = &associationPathTrie{}
+				node.children[segment] = child
+			}
+			node = child
+		}
+		node.associationKey = strings.Join(pathValue.segments, "\x1f")
+	}
+	return root
+}
+
+func walkAssociationPathTrie(node *associationPathTrie, segments []string, segmentIndex int, visit func(string)) {
+	if node == nil {
+		return
+	}
+	if node.associationKey != "" {
+		visit(node.associationKey)
+	}
+	if segmentIndex < 0 {
+		return
+	}
+	segment := segments[segmentIndex]
+	walkAssociationPathTrie(node.children[segment], segments, segmentIndex-1, visit)
+	if segment != "EXPR" {
+		walkAssociationPathTrie(node.children["EXPR"], segments, segmentIndex-1, visit)
+	}
 }
 
 func combineRuntimeCandidates(first, second []int) []int {
@@ -580,8 +594,8 @@ func buildEndpoints(static []StaticEndpoint, runtime []RuntimeRequest, associati
 
 func resolveCandidates(endpoint StaticEndpoint, bases []RuntimeBase) []string {
 	raw := endpoint.RawURL
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme != "" || parsed.Host != "" {
+	parsed, sourceRelative, ok := parseStaticReference(endpoint)
+	if !ok {
 		return []string{}
 	}
 	staticPath, ok := normalizeStaticPath(raw)
@@ -589,7 +603,15 @@ func resolveCandidates(endpoint StaticEndpoint, bases []RuntimeBase) []string {
 		return []string{}
 	}
 	suffix := strings.Join(staticPath.segments, "/")
-	if suffix == "" || strings.Contains(suffix, "EXPR") {
+	if suffix == "" || hasExpressionSegment(staticPath) {
+		return []string{}
+	}
+	if sourceRelative && parsed.Scheme != "" && parsed.Host != "" {
+		parsed.Fragment = ""
+		parsed.RawFragment = ""
+		return []string{parsed.String()}
+	}
+	if parsed.Scheme != "" || parsed.Host != "" {
 		return []string{}
 	}
 	out := make([]string, 0, len(bases))
@@ -660,15 +682,12 @@ func isReportableStaticOnly(endpoint StaticEndpoint, entryOrigins map[string]boo
 	if raw == "" || strings.HasPrefix(raw, "?") || strings.HasPrefix(raw, "#") {
 		return false
 	}
-	parsed, err := url.Parse(raw)
-	if err != nil {
+	parsed, _, ok := parseStaticReference(endpoint)
+	if !ok {
 		return false
 	}
 	if parsed.Host != "" {
-		origin := ""
-		if parsed.Scheme != "" {
-			origin = parsed.Scheme + "://" + parsed.Host
-		}
+		origin := urlutil.GetOrigin(parsed.String())
 		if (origin == "" || !entryOrigins[origin]) && strings.TrimSpace(endpoint.Method) == "" {
 			return false
 		}
@@ -677,8 +696,27 @@ func isReportableStaticOnly(endpoint StaticEndpoint, entryOrigins map[string]boo
 	case ".htm", ".html", ".xhtml", ".pdf":
 		return false
 	}
-	_, ok := normalizeStaticPath(raw)
+	_, ok = normalizeStaticPath(raw)
 	return ok
+}
+
+// parseStaticReference resolves protocol-relative references in the source
+// entry's context. Other relative paths remain relative because association may
+// legitimately infer a cross-origin API base from runtime evidence.
+func parseStaticReference(endpoint StaticEndpoint) (*url.URL, bool, bool) {
+	reference, err := url.Parse(strings.TrimSpace(endpoint.RawURL))
+	if err != nil {
+		return nil, false, false
+	}
+	sourceRelative := reference.Scheme == ""
+	if sourceRelative && reference.Host != "" && endpoint.SourceIdentity.EntryURL != "" {
+		base, err := url.Parse(endpoint.SourceIdentity.EntryURL)
+		if err != nil || base.Scheme == "" || base.Host == "" {
+			return nil, sourceRelative, false
+		}
+		reference = base.ResolveReference(reference)
+	}
+	return reference, sourceRelative, true
 }
 
 func staticInterfaceKey(raw, method string) string {

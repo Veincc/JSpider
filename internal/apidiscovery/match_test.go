@@ -1,6 +1,10 @@
 package apidiscovery
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestAssociateInfersSegmentBoundedPrefix(t *testing.T) {
 	static := []StaticEndpoint{
@@ -282,6 +286,45 @@ func TestRelativeStaticAssociationIsIsolatedToItsSourceEntry(t *testing.T) {
 	}
 }
 
+func TestProtocolRelativeStaticAssociationUsesOwnEntryIdentityAndScheme(t *testing.T) {
+	firstEntry := "http://first.example/app/"
+	report := BuildReport(
+		[]StaticEndpoint{{
+			RawURL: "//api.example/api/users", Method: "GET",
+			SourceIdentity: SourceIdentity{EntryURL: firstEntry},
+		}},
+		[]RuntimeRequest{
+			{RequestID: "cross-entry", URL: "http://api.example/api/users", Method: "GET", ResourceType: "Fetch", EntryURL: "http://second.example/app/"},
+			{RequestID: "cross-scheme", URL: "https://api.example/api/users", Method: "GET", ResourceType: "Fetch", EntryURL: firstEntry},
+			{RequestID: "own-entry", URL: "http://api.example/api/users", Method: "GET", ResourceType: "Fetch", EntryURL: firstEntry},
+		},
+	)
+	if len(report.Associations) != 1 || report.Associations[0].RuntimeIndex != 2 {
+		t.Fatalf("associations = %+v, want only same-entry same-scheme runtime", report.Associations)
+	}
+}
+
+func TestProtocolRelativeStaticOnlyUsesResolvedOriginAndCandidate(t *testing.T) {
+	entry := "http://first.example/app/"
+	session := NewSession()
+	session.AddEntryURL(entry)
+	session.AddStatic([]StaticEndpoint{{
+		RawURL:         "//first.example/api/users",
+		SourceIdentity: SourceIdentity{EntryURL: entry},
+	}})
+	report := session.Report()
+	if len(report.Endpoints) != 1 || report.Endpoints[0].Kind != EndpointStaticOnly {
+		t.Fatalf("endpoints = %+v, want methodless same-origin static endpoint", report.Endpoints)
+	}
+	want := []string{"http://first.example/api/users"}
+	if got := report.Endpoints[0].ResolvedCandidates; len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("resolved candidates = %v, want %v", got, want)
+	}
+	if got := EndpointURLs(report, []string{entry}); len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("EndpointURLs() = %v, want %v", got, want)
+	}
+}
+
 func TestExpressionWithoutFixedPrefixRemainsStaticOnly(t *testing.T) {
 	report := BuildReport(
 		[]StaticEndpoint{{
@@ -335,6 +378,85 @@ func TestAssociationIndexUsesMethodFinalSegmentAndFixedPrefix(t *testing.T) {
 	if report.Associations[0].Prefix != "/gw" || report.Associations[1].Prefix != "/gw" {
 		t.Fatalf("association prefixes = %+v, want fixed /gw", report.Associations)
 	}
+}
+
+func TestExpressionAssociationIndexPartitionsFixedSegmentsAfterEXPR(t *testing.T) {
+	const count = 64
+	static := make([]StaticEndpoint, count)
+	runtime := make([]RuntimeRequest, count)
+	for index := 0; index < count; index++ {
+		static[index] = StaticEndpoint{
+			RawURL: fmt.Sprintf("/api/EXPR/item-%03d/users", index),
+			Method: "GET",
+		}
+		runtime[index] = RuntimeRequest{
+			URL:          fmt.Sprintf("https://example.com/gw/api/value/item-%03d/users", index),
+			Method:       "GET",
+			ResourceType: "Fetch",
+		}
+	}
+
+	associationIndex := newRuntimeAssociationIndex(static, runtime)
+	for staticIndex, endpoint := range static {
+		candidates := associationIndex.candidates(endpoint)
+		if len(candidates) != 1 || candidates[0] != staticIndex {
+			t.Fatalf("static[%d] candidates = %v, want only runtime %d", staticIndex, candidates, staticIndex)
+		}
+	}
+}
+
+func TestAssociationIndexLongExactPathMetadataIsLinear(t *testing.T) {
+	const segmentCount = 512
+	segments := make([]string, segmentCount)
+	for index := range segments {
+		segments[index] = fmt.Sprintf("segment-%03d", index)
+	}
+	pathValue := "/" + strings.Join(segments, "/")
+	static := []StaticEndpoint{{RawURL: pathValue, Method: "GET"}}
+	runtime := []RuntimeRequest{{
+		URL: "https://example.com/gateway" + pathValue, Method: "GET", ResourceType: "Fetch",
+	}}
+
+	trie := buildAssociationPathTrie(static)
+	if nodes := countAssociationPathTrieNodes(trie); nodes != segmentCount+1 {
+		t.Fatalf("trie nodes = %d, want %d for one %d-segment static path", nodes, segmentCount+1, segmentCount)
+	}
+	associationIndex := newRuntimeAssociationIndex(static, runtime)
+	if len(associationIndex.anyMethod) != 1 || len(associationIndex.byMethod) != 1 {
+		t.Fatalf("candidate map keys = any:%d method:%d, want one actual static match in each", len(associationIndex.anyMethod), len(associationIndex.byMethod))
+	}
+	if candidates := associationIndex.candidates(static[0]); len(candidates) != 1 || candidates[0] != 0 {
+		t.Fatalf("candidates = %v, want runtime 0", candidates)
+	}
+}
+
+func TestExpressionAssociationIndexPreservesEmptyMethodCompatibility(t *testing.T) {
+	static := []StaticEndpoint{
+		{RawURL: "/api/EXPR/users", Method: "GET"},
+		{RawURL: "/api/EXPR/users"},
+	}
+	runtime := []RuntimeRequest{
+		{URL: "https://example.com/api/one/users", ResourceType: "Fetch"},
+		{URL: "https://example.com/api/two/users", Method: "POST", ResourceType: "Fetch"},
+	}
+	associationIndex := newRuntimeAssociationIndex(static, runtime)
+	if candidates := associationIndex.candidates(static[0]); len(candidates) != 1 || candidates[0] != 0 {
+		t.Fatalf("GET static candidates = %v, want empty-method runtime compatibility", candidates)
+	}
+	if candidates := associationIndex.candidates(static[1]); len(candidates) != 2 {
+		t.Fatalf("methodless static candidates = %v, want both runtime methods", candidates)
+	}
+}
+
+func countAssociationPathTrieNodes(node *associationPathTrie) int {
+	if node == nil {
+		return 0
+	}
+	count := 1
+	for _, child := range node.children {
+		count += countAssociationPathTrieNodes(child)
+	}
+	return count
 }
 
 func TestRuntimeBaseEvidenceDoesNotCrossSourceEntries(t *testing.T) {

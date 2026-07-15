@@ -47,12 +47,15 @@ func preferredEndpointCandidates(endpoint Endpoint, entryURLs []string) []string
 	if raw == "" || strings.HasPrefix(raw, "?") || strings.HasPrefix(raw, "#") {
 		return nil
 	}
-	reference, err := url.Parse(raw)
-	if err != nil {
+	reference, _, ok := parseStaticReference(StaticEndpoint{
+		RawURL:         raw,
+		SourceIdentity: endpoint.SourceIdentity,
+	})
+	if !ok {
 		return nil
 	}
 	if reference.Scheme != "" {
-		return []string{raw}
+		return []string{reference.String()}
 	}
 	if endpoint.SourceIdentity.EntryURL != "" {
 		base, err := url.Parse(endpoint.SourceIdentity.EntryURL)
@@ -82,7 +85,7 @@ func normalizeEndpointURL(raw string) (string, bool) {
 	default:
 		return "", false
 	}
-	if strings.Contains(parsed.Path, "EXPR") {
+	if hasExpressionSegment(normalizePath(parsed.EscapedPath())) {
 		return "", false
 	}
 	parsed.Fragment = ""
