@@ -419,6 +419,53 @@ func TestExpressionAssociationIndexPartitionsFixedSegmentsAfterEXPR(t *testing.T
 	}
 }
 
+func TestAssociationIndexPartitionsSamePathBySourceEntry(t *testing.T) {
+	const count = 64
+	static := make([]StaticEndpoint, count)
+	runtime := make([]RuntimeRequest, count)
+	for index := 0; index < count; index++ {
+		entry := fmt.Sprintf("https://entry-%03d.example/", index)
+		rawURL := "/api/users"
+		if index%2 == 1 {
+			rawURL = "//api.example/api/users"
+		}
+		staticMethod := "GET"
+		runtimeMethod := "GET"
+		switch index % 3 {
+		case 1:
+			runtimeMethod = ""
+		case 2:
+			staticMethod = ""
+			runtimeMethod = "POST"
+		}
+		static[index] = StaticEndpoint{
+			RawURL: rawURL, Method: staticMethod, SourceIdentity: SourceIdentity{EntryURL: entry},
+		}
+		runtime[index] = RuntimeRequest{
+			URL: "https://api.example/api/users", Method: runtimeMethod, ResourceType: "Fetch", EntryURL: entry,
+		}
+	}
+
+	associationIndex := newRuntimeAssociationIndex(static, runtime)
+	for staticIndex, endpoint := range static {
+		candidates := associationIndex.candidates(endpoint)
+		if len(candidates) != 1 || candidates[0] != staticIndex {
+			t.Fatalf("static[%d] candidates = %v, want only same-entry runtime %d", staticIndex, candidates, staticIndex)
+		}
+	}
+
+	unproven := make([]StaticEndpoint, count)
+	for index := range unproven {
+		unproven[index] = StaticEndpoint{RawURL: "//api.example/api/users", Method: "GET"}
+	}
+	unprovenIndex := newRuntimeAssociationIndex(unproven, runtime)
+	for staticIndex, endpoint := range unproven {
+		if candidates := unprovenIndex.candidates(endpoint); len(candidates) != 0 {
+			t.Fatalf("unproven static[%d] candidates = %v, want none", staticIndex, candidates)
+		}
+	}
+}
+
 func TestAssociationIndexLongExactPathMetadataIsLinear(t *testing.T) {
 	const segmentCount = 512
 	segments := make([]string, segmentCount)

@@ -312,9 +312,12 @@ func matchPath(static, runtime normalizedPath) (int, []string, bool, bool) {
 }
 
 type runtimeAssociationIndex struct {
-	anyMethod     map[string][]int
-	byMethod      map[string][]int
-	withoutMethod map[string][]int
+	anyMethod          map[string][]int
+	byMethod           map[string][]int
+	withoutMethod      map[string][]int
+	entryAnyMethod     map[string][]int
+	entryByMethod      map[string][]int
+	entryWithoutMethod map[string][]int
 }
 
 type associationPathTrie struct {
@@ -324,9 +327,12 @@ type associationPathTrie struct {
 
 func newRuntimeAssociationIndex(static []StaticEndpoint, runtime []RuntimeRequest) runtimeAssociationIndex {
 	index := runtimeAssociationIndex{
-		anyMethod:     make(map[string][]int),
-		byMethod:      make(map[string][]int),
-		withoutMethod: make(map[string][]int),
+		anyMethod:          make(map[string][]int),
+		byMethod:           make(map[string][]int),
+		withoutMethod:      make(map[string][]int),
+		entryAnyMethod:     make(map[string][]int),
+		entryByMethod:      make(map[string][]int),
+		entryWithoutMethod: make(map[string][]int),
 	}
 	trie := buildAssociationPathTrie(static)
 	for runtimeIndex, request := range runtime {
@@ -347,12 +353,26 @@ func newRuntimeAssociationIndex(static []StaticEndpoint, runtime []RuntimeReques
 				key := method + "\x00" + associationKey
 				index.byMethod[key] = append(index.byMethod[key], runtimeIndex)
 			}
+			if request.EntryURL != "" {
+				entryKey := request.EntryURL + "\x00" + associationKey
+				index.entryAnyMethod[entryKey] = append(index.entryAnyMethod[entryKey], runtimeIndex)
+				if method == "" {
+					index.entryWithoutMethod[entryKey] = append(index.entryWithoutMethod[entryKey], runtimeIndex)
+				} else {
+					methodKey := request.EntryURL + "\x00" + method + "\x00" + associationKey
+					index.entryByMethod[methodKey] = append(index.entryByMethod[methodKey], runtimeIndex)
+				}
+			}
 		})
 	}
 	return index
 }
 
 func (index runtimeAssociationIndex) candidates(static StaticEndpoint) []int {
+	reference, sourceRelative, ok := parseStaticReference(static)
+	if !ok || isUnprovenProtocolRelative(reference, sourceRelative, static.SourceIdentity) {
+		return nil
+	}
 	staticPath, ok := normalizeStaticPath(static.RawURL)
 	if !ok || len(staticPath.segments) == 0 {
 		return nil
@@ -364,6 +384,14 @@ func (index runtimeAssociationIndex) candidates(static StaticEndpoint) []int {
 	}
 	method := strings.ToUpper(strings.TrimSpace(static.Method))
 	key := strings.Join(staticPath.segments, "\x1f")
+	if sourceRelative && static.SourceIdentity.EntryURL != "" {
+		entryKey := static.SourceIdentity.EntryURL + "\x00" + key
+		if method == "" {
+			return index.entryAnyMethod[entryKey]
+		}
+		methodKey := static.SourceIdentity.EntryURL + "\x00" + method + "\x00" + key
+		return combineRuntimeCandidates(index.entryByMethod[methodKey], index.entryWithoutMethod[entryKey])
+	}
 	if method == "" {
 		return index.anyMethod[key]
 	}
