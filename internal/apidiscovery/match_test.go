@@ -304,6 +304,20 @@ func TestProtocolRelativeStaticAssociationUsesOwnEntryIdentityAndScheme(t *testi
 	}
 }
 
+func TestProtocolRelativeStaticWithoutSourceIdentityDoesNotAssociate(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{{RawURL: "//api.example/api/users", Method: "GET"}},
+		[]RuntimeRequest{
+			{RequestID: "http-first", URL: "http://api.example/api/users", Method: "GET", ResourceType: "Fetch", EntryURL: "http://first.example/"},
+			{RequestID: "https-first", URL: "https://api.example/api/users", Method: "GET", ResourceType: "Fetch", EntryURL: "http://first.example/"},
+			{RequestID: "http-second", URL: "http://api.example/api/users", Method: "GET", ResourceType: "Fetch", EntryURL: "http://second.example/"},
+		},
+	)
+	if len(report.Associations) != 0 {
+		t.Fatalf("associations = %+v, want no binding without source entry provenance", report.Associations)
+	}
+}
+
 func TestProtocolRelativeStaticOnlyUsesResolvedOriginAndCandidate(t *testing.T) {
 	entry := "http://first.example/app/"
 	session := NewSession()

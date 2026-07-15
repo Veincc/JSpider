@@ -20,12 +20,10 @@ func TestEndpointURLsUsesPriorityAndResolvesRelativeRawURLs(t *testing.T) {
 		{RawURL: "/api/users"},
 		{RawURL: "./api/orders"},
 		{RawURL: "../api/admin"},
-		{RawURL: "//api.example.net/users"},
 	}}
 	got := EndpointURLs(report, []string{"https://example.com/base/page"})
 	want := []string{
 		"https://api.example.com/matched",
-		"https://api.example.net/users",
 		"https://example.com/absolute?q=1",
 		"https://example.com/api/admin",
 		"https://example.com/api/users",
@@ -34,6 +32,32 @@ func TestEndpointURLsUsesPriorityAndResolvesRelativeRawURLs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("EndpointURLs() = %v, want %v", got, want)
+	}
+}
+
+func TestEndpointURLsDoesNotGuessEntriesForUnprovenProtocolRelativeStatic(t *testing.T) {
+	report := BuildReport([]StaticEndpoint{{
+		RawURL: "//api.example/api/users", Method: "GET",
+	}}, nil)
+	if len(report.Endpoints) != 1 || report.Endpoints[0].Kind != EndpointStaticOnly || len(report.Endpoints[0].ResolvedCandidates) != 0 {
+		t.Fatalf("endpoints = %+v, want unresolved static-only evidence", report.Endpoints)
+	}
+	entries := []string{"http://first.example/app/", "https://second.example/root/"}
+	if got := EndpointURLs(report, entries); len(got) != 0 {
+		t.Fatalf("EndpointURLs() = %v, want no guessed scheme or entry", got)
+	}
+
+	legacy := Report{Endpoints: []Endpoint{
+		{RawURL: "/api/relative"},
+		{RawURL: "https://api.example/absolute"},
+	}}
+	want := []string{
+		"http://first.example/api/relative",
+		"https://api.example/absolute",
+		"https://second.example/api/relative",
+	}
+	if got := EndpointURLs(legacy, entries); !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy relative/absolute EndpointURLs() = %v, want %v", got, want)
 	}
 }
 

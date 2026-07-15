@@ -47,11 +47,14 @@ func preferredEndpointCandidates(endpoint Endpoint, entryURLs []string) []string
 	if raw == "" || strings.HasPrefix(raw, "?") || strings.HasPrefix(raw, "#") {
 		return nil
 	}
-	reference, _, ok := parseStaticReference(StaticEndpoint{
+	reference, sourceRelative, ok := parseStaticReference(StaticEndpoint{
 		RawURL:         raw,
 		SourceIdentity: endpoint.SourceIdentity,
 	})
 	if !ok {
+		return nil
+	}
+	if isUnprovenProtocolRelative(reference, sourceRelative, endpoint.SourceIdentity) {
 		return nil
 	}
 	if reference.Scheme != "" {

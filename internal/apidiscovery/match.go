@@ -123,6 +123,9 @@ func associateOne(static StaticEndpoint, runtime RuntimeRequest) (Association, b
 	if !ok {
 		return Association{}, false
 	}
+	if isUnprovenProtocolRelative(staticURL, sourceRelative, static.SourceIdentity) {
+		return Association{}, false
+	}
 	if sourceRelative && static.SourceIdentity.EntryURL != "" && runtime.EntryURL != static.SourceIdentity.EntryURL {
 		return Association{}, false
 	}
@@ -598,6 +601,9 @@ func resolveCandidates(endpoint StaticEndpoint, bases []RuntimeBase) []string {
 	if !ok {
 		return []string{}
 	}
+	if isUnprovenProtocolRelative(parsed, sourceRelative, endpoint.SourceIdentity) {
+		return []string{}
+	}
 	staticPath, ok := normalizeStaticPath(raw)
 	if !ok {
 		return []string{}
@@ -717,6 +723,10 @@ func parseStaticReference(endpoint StaticEndpoint) (*url.URL, bool, bool) {
 		reference = base.ResolveReference(reference)
 	}
 	return reference, sourceRelative, true
+}
+
+func isUnprovenProtocolRelative(reference *url.URL, sourceRelative bool, identity SourceIdentity) bool {
+	return sourceRelative && reference.Scheme == "" && reference.Host != "" && identity.EntryURL == ""
 }
 
 func staticInterfaceKey(raw, method string) string {
