@@ -60,6 +60,38 @@ func TestInitializeBrowserAllocatesBeforeUsingSetupTimeout(t *testing.T) {
 	}
 }
 
+func TestHeadlessExternalAndClickablePolicyUsesCanonicalOrigin(t *testing.T) {
+	cfg := &Config{EntryURL: "https://example.com/start", SameOrigin: true}
+	canonicalURL := "HTTPS://EXAMPLE.com:443/app.js"
+	nonDefaultURL := "https://example.com:444/app.js"
+
+	if !isAllowedByPolicy(canonicalURL, cfg) {
+		t.Fatal("canonical same-origin JavaScript classified as external")
+	}
+	if isAllowedByPolicy(nonDefaultURL, cfg) {
+		t.Fatal("non-default-port JavaScript classified as same-origin")
+	}
+	if shouldSkipClickableHref(canonicalURL, cfg.EntryURL) {
+		t.Fatal("canonical same-origin link was skipped")
+	}
+	if !shouldSkipClickableHref(nonDefaultURL, cfg.EntryURL) {
+		t.Fatal("non-default-port link was treated as internal")
+	}
+	if shouldSkipClickableHref("//EXAMPLE.com:443/next", "HTTPS://example.com/start") {
+		t.Fatal("protocol-relative canonical link with uppercase entry scheme was skipped")
+	}
+
+	cdnCfg := &Config{
+		EntryURL: "https://example.com/start", SameOrigin: true, AllowCDN: []string{"cdn.example"},
+	}
+	if isAllowedByPolicy("ftp://cdn.example/app.js", cdnCfg) {
+		t.Fatal("non-HTTP CDN JavaScript was allowed")
+	}
+	if isAllowedByPolicy("https://cdn.example:/app.js", cdnCfg) {
+		t.Fatal("invalid-port CDN JavaScript was allowed")
+	}
+}
+
 func TestInitializeBrowserCancelsLaunchAtAbsoluteCutoff(t *testing.T) {
 	browserCtx, browserCancel := context.WithCancel(context.Background())
 	defer browserCancel()

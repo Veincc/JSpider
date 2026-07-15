@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,67 @@ func newTestFetcher(t *testing.T, ts *httptest.Server) *Fetcher {
 		t.Fatalf("New() error = %v", err)
 	}
 	return f
+}
+
+func TestShouldSendCookiesUsesCanonicalOrigin(t *testing.T) {
+	if !shouldSendCookies("https://EXAMPLE.com:443/app.js", "https://example.com/") {
+		t.Fatal("canonical same-origin request lost cookies")
+	}
+	if shouldSendCookies("https://example.com:444/app.js", "https://example.com/") {
+		t.Fatal("non-default port received same-origin cookies")
+	}
+}
+
+func TestRedirectPolicyUsesCanonicalOrigin(t *testing.T) {
+	checker := redirectChecker(&config.Config{SameOrigin: true})
+	entryURL := "https://example.com/start"
+
+	canonicalTarget, err := http.NewRequestWithContext(
+		context.WithValue(context.Background(), redirectPolicyKey{}, entryURL),
+		http.MethodGet,
+		"https://EXAMPLE.com:443/next",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(canonicalTarget, nil); err != nil {
+		t.Fatalf("canonical same-origin redirect rejected: %v", err)
+	}
+
+	nonDefaultTarget, err := http.NewRequestWithContext(
+		context.WithValue(context.Background(), redirectPolicyKey{}, entryURL),
+		http.MethodGet,
+		"https://example.com:444/next",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(nonDefaultTarget, nil); err == nil {
+		t.Fatal("non-default-port redirect accepted as same-origin")
+	}
+}
+
+func TestRedirectCanonicalPolicyRejectsInvalidAllowedCDNOrigin(t *testing.T) {
+	checker := redirectChecker(&config.Config{SameOrigin: true, AllowCDN: []string{"cdn.example"}})
+	entryContext := context.WithValue(context.Background(), redirectPolicyKey{}, "https://example.com/start")
+
+	ftpTarget, err := http.NewRequestWithContext(entryContext, http.MethodGet, "ftp://cdn.example/next", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(ftpTarget, nil); err == nil {
+		t.Fatal("non-HTTP CDN redirect accepted")
+	}
+
+	invalidPortTarget := (&http.Request{
+		Method: http.MethodGet,
+		URL:    &url.URL{Scheme: "https", Host: "cdn.example:", Path: "/next"},
+	}).WithContext(entryContext)
+	if err := checker(invalidPortTarget, nil); err == nil {
+		t.Fatal("invalid-port CDN redirect accepted")
+	}
 }
 
 func TestFetchRecordsRequestedAndRedirectFinalURLs(t *testing.T) {

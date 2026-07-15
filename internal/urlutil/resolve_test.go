@@ -63,6 +63,28 @@ func TestIsSameOrigin(t *testing.T) {
 	}
 }
 
+func TestIsSameOriginUsesCanonicalHTTPOrigin(t *testing.T) {
+	tests := []struct {
+		left  string
+		right string
+		want  bool
+	}{
+		{"https://EXAMPLE.com:443/a", "https://example.com/b", true},
+		{"http://example.com:80/a", "http://example.com/b", true},
+		{"https://bücher.example/a", "https://xn--bcher-kva.example/b", true},
+		{"http://[2001:0db8::1]:80/a", "http://[2001:db8::1]/b", true},
+		{"https://example.com:444/a", "https://example.com/b", false},
+		{"http://example.com/a", "https://example.com/a", false},
+		{"ftp://example.com/a", "ftp://example.com/b", false},
+		{"%zz", "https://example.com/b", false},
+	}
+	for _, test := range tests {
+		if got := IsSameOrigin(test.left, test.right); got != test.want {
+			t.Errorf("IsSameOrigin(%q, %q) = %v, want %v", test.left, test.right, got, test.want)
+		}
+	}
+}
+
 func TestGetOriginRequiresSchemeAndHost(t *testing.T) {
 	tests := []struct {
 		raw  string
@@ -70,6 +92,12 @@ func TestGetOriginRequiresSchemeAndHost(t *testing.T) {
 	}{
 		{"https://example.com/path", "https://example.com"},
 		{"http://example.com:8080/path", "http://example.com:8080"},
+		{"https://EXAMPLE.com:443/path", "https://example.com"},
+		{"http://EXAMPLE.com:80/path", "http://example.com"},
+		{"https://bücher.example/path", "https://xn--bcher-kva.example"},
+		{"http://[2001:0db8::1]:80/path", "http://[2001:db8::1]"},
+		{"ftp://example.com/path", ""},
+		{"%zz", ""},
 		{"/relative/path", ""},
 		{"", ""},
 	}
@@ -107,8 +135,15 @@ func TestIsAllowedDomain(t *testing.T) {
 	}{
 		{"https://example.com/a.js", "https://example.com/", nil, true},
 		{"https://cdn.example.com/a.js", "https://example.com/", []string{"cdn.example.com"}, true},
+		{"https://cdn.example.com/a.js", "https://example.com/", []string{"cdn.example.com:8443"}, true},
 		{"https://other.com/a.js", "https://example.com/", nil, false},
 		{"https://sub.cdn.com/a.js", "https://example.com/", []string{"cdn.com"}, true},
+		{"https://bücher.example/a.js", "https://example.com/", []string{"bücher.example"}, true},
+		{"https://xn--bcher-kva.example/a.js", "https://example.com/", []string{"bücher.example"}, true},
+		{"https://assets.bücher.example/a.js", "https://example.com/", []string{"bücher.example"}, true},
+		{"https://assets.xn--bcher-kva.example/a.js", "https://example.com/", []string{"https://BÜCHER.example:8443/"}, true},
+		{"ftp://cdn.example.com/a.js", "https://example.com/", []string{"cdn.example.com"}, false},
+		{"https://cdn.example.com:/a.js", "https://example.com/", []string{"cdn.example.com"}, false},
 	}
 	for _, tt := range tests {
 		got := IsAllowedDomain(tt.url, tt.allowed, tt.sameOrigin)

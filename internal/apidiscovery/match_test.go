@@ -339,6 +339,145 @@ func TestProtocolRelativeStaticOnlyUsesResolvedOriginAndCandidate(t *testing.T) 
 	}
 }
 
+func TestDefaultPortAuthorityUsesCanonicalOrigin(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{{
+			RawURL: "https://EXAMPLE.com:443/api/users", Method: "GET",
+		}},
+		[]RuntimeRequest{{
+			URL: "https://example.com/api/users", Method: "GET", ResourceType: "Fetch",
+			EntryURL: "https://example.com/",
+		}},
+	)
+	if len(report.Associations) != 1 {
+		t.Fatalf("associations = %+v, want canonical same-origin match", report.Associations)
+	}
+	association := report.Associations[0]
+	if association.RuntimeOrigin != "https://example.com" {
+		t.Fatalf("runtime origin = %q, want canonical origin", association.RuntimeOrigin)
+	}
+	if !containsString(association.Evidence, "entry_origin") {
+		t.Fatalf("evidence = %v, want canonical entry-origin evidence", association.Evidence)
+	}
+}
+
+func TestProtocolRelativeDefaultPortAuthorityUsesCanonicalOrigin(t *testing.T) {
+	entry := "https://entry.example/app/"
+	static := StaticEndpoint{
+		RawURL: "//API.EXAMPLE:443/api/users", Method: "GET",
+		SourceIdentity: SourceIdentity{EntryURL: entry},
+	}
+	runtime := RuntimeRequest{
+		URL: "https://api.example/api/users", Method: "GET", ResourceType: "XHR", EntryURL: entry,
+	}
+
+	associationIndex := newRuntimeAssociationIndex([]StaticEndpoint{static}, []RuntimeRequest{runtime})
+	if candidates := associationIndex.candidates(static); len(candidates) != 1 || candidates[0] != 0 {
+		t.Fatalf("candidates = %v, want one canonical authority candidate", candidates)
+	}
+	report := BuildReport([]StaticEndpoint{static}, []RuntimeRequest{runtime})
+	if len(report.Associations) != 1 || report.Associations[0].RuntimeOrigin != "https://api.example" {
+		t.Fatalf("associations = %+v, want canonical protocol-relative match", report.Associations)
+	}
+}
+
+func TestEntryOriginEvidenceUsesCanonicalOrigin(t *testing.T) {
+	entry := "https://EXAMPLE.com:443/start"
+	report := BuildReport(
+		[]StaticEndpoint{{
+			RawURL: "/api/users", Method: "GET",
+			SourceIdentity: SourceIdentity{EntryURL: entry},
+		}},
+		[]RuntimeRequest{{
+			URL: "https://EXAMPLE.com:443/api/users", Method: "GET", ResourceType: "Fetch",
+			EntryURL: entry,
+		}},
+	)
+	if len(report.Associations) != 1 {
+		t.Fatalf("associations = %+v, want one", report.Associations)
+	}
+	association := report.Associations[0]
+	if association.RuntimeOrigin != "https://example.com" {
+		t.Fatalf("runtime origin = %q, want canonical origin", association.RuntimeOrigin)
+	}
+	if !containsString(association.Evidence, "entry_origin") {
+		t.Fatalf("evidence = %v, want canonical entry-origin evidence", association.Evidence)
+	}
+}
+
+func TestMethodlessCanonicalSameOriginStaticOnlyIsReportable(t *testing.T) {
+	session := NewSession()
+	session.AddEntryURL("https://example.com/")
+	session.AddStatic([]StaticEndpoint{{RawURL: "https://EXAMPLE.com:443/api/users"}})
+
+	report := session.Report()
+	if len(report.Endpoints) != 1 || report.Endpoints[0].Kind != EndpointStaticOnly {
+		t.Fatalf("endpoints = %+v, want canonical same-origin static-only endpoint", report.Endpoints)
+	}
+}
+
+func TestNonDefaultPortAuthorityRemainsDistinct(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{{RawURL: "https://example.com:444/api/users", Method: "GET"}},
+		[]RuntimeRequest{{URL: "https://example.com/api/users", Method: "GET", ResourceType: "Fetch"}},
+	)
+	if len(report.Associations) != 0 {
+		t.Fatalf("associations = %+v, want non-default port isolated", report.Associations)
+	}
+}
+
+func TestNonHTTPAuthorityDoesNotAssociate(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{{RawURL: "ftp://example.com/api/users", Method: "GET"}},
+		[]RuntimeRequest{{URL: "ftp://example.com/api/users", Method: "GET", ResourceType: "Fetch"}},
+	)
+	if len(report.Associations) != 0 {
+		t.Fatalf("associations = %+v, want non-HTTP authority rejected", report.Associations)
+	}
+}
+
+func TestAssociationIndexRejectsInvalidRuntimeAuthority(t *testing.T) {
+	static := StaticEndpoint{RawURL: "/api/users", Method: "GET"}
+	runtime := []RuntimeRequest{
+		{URL: "ftp://example.com/api/users", Method: "GET", ResourceType: "Fetch"},
+		{URL: "https://example.com:/api/users", Method: "GET", ResourceType: "Fetch"},
+	}
+	associationIndex := newRuntimeAssociationIndex([]StaticEndpoint{static}, runtime)
+	if candidates := associationIndex.candidates(static); len(candidates) != 0 {
+		t.Fatalf("candidates = %v, want invalid runtime authorities omitted from every scope", candidates)
+	}
+}
+
+func TestInvalidStaticAuthorityFailsClosed(t *testing.T) {
+	runtime := []RuntimeRequest{{
+		URL: "https://example.com/api/users", Method: "GET", ResourceType: "Fetch",
+	}}
+	for _, rawURL := range []string{
+		"https:/api/users",
+		"https://example.com:/api/users",
+		"ftp:/api/users",
+		"ftp://example.com/api/users",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			static := StaticEndpoint{RawURL: rawURL, Method: "GET"}
+			associationIndex := newRuntimeAssociationIndex([]StaticEndpoint{static}, runtime)
+			if candidates := associationIndex.candidates(static); len(candidates) != 0 {
+				t.Fatalf("candidates = %v, want invalid static authority rejected", candidates)
+			}
+
+			report := BuildReport([]StaticEndpoint{static}, runtime)
+			if len(report.Associations) != 0 {
+				t.Fatalf("associations = %+v, want invalid static authority rejected", report.Associations)
+			}
+			for _, endpoint := range report.Endpoints {
+				if endpoint.Kind == EndpointStaticOnly && endpoint.RawURL == rawURL {
+					t.Fatalf("invalid static-only endpoint was reported: %+v", endpoint)
+				}
+			}
+		})
+	}
+}
+
 func TestExpressionWithoutFixedPrefixRemainsStaticOnly(t *testing.T) {
 	report := BuildReport(
 		[]StaticEndpoint{{
@@ -528,11 +667,11 @@ func TestAssociationIndexPartitionsSamePathByAuthority(t *testing.T) {
 	portRuntime := []RuntimeRequest{
 		{URL: "http://api.example:443/api/users", Method: "GET", ResourceType: "Fetch"},
 		{URL: "https://api.example/api/users", Method: "GET", ResourceType: "Fetch"},
-		{URL: "https://api.example:443/api/users", Method: "GET", ResourceType: "Fetch"},
+		{URL: "https://api.example:444/api/users", Method: "GET", ResourceType: "Fetch"},
 	}
 	portIndex := newRuntimeAssociationIndex([]StaticEndpoint{portStatic}, portRuntime)
-	if candidates := portIndex.candidates(portStatic); len(candidates) != 1 || candidates[0] != 2 {
-		t.Fatalf("explicit-port candidates = %v, want only same-scheme explicit-port runtime 2", candidates)
+	if candidates := portIndex.candidates(portStatic); len(candidates) != 1 || candidates[0] != 1 {
+		t.Fatalf("explicit-default-port candidates = %v, want canonical HTTPS runtime 1", candidates)
 	}
 }
 

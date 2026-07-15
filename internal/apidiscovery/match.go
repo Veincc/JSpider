@@ -5,7 +5,6 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"unicode"
 
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
@@ -120,6 +119,10 @@ func associateOne(static StaticEndpoint, runtime RuntimeRequest) (Association, b
 	if err != nil || runtimeURL.Scheme == "" || runtimeURL.Host == "" {
 		return Association{}, false
 	}
+	runtimeOrigin := urlutil.GetOrigin(runtimeURL.String())
+	if runtimeOrigin == "" {
+		return Association{}, false
+	}
 	staticURL, sourceRelative, ok := parseStaticReference(static)
 	if !ok {
 		return Association{}, false
@@ -130,13 +133,8 @@ func associateOne(static StaticEndpoint, runtime RuntimeRequest) (Association, b
 	if sourceRelative && static.SourceIdentity.EntryURL != "" && runtime.EntryURL != static.SourceIdentity.EntryURL {
 		return Association{}, false
 	}
-	if staticURL.Host != "" {
-		if !strings.EqualFold(staticURL.Host, runtimeURL.Host) {
-			return Association{}, false
-		}
-		if staticURL.Scheme != "" && !strings.EqualFold(staticURL.Scheme, runtimeURL.Scheme) {
-			return Association{}, false
-		}
+	if staticURL.Host != "" && !urlutil.IsSameOrigin(staticURL.String(), runtimeURL.String()) {
+		return Association{}, false
 	}
 	runtimePath := normalizePath(runtimeURL.EscapedPath())
 	// Match on whole path segments only. A suffix match can infer a gateway
@@ -192,7 +190,6 @@ func associateOne(static StaticEndpoint, runtime RuntimeRequest) (Association, b
 		score += overlap
 		evidence = append(evidence, "body_params")
 	}
-	runtimeOrigin := runtimeURL.Scheme + "://" + runtimeURL.Host
 	if urlutil.GetOrigin(runtime.EntryURL) == runtimeOrigin {
 		score += 5
 		evidence = append(evidence, "entry_origin")
@@ -330,8 +327,7 @@ const (
 type associationCandidateScope struct {
 	kind     associationCandidateScopeKind
 	entryURL string
-	scheme   string
-	host     string
+	origin   string
 }
 
 type associationCandidateKey struct {
@@ -366,7 +362,10 @@ func newRuntimeAssociationIndex(static []StaticEndpoint, runtime []RuntimeReques
 			continue
 		}
 		method := strings.ToUpper(strings.TrimSpace(request.Method))
-		scopes := runtimeAssociationScopes(request, parsed)
+		scopes, ok := runtimeAssociationScopes(request, parsed)
+		if !ok {
+			continue
+		}
 		walkAssociationPathTrie(trie, pathValue.segments, len(pathValue.segments)-1, func(associationKey string) {
 			for _, scope := range scopes {
 				key := associationCandidateKey{scope: scope, associationKey: associationKey}
@@ -398,7 +397,10 @@ func (index runtimeAssociationIndex) candidates(static StaticEndpoint) []int {
 		}
 	}
 	method := strings.ToUpper(strings.TrimSpace(static.Method))
-	scope := staticAssociationScope(static, reference, sourceRelative)
+	scope, ok := staticAssociationScope(static, reference, sourceRelative)
+	if !ok {
+		return nil
+	}
 	key := associationCandidateKey{scope: scope, associationKey: strings.Join(staticPath.segments, "\x1f")}
 	if method == "" {
 		return index.anyMethod[key]
@@ -407,22 +409,28 @@ func (index runtimeAssociationIndex) candidates(static StaticEndpoint) []int {
 	return combineRuntimeCandidates(index.byMethod[methodKey], index.withoutMethod[key])
 }
 
-func runtimeAssociationScopes(request RuntimeRequest, parsed *url.URL) []associationCandidateScope {
-	authority := associationAuthorityScope(associationScopeAuthority, "", parsed)
+func runtimeAssociationScopes(request RuntimeRequest, parsed *url.URL) ([]associationCandidateScope, bool) {
+	authority, ok := associationAuthorityScope(associationScopeAuthority, "", parsed)
+	if !ok {
+		return nil, false
+	}
 	scopes := []associationCandidateScope{
 		{kind: associationScopeGlobal},
 		authority,
 	}
 	if request.EntryURL != "" {
+		entryAuthority := authority
+		entryAuthority.kind = associationScopeEntryAuthority
+		entryAuthority.entryURL = request.EntryURL
 		scopes = append(scopes,
 			associationCandidateScope{kind: associationScopeEntry, entryURL: request.EntryURL},
-			associationAuthorityScope(associationScopeEntryAuthority, request.EntryURL, parsed),
+			entryAuthority,
 		)
 	}
-	return scopes
+	return scopes, true
 }
 
-func staticAssociationScope(static StaticEndpoint, reference *url.URL, sourceRelative bool) associationCandidateScope {
+func staticAssociationScope(static StaticEndpoint, reference *url.URL, sourceRelative bool) (associationCandidateScope, bool) {
 	if reference.Host != "" {
 		if sourceRelative {
 			return associationAuthorityScope(associationScopeEntryAuthority, static.SourceIdentity.EntryURL, reference)
@@ -430,33 +438,21 @@ func staticAssociationScope(static StaticEndpoint, reference *url.URL, sourceRel
 		return associationAuthorityScope(associationScopeAuthority, "", reference)
 	}
 	if sourceRelative && static.SourceIdentity.EntryURL != "" {
-		return associationCandidateScope{kind: associationScopeEntry, entryURL: static.SourceIdentity.EntryURL}
+		return associationCandidateScope{kind: associationScopeEntry, entryURL: static.SourceIdentity.EntryURL}, true
 	}
-	return associationCandidateScope{kind: associationScopeGlobal}
+	return associationCandidateScope{kind: associationScopeGlobal}, true
 }
 
-func associationAuthorityScope(kind associationCandidateScopeKind, entryURL string, parsed *url.URL) associationCandidateScope {
+func associationAuthorityScope(kind associationCandidateScopeKind, entryURL string, parsed *url.URL) (associationCandidateScope, bool) {
+	origin := urlutil.GetOrigin(parsed.String())
+	if origin == "" {
+		return associationCandidateScope{}, false
+	}
 	return associationCandidateScope{
 		kind:     kind,
 		entryURL: entryURL,
-		scheme:   canonicalEqualFold(parsed.Scheme),
-		host:     canonicalEqualFold(parsed.Host),
-	}
-}
-
-func canonicalEqualFold(value string) string {
-	var folded strings.Builder
-	folded.Grow(len(value))
-	for _, current := range value {
-		canonical := current
-		for next := unicode.SimpleFold(current); next != current; next = unicode.SimpleFold(next) {
-			if next < canonical {
-				canonical = next
-			}
-		}
-		folded.WriteRune(canonical)
-	}
-	return folded.String()
+		origin:   origin,
+	}, true
 }
 
 func buildAssociationPathTrie(static []StaticEndpoint) *associationPathTrie {
@@ -783,6 +779,9 @@ func isReportableStaticOnly(endpoint StaticEndpoint, entryOrigins map[string]boo
 	}
 	if parsed.Host != "" {
 		origin := urlutil.GetOrigin(parsed.String())
+		if origin == "" && parsed.Scheme != "" {
+			return false
+		}
 		if (origin == "" || !entryOrigins[origin]) && strings.TrimSpace(endpoint.Method) == "" {
 			return false
 		}
@@ -810,6 +809,11 @@ func parseStaticReference(endpoint StaticEndpoint) (*url.URL, bool, bool) {
 			return nil, sourceRelative, false
 		}
 		reference = base.ResolveReference(reference)
+	}
+	if reference.Scheme != "" {
+		if (reference.Scheme != "http" && reference.Scheme != "https") || reference.Host == "" {
+			return nil, sourceRelative, false
+		}
 	}
 	return reference, sourceRelative, true
 }

@@ -49,26 +49,20 @@ func NormalizeURL(rawURL string) (string, error) {
 	return u.String(), nil
 }
 
-// IsSameOrigin checks whether two URLs share the same origin.
-func IsSameOrigin(u1, u2 string) bool {
-	parsed1, err := url.Parse(u1)
-	if err != nil {
-		return false
-	}
-	parsed2, err := url.Parse(u2)
-	if err != nil {
-		return false
-	}
-	return parsed1.Scheme == parsed2.Scheme && parsed1.Host == parsed2.Host
+// IsSameOrigin checks whether two URLs share the same canonical HTTP(S) origin.
+func IsSameOrigin(left, right string) bool {
+	leftOrigin, leftErr := CanonicalOrigin(left)
+	rightOrigin, rightErr := CanonicalOrigin(right)
+	return leftErr == nil && rightErr == nil && leftOrigin == rightOrigin
 }
 
-// GetOrigin returns the origin (scheme + host) of a URL.
+// GetOrigin returns the canonical HTTP(S) origin of a URL.
 func GetOrigin(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	origin, err := CanonicalOrigin(rawURL)
+	if err != nil {
 		return ""
 	}
-	return u.Scheme + "://" + u.Host
+	return origin
 }
 
 // GetHost returns the host of a URL.
@@ -82,7 +76,11 @@ func GetHost(rawURL string) string {
 
 // IsAllowedDomain checks whether a URL is in the allowed domain list.
 func IsAllowedDomain(rawURL string, allowedDomains []string, sameOriginURL string) bool {
-	parsed, err := url.Parse(rawURL)
+	origin, err := CanonicalOrigin(rawURL)
+	if err != nil {
+		return false
+	}
+	parsed, err := url.Parse(origin)
 	if err != nil {
 		return false
 	}
@@ -92,8 +90,11 @@ func IsAllowedDomain(rawURL string, allowedDomains []string, sameOriginURL strin
 	}
 
 	// Check same origin
-	if sameOriginURL != "" && IsSameOrigin(rawURL, sameOriginURL) {
-		return true
+	if sameOriginURL != "" {
+		sameOrigin, err := CanonicalOrigin(sameOriginURL)
+		if err == nil && origin == sameOrigin {
+			return true
+		}
 	}
 
 	// Check allowed CDN domains
@@ -111,7 +112,7 @@ func IsAllowedDomain(rawURL string, allowedDomains []string, sameOriginURL strin
 }
 
 func normalizeAllowedDomain(domain string) string {
-	d := strings.TrimSpace(strings.ToLower(domain))
+	d := strings.TrimSpace(domain)
 	d = strings.TrimSuffix(d, "/")
 	if d == "" {
 		return ""
@@ -123,7 +124,21 @@ func normalizeAllowedDomain(domain string) string {
 	} else if host, _, err := net.SplitHostPort(d); err == nil {
 		d = host
 	}
-	d = strings.Trim(d, ".")
+	d = strings.Trim(strings.ToLower(d), ".")
+	if len(d) >= 2 && d[0] == '[' && d[len(d)-1] == ']' {
+		d = d[1 : len(d)-1]
+	}
+	if ip := net.ParseIP(d); ip != nil {
+		return strings.ToLower(ip.String())
+	}
+	d, err := originIDNA.ToASCII(d)
+	if err != nil {
+		return ""
+	}
+	d = strings.ToLower(d)
+	if d == "" || !isSupportedASCIIHostname(d) {
+		return ""
+	}
 	return d
 }
 
