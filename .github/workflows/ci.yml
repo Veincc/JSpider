@@ -59,12 +59,12 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: HTML parser
-        run: go test ./internal/html -run '^$' -fuzz '^FuzzExtractEntryJS$' -fuzztime=10s
+        run: go test ./internal/html -run '^$' -fuzz '^FuzzExtractEntryJS$' -fuzztime=250000x
       - name: URL resolution and canonicalization
-        run: go test ./internal/urlutil -run '^$' -fuzz '^FuzzResolveAndCanonicalOrigin$' -fuzztime=10s
+        run: go test ./internal/urlutil -run '^$' -fuzz '^FuzzResolveAndCanonicalOrigin$' -fuzztime=250000x
       - name: Source-map parser
-        run: go test ./internal/preprocess -run '^$' -fuzz '^FuzzParseApplicationSourceMap$' -fuzztime=10s
+        run: go test ./internal/preprocess -run '^$' -fuzz '^FuzzParseApplicationSourceMap$' -fuzztime=250000x
       - name: API request parser
         env:
           CGO_ENABLED: "1"
-        run: go test ./internal/apidiscovery -run '^$' -fuzz '^FuzzParseRequestData$' -fuzztime=10s
+        run: go test ./internal/apidiscovery -run '^$' -fuzz '^FuzzParseRequestData$' -fuzztime=250000x
