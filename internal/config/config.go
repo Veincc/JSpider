@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strings"
@@ -12,10 +13,11 @@ import (
 )
 
 const (
-	DefaultMaxDepth              = 10
-	DefaultMaxSizeMB             = 0
-	DefaultProcessTimeoutSeconds = 30
-	DefaultHeadlessBodyMB        = 8
+	DefaultMaxDepth                    = 10
+	DefaultMaxSizeMB                   = 0
+	DefaultProcessTimeoutSeconds       = 30
+	DefaultHeadlessBodyMB              = 8
+	maxByteLimitMB               int64 = math.MaxInt64 / (1024 * 1024)
 )
 
 type Config struct {
@@ -81,6 +83,7 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "  --process-timeout starts before source-map scanning and propagates caller cancellation; adjacent .map probing has a 3-second sub-deadline.\n")
 		fmt.Fprintf(os.Stderr, "  Decoded source-map input is capped at 128 MiB; recovered output remains capped at 512 files and 64 MiB.\n")
 		fmt.Fprintf(os.Stderr, "  API Discovery may refetch a shared script once per entry; every attempt counts against the canonical-origin -n budget.\n")
+		fmt.Fprintf(os.Stderr, "  API request-body capture admits 4 active and 4 queued CDP reads; parsing is capped at 1 MiB per body.\n")
 		fmt.Fprintf(os.Stderr, "  Headless -t phases use absolute deadlines: navigation 50%%, scrolling 70%%, click/DOM 95%%, body drain 100%%.\n")
 		fmt.Fprintf(os.Stderr, "  Chrome/CDP may fully materialize a response before the cap is applied by --headless-body-mb.\n")
 		fmt.Fprintf(os.Stderr, "  Canonical-origin output names include non-default ports; default ports normalize away, and collisions add an eight-hex-character SHA-256 suffix.\n")
@@ -168,6 +171,9 @@ func (c *Config) Validate() error {
 	if c.MaxSizeMB < 0 {
 		return fmt.Errorf("maximum download size must not be negative")
 	}
+	if int64(c.MaxSizeMB) > maxByteLimitMB {
+		return fmt.Errorf("maximum download size is too large")
+	}
 	if c.Timeout <= 0 {
 		return fmt.Errorf("HTTP timeout must be greater than zero")
 	}
@@ -176,6 +182,9 @@ func (c *Config) Validate() error {
 	}
 	if c.HeadlessBodyMB <= 0 {
 		return fmt.Errorf("headless body limit must be greater than zero")
+	}
+	if int64(c.HeadlessBodyMB) > maxByteLimitMB {
+		return fmt.Errorf("headless body limit is too large")
 	}
 	if _, err := NormalizeProxy(c.Proxy); err != nil {
 		return fmt.Errorf("proxy configuration: %w", err)

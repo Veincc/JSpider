@@ -32,30 +32,55 @@ type runtimeCapture struct {
 	// trackedByKey keeps completed redirects addressable for async
 	// Network.getRequestPostData responses. RequestID alone is not enough when
 	// Chrome reuses it across redirect hops.
-	trackedByKey    map[string]*trackedRuntimeRequest
-	redirectCounts  map[network.RequestID]int
-	webSockets      map[network.RequestID]*trackedRuntimeRequest
-	inFlight        int
-	lastActivity    time.Time
-	activity        chan struct{}
-	postDataPending int
-	postDataIdle    chan struct{}
-	nextOrder       uint64
+	trackedByKey      map[string]*trackedRuntimeRequest
+	latestByRequestID map[network.RequestID]*trackedRuntimeRequest
+	redirectCounts    map[network.RequestID]int
+	webSockets        map[network.RequestID]*trackedRuntimeRequest
+	inFlight          int
+	lastActivity      time.Time
+	activity          chan struct{}
+	postDataPending   int
+	postDataIdle      chan struct{}
+	postDataQueue     []postDataJob
+	postDataWake      chan struct{}
+	postDataCtx       context.Context
+	postDataCancel    context.CancelFunc
+	postDataWorkers   sync.WaitGroup
+	postDataWatcher   sync.WaitGroup
+	postDataAccepting bool
+	postDataFetcher   requestPostDataFetcher
+	postDataError     func(string, error)
+	nextOrder         uint64
 }
 
-const networkQuietRequestMaxAge = 5 * time.Second
+type postDataJob struct {
+	requestID  network.RequestID
+	requestURL string
+	tracked    *trackedRuntimeRequest
+}
+
+type requestPostDataFetcher func(context.Context, network.RequestID) ([]byte, error)
+
+const (
+	networkQuietRequestMaxAge   = 5 * time.Second
+	postDataWorkerCount         = 4
+	postDataQueueCapacity       = 4
+	postDataOutstandingCapacity = postDataWorkerCount + postDataQueueCapacity
+)
 
 func newRuntimeCapture(entryURL string) *runtimeCapture {
 	return &runtimeCapture{
-		entryURL:       apidiscovery.SanitizeURL(entryURL),
-		stage:          "navigate",
-		active:         make(map[network.RequestID]*trackedRuntimeRequest),
-		trackedByKey:   make(map[string]*trackedRuntimeRequest),
-		redirectCounts: make(map[network.RequestID]int),
-		webSockets:     make(map[network.RequestID]*trackedRuntimeRequest),
-		lastActivity:   time.Now(),
-		activity:       make(chan struct{}, 1),
-		postDataIdle:   closedChannel(),
+		entryURL:          apidiscovery.SanitizeURL(entryURL),
+		stage:             "navigate",
+		active:            make(map[network.RequestID]*trackedRuntimeRequest),
+		trackedByKey:      make(map[string]*trackedRuntimeRequest),
+		latestByRequestID: make(map[network.RequestID]*trackedRuntimeRequest),
+		redirectCounts:    make(map[network.RequestID]int),
+		webSockets:        make(map[network.RequestID]*trackedRuntimeRequest),
+		lastActivity:      time.Now(),
+		activity:          make(chan struct{}, 1),
+		postDataIdle:      closedChannel(),
+		postDataWake:      make(chan struct{}, postDataWorkerCount),
 	}
 }
 
@@ -65,9 +90,9 @@ func (c *runtimeCapture) setStage(stage string) {
 	c.mu.Unlock()
 }
 
-func (c *runtimeCapture) handleRequest(event *network.EventRequestWillBeSent) bool {
+func (c *runtimeCapture) handleRequest(event *network.EventRequestWillBeSent) *trackedRuntimeRequest {
 	if event == nil || event.Request == nil || !isCapturedAPIType(event.Type) {
-		return false
+		return nil
 	}
 
 	headers := networkHeaders(event.Request.Headers)
@@ -131,17 +156,33 @@ func (c *runtimeCapture) handleRequest(event *network.EventRequestWillBeSent) bo
 	c.nextOrder++
 	c.active[event.RequestID] = tracked
 	if event.Request.HasPostData {
+		c.latestByRequestID[event.RequestID] = tracked
 		c.trackedByKey[runtimeRequestKey(event.RequestID, event.Request.URL)] = tracked
+	} else {
+		// A bodyless redirect hop invalidates any older post-data token that
+		// reused this CDP request ID without retaining a useless generation.
+		delete(c.latestByRequestID, event.RequestID)
 	}
 	c.markActivityLocked()
-	return true
+	return tracked
 }
 
 func (c *runtimeCapture) setPostData(requestID network.RequestID, requestURL string, body []byte) {
 	c.mu.Lock()
 	key := runtimeRequestKey(requestID, requestURL)
 	tracked := c.trackedByKey[key]
+	c.mu.Unlock()
+	defer c.releasePostDataLookupForTracked(requestID, requestURL, tracked)
+	c.setPostDataForTracked(requestID, requestURL, tracked, body)
+}
+
+func (c *runtimeCapture) setPostDataForTracked(requestID network.RequestID, requestURL string, tracked *trackedRuntimeRequest, body []byte) {
 	if tracked == nil {
+		return
+	}
+	c.mu.Lock()
+	key := runtimeRequestKey(requestID, requestURL)
+	if c.trackedByKey[key] != tracked || c.latestByRequestID[requestID] != tracked {
 		c.mu.Unlock()
 		return
 	}
@@ -156,7 +197,7 @@ func (c *runtimeCapture) setPostData(requestID network.RequestID, requestURL str
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.trackedByKey[key] != tracked {
+	if c.trackedByKey[key] != tracked || c.latestByRequestID[requestID] != tracked {
 		return
 	}
 	tracked.request.BodyParams = data.Body.Params
@@ -166,16 +207,34 @@ func (c *runtimeCapture) setPostData(requestID network.RequestID, requestURL str
 	tracked.request.BodyParseError = data.Body.ParseError
 	tracked.request.BodySample = data.Body.Sample
 	tracked.request.GraphQL = data.Body.GraphQL
-	delete(c.trackedByKey, key)
+	c.releasePostDataLookupLocked(requestID, requestURL, tracked)
 }
 
 func (c *runtimeCapture) releasePostDataLookup(requestID network.RequestID, requestURL string) {
 	c.mu.Lock()
 	key := runtimeRequestKey(requestID, requestURL)
-	if c.trackedByKey[key] != nil {
+	tracked := c.trackedByKey[key]
+	c.releasePostDataLookupLocked(requestID, requestURL, tracked)
+	c.mu.Unlock()
+}
+
+func (c *runtimeCapture) releasePostDataLookupForTracked(requestID network.RequestID, requestURL string, tracked *trackedRuntimeRequest) {
+	c.mu.Lock()
+	c.releasePostDataLookupLocked(requestID, requestURL, tracked)
+	c.mu.Unlock()
+}
+
+func (c *runtimeCapture) releasePostDataLookupLocked(requestID network.RequestID, requestURL string, tracked *trackedRuntimeRequest) {
+	if tracked == nil {
+		return
+	}
+	key := runtimeRequestKey(requestID, requestURL)
+	if c.trackedByKey[key] == tracked {
 		delete(c.trackedByKey, key)
 	}
-	c.mu.Unlock()
+	if c.latestByRequestID[requestID] == tracked {
+		delete(c.latestByRequestID, requestID)
+	}
 }
 
 func (c *runtimeCapture) stageName() string {
@@ -313,27 +372,169 @@ func (c *runtimeCapture) snapshot() []apidiscovery.RuntimeRequest {
 	return requests
 }
 
-func (c *runtimeCapture) beginPostDataFetch() {
+func (c *runtimeCapture) startPostDataWorkers(ctx context.Context, fetcher requestPostDataFetcher, reportError func(string, error)) {
 	c.mu.Lock()
+	c.postDataCtx, c.postDataCancel = context.WithCancel(ctx)
+	c.postDataFetcher = fetcher
+	c.postDataError = reportError
+	c.postDataAccepting = true
+	c.postDataQueue = make([]postDataJob, 0, postDataQueueCapacity)
+	c.mu.Unlock()
+
+	for range postDataWorkerCount {
+		c.postDataWorkers.Add(1)
+		go c.runPostDataWorker()
+	}
+	c.postDataWatcher.Add(1)
+	go func() {
+		defer c.postDataWatcher.Done()
+		<-c.postDataCtx.Done()
+		c.shutdownPostDataAdmission()
+	}()
+}
+
+func (c *runtimeCapture) stopPostDataWorkers() {
+	c.mu.Lock()
+	cancel := c.postDataCancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	c.shutdownPostDataAdmission()
+	c.postDataWatcher.Wait()
+	c.postDataWorkers.Wait()
+}
+
+func (c *runtimeCapture) shutdownPostDataAdmission() {
+	c.mu.Lock()
+	c.postDataAccepting = false
+	for _, job := range c.postDataQueue {
+		c.releasePostDataLookupLocked(job.requestID, job.requestURL, job.tracked)
+	}
+	dropped := len(c.postDataQueue)
+	clear(c.postDataQueue)
+	c.postDataQueue = nil
+	if dropped >= c.postDataPending {
+		c.postDataPending = 0
+	} else {
+		c.postDataPending -= dropped
+	}
+	c.signalPostDataIdleLocked()
+	c.mu.Unlock()
+	for range postDataWorkerCount {
+		c.wakePostDataWorker()
+	}
+}
+
+func (c *runtimeCapture) enqueuePostDataFetch(requestID network.RequestID, requestURL string, tracked *trackedRuntimeRequest) bool {
+	c.mu.Lock()
+	key := runtimeRequestKey(requestID, requestURL)
+	ctx := c.postDataCtx
+	if tracked == nil || c.trackedByKey[key] != tracked || c.latestByRequestID[requestID] != tracked ||
+		!c.postDataAccepting || ctx == nil || ctx.Err() != nil ||
+		len(c.postDataQueue) >= postDataQueueCapacity || c.postDataPending >= postDataOutstandingCapacity {
+		c.releasePostDataLookupLocked(requestID, requestURL, tracked)
+		c.mu.Unlock()
+		return false
+	}
 	if c.postDataPending == 0 {
 		c.postDataIdle = make(chan struct{})
 	}
 	c.postDataPending++
+	c.postDataQueue = append(c.postDataQueue, postDataJob{requestID: requestID, requestURL: requestURL, tracked: tracked})
 	c.mu.Unlock()
+	c.wakePostDataWorker()
+	return true
+}
+
+func (c *runtimeCapture) wakePostDataWorker() {
+	select {
+	case c.postDataWake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *runtimeCapture) runPostDataWorker() {
+	defer c.postDataWorkers.Done()
+	for {
+		job, ok := c.nextPostDataJob()
+		if !ok {
+			return
+		}
+		c.processPostDataJob(job)
+	}
+}
+
+func (c *runtimeCapture) nextPostDataJob() (postDataJob, bool) {
+	for {
+		c.mu.Lock()
+		ctx := c.postDataCtx
+		if ctx == nil || ctx.Err() != nil || !c.postDataAccepting {
+			c.mu.Unlock()
+			return postDataJob{}, false
+		}
+		if len(c.postDataQueue) > 0 {
+			job := c.postDataQueue[0]
+			c.postDataQueue[0] = postDataJob{}
+			c.postDataQueue = c.postDataQueue[1:]
+			c.mu.Unlock()
+			return job, true
+		}
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return postDataJob{}, false
+		case <-c.postDataWake:
+		}
+	}
+}
+
+func (c *runtimeCapture) processPostDataJob(job postDataJob) {
+	defer c.endPostDataFetch()
+	defer c.releasePostDataLookupForTracked(job.requestID, job.requestURL, job.tracked)
+	c.mu.Lock()
+	ctx, fetcher, reportError := c.postDataCtx, c.postDataFetcher, c.postDataError
+	c.mu.Unlock()
+	if ctx == nil || fetcher == nil {
+		return
+	}
+	body, err := fetcher(ctx, job.requestID)
+	if err != nil || ctx.Err() != nil {
+		if err != nil && reportError != nil && ctx.Err() == nil {
+			reportError(job.requestURL, err)
+		}
+		return
+	}
+	if len(body) > apidiscovery.MaxRequestBodyBytes+1 {
+		body = body[:apidiscovery.MaxRequestBodyBytes+1]
+	}
+	c.setPostDataForTracked(job.requestID, job.requestURL, job.tracked, body)
 }
 
 func (c *runtimeCapture) endPostDataFetch() {
 	c.mu.Lock()
 	if c.postDataPending > 0 {
 		c.postDataPending--
-		if c.postDataPending == 0 {
-			close(c.postDataIdle)
-		}
 	}
+	c.signalPostDataIdleLocked()
 	c.mu.Unlock()
 }
 
+func (c *runtimeCapture) signalPostDataIdleLocked() {
+	if c.postDataPending != 0 {
+		return
+	}
+	select {
+	case <-c.postDataIdle:
+	default:
+		close(c.postDataIdle)
+	}
+}
+
 func (c *runtimeCapture) waitForPostDataContext(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	c.mu.Lock()
 	if c.postDataPending == 0 {
 		c.mu.Unlock()
@@ -343,7 +544,7 @@ func (c *runtimeCapture) waitForPostDataContext(ctx context.Context) bool {
 	c.mu.Unlock()
 	select {
 	case <-idle:
-		return true
+		return ctx.Err() == nil
 	case <-ctx.Done():
 		return false
 	}

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -602,7 +603,7 @@ func DiscoverWithRuntime(ctx context.Context, cfg *Config, log *logging.Logger) 
 	// Create browser context — this is the root of the chromedp context tree.
 	// Every chromedp.Run must receive a descendant of browserCtx.
 	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
-	capture.startBodyWorkers(browserCtx, int64(cfg.HeadlessBodyMB)*1024*1024, cfg.EntryURL, log, func(ctx context.Context, requestID network.RequestID) ([]byte, error) {
+	capture.startBodyWorkers(browserCtx, headlessBodyLimitBytes(cfg.HeadlessBodyMB), cfg.EntryURL, log, func(ctx context.Context, requestID network.RequestID) ([]byte, error) {
 		var body []byte
 		err := chromedp.Run(ctx, chromedp.ActionFunc(func(actionCtx context.Context) error {
 			var err error
@@ -612,6 +613,20 @@ func DiscoverWithRuntime(ctx context.Context, cfg *Config, log *logging.Logger) 
 		return body, err
 	})
 	defer capture.stopBodyWorkers()
+	if apiCapture != nil {
+		apiCapture.startPostDataWorkers(browserCtx, func(ctx context.Context, requestID network.RequestID) ([]byte, error) {
+			var body []byte
+			err := chromedp.Run(ctx, chromedp.ActionFunc(func(actionCtx context.Context) error {
+				var err error
+				body, err = network.GetRequestPostData(requestID).Do(actionCtx)
+				return err
+			}))
+			return body, err
+		}, func(requestURL string, err error) {
+			log.Verbose("  [api] request body unavailable for %s: %v", requestURL, err)
+		})
+		defer apiCapture.stopPostDataWorkers()
+	}
 	defer browserCancel()
 
 	currentResult := func(domHTML string) DiscoveryResult {
@@ -635,25 +650,13 @@ func DiscoverWithRuntime(ctx context.Context, cfg *Config, log *logging.Logger) 
 				capture.mu.Unlock()
 				log.Verbose("  [network] Script request: %s", e.Request.URL)
 			}
-			if apiCapture != nil && apiCapture.handleRequest(e) {
-				log.Verbose("  [api] %s %s (type=%s stage=%s)", e.Request.Method, e.Request.URL, e.Type, apiCapture.stageName())
-				if e.Request.HasPostData {
-					apiCapture.beginPostDataFetch()
-					go func(requestID network.RequestID, requestURL string) {
-						defer apiCapture.endPostDataFetch()
-						defer apiCapture.releasePostDataLookup(requestID, requestURL)
-						var body []byte
-						err := chromedp.Run(browserCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-							var err error
-							body, err = network.GetRequestPostData(requestID).Do(ctx)
-							return err
-						}))
-						if err != nil {
-							log.Verbose("  [api] request body unavailable for %s: %v", requestURL, err)
-							return
-						}
-						apiCapture.setPostData(requestID, requestURL, body)
-					}(e.RequestID, e.Request.URL)
+			if apiCapture != nil {
+				tracked := apiCapture.handleRequest(e)
+				if tracked != nil {
+					log.Verbose("  [api] %s %s (type=%s stage=%s)", e.Request.Method, e.Request.URL, e.Type, apiCapture.stageName())
+					if e.Request.HasPostData && !apiCapture.enqueuePostDataFetch(e.RequestID, e.Request.URL, tracked) {
+						log.Verbose("  [api] request body capture dropped at capacity for %s", e.Request.URL)
+					}
 				}
 			}
 		case *network.EventResponseReceived:
@@ -831,6 +834,16 @@ func DiscoverWithRuntime(ctx context.Context, cfg *Config, log *logging.Logger) 
 		return currentResult(""), ctx.Err()
 	}
 	return currentResult(""), nil
+}
+
+func headlessBodyLimitBytes(limitMB int) int64 {
+	if limitMB <= 0 {
+		return 8 * 1024 * 1024
+	}
+	if int64(limitMB) > math.MaxInt64/(1024*1024) {
+		return math.MaxInt64 - 1
+	}
+	return int64(limitMB) * 1024 * 1024
 }
 
 // phaseContext creates a child context of browserCtx with an absolute cutoff.

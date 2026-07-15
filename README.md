@@ -98,6 +98,8 @@ jspider -u https://example.com --api-discovery
 
 API Discovery keeps JavaScript provenance separate for every exact entry URL. It may therefore fetch a shared script once per entry; every such attempt, including failures, counts against the shared `-n` budget for that canonical origin. Normal and Headless-only runs continue to deduplicate crawling across same-origin entries.
 
+Request-body capture admits at most four active and four queued CDP post-data lookups; excess lookups are dropped without blocking Chrome's event stream. Parsing is capped at 1 MiB per admitted body and retained samples at 4 KiB. Chrome/CDP can still materialize each of the four active request bodies before JSpider applies the parse cap.
+
 During API discovery JSpider:
 
 1. Completes Headless-assisted and recursive JavaScript discovery first, retaining each downloaded in-memory analysis body by source URL.

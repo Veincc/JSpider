@@ -3,6 +3,7 @@ package config
 import (
 	"flag"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -258,6 +259,7 @@ func TestUsageDocumentsBehaviorAndLimits(t *testing.T) {
 		"depth zero":              "-d 0 fetches entry-discovered JavaScript but does not recurse",
 		"fetch attempts":          "-n limits fetch attempts per canonical origin; failures count, entry HTML does not",
 		"API entry attempts":      "API Discovery may refetch a shared script once per entry; every attempt counts against the canonical-origin -n budget",
+		"API request body bound":  "API request-body capture admits 4 active and 4 queued CDP reads; parsing is capped at 1 MiB per body",
 		"processing cancellation": "starts before source-map scanning and propagates caller cancellation",
 		"source map timeout":      "adjacent .map probing has a 3-second sub-deadline",
 		"source map input cap":    "Decoded source-map input is capped at 128 MiB",
@@ -319,6 +321,28 @@ func TestValidateRejectsImpossibleValues(t *testing.T) {
 
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid Config rejected: %v", err)
+	}
+}
+
+func TestValidateRejectsMiBToByteOverflow(t *testing.T) {
+	tooLarge := int64(math.MaxInt64/(1024*1024)) + 1
+	if tooLarge > int64(math.MaxInt) {
+		t.Skip("platform int cannot represent an overflowing MiB value")
+	}
+	valid := Config{
+		URL: "https://example.com", OutDir: "output", Workers: 1, Timeout: 1,
+		ProcessTimeoutSeconds: 1, HeadlessBodyMB: 1,
+	}
+	for _, field := range []string{"download", "headless"} {
+		cfg := valid
+		if field == "download" {
+			cfg.MaxSizeMB = int(tooLarge)
+		} else {
+			cfg.HeadlessBodyMB = int(tooLarge)
+		}
+		if err := cfg.Validate(); err == nil || !strings.Contains(strings.ToLower(err.Error()), "too large") {
+			t.Fatalf("%s MiB overflow validation error = %v, want too large", field, err)
+		}
 	}
 }
 

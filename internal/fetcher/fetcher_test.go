@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -682,5 +683,11 @@ func TestNewRejectsInvalidProxy(t *testing.T) {
 
 	if _, err := New(cfg, log); err == nil {
 		t.Fatal("New() returned no error for an unsupported proxy scheme")
+	}
+}
+
+func TestMaxSizeBytesNeverWrapsToUnlimited(t *testing.T) {
+	if got := maxSizeBytes(math.MaxInt); got <= 0 {
+		t.Fatalf("maxSizeBytes(math.MaxInt) = %d, want a positive bounded value", got)
 	}
 }

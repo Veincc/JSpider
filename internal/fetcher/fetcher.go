@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -296,6 +297,11 @@ func decompressBounded(data []byte, encoding string, maxSize int64) ([]byte, err
 func maxSizeBytes(maxSizeMB int) int64 {
 	if maxSizeMB <= 0 {
 		return 0
+	}
+	if int64(maxSizeMB) > math.MaxInt64/(1024*1024) {
+		// Config.Validate rejects this value. Saturation keeps direct package
+		// callers from turning an overflowing positive limit into "unlimited".
+		return math.MaxInt64 - 1
 	}
 	return int64(maxSizeMB) * 1024 * 1024
 }
