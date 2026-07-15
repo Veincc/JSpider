@@ -5,6 +5,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
@@ -312,12 +313,35 @@ func matchPath(static, runtime normalizedPath) (int, []string, bool, bool) {
 }
 
 type runtimeAssociationIndex struct {
-	anyMethod          map[string][]int
-	byMethod           map[string][]int
-	withoutMethod      map[string][]int
-	entryAnyMethod     map[string][]int
-	entryByMethod      map[string][]int
-	entryWithoutMethod map[string][]int
+	anyMethod     map[associationCandidateKey][]int
+	byMethod      map[associationMethodCandidateKey][]int
+	withoutMethod map[associationCandidateKey][]int
+}
+
+type associationCandidateScopeKind uint8
+
+const (
+	associationScopeGlobal associationCandidateScopeKind = iota
+	associationScopeEntry
+	associationScopeAuthority
+	associationScopeEntryAuthority
+)
+
+type associationCandidateScope struct {
+	kind     associationCandidateScopeKind
+	entryURL string
+	scheme   string
+	host     string
+}
+
+type associationCandidateKey struct {
+	scope          associationCandidateScope
+	associationKey string
+}
+
+type associationMethodCandidateKey struct {
+	candidate associationCandidateKey
+	method    string
 }
 
 type associationPathTrie struct {
@@ -327,12 +351,9 @@ type associationPathTrie struct {
 
 func newRuntimeAssociationIndex(static []StaticEndpoint, runtime []RuntimeRequest) runtimeAssociationIndex {
 	index := runtimeAssociationIndex{
-		anyMethod:          make(map[string][]int),
-		byMethod:           make(map[string][]int),
-		withoutMethod:      make(map[string][]int),
-		entryAnyMethod:     make(map[string][]int),
-		entryByMethod:      make(map[string][]int),
-		entryWithoutMethod: make(map[string][]int),
+		anyMethod:     make(map[associationCandidateKey][]int),
+		byMethod:      make(map[associationMethodCandidateKey][]int),
+		withoutMethod: make(map[associationCandidateKey][]int),
 	}
 	trie := buildAssociationPathTrie(static)
 	for runtimeIndex, request := range runtime {
@@ -345,22 +366,16 @@ func newRuntimeAssociationIndex(static []StaticEndpoint, runtime []RuntimeReques
 			continue
 		}
 		method := strings.ToUpper(strings.TrimSpace(request.Method))
+		scopes := runtimeAssociationScopes(request, parsed)
 		walkAssociationPathTrie(trie, pathValue.segments, len(pathValue.segments)-1, func(associationKey string) {
-			index.anyMethod[associationKey] = append(index.anyMethod[associationKey], runtimeIndex)
-			if method == "" {
-				index.withoutMethod[associationKey] = append(index.withoutMethod[associationKey], runtimeIndex)
-			} else {
-				key := method + "\x00" + associationKey
-				index.byMethod[key] = append(index.byMethod[key], runtimeIndex)
-			}
-			if request.EntryURL != "" {
-				entryKey := request.EntryURL + "\x00" + associationKey
-				index.entryAnyMethod[entryKey] = append(index.entryAnyMethod[entryKey], runtimeIndex)
+			for _, scope := range scopes {
+				key := associationCandidateKey{scope: scope, associationKey: associationKey}
+				index.anyMethod[key] = append(index.anyMethod[key], runtimeIndex)
 				if method == "" {
-					index.entryWithoutMethod[entryKey] = append(index.entryWithoutMethod[entryKey], runtimeIndex)
+					index.withoutMethod[key] = append(index.withoutMethod[key], runtimeIndex)
 				} else {
-					methodKey := request.EntryURL + "\x00" + method + "\x00" + associationKey
-					index.entryByMethod[methodKey] = append(index.entryByMethod[methodKey], runtimeIndex)
+					methodKey := associationMethodCandidateKey{candidate: key, method: method}
+					index.byMethod[methodKey] = append(index.byMethod[methodKey], runtimeIndex)
 				}
 			}
 		})
@@ -383,19 +398,65 @@ func (index runtimeAssociationIndex) candidates(static StaticEndpoint) []int {
 		}
 	}
 	method := strings.ToUpper(strings.TrimSpace(static.Method))
-	key := strings.Join(staticPath.segments, "\x1f")
-	if sourceRelative && static.SourceIdentity.EntryURL != "" {
-		entryKey := static.SourceIdentity.EntryURL + "\x00" + key
-		if method == "" {
-			return index.entryAnyMethod[entryKey]
-		}
-		methodKey := static.SourceIdentity.EntryURL + "\x00" + method + "\x00" + key
-		return combineRuntimeCandidates(index.entryByMethod[methodKey], index.entryWithoutMethod[entryKey])
-	}
+	scope := staticAssociationScope(static, reference, sourceRelative)
+	key := associationCandidateKey{scope: scope, associationKey: strings.Join(staticPath.segments, "\x1f")}
 	if method == "" {
 		return index.anyMethod[key]
 	}
-	return combineRuntimeCandidates(index.byMethod[method+"\x00"+key], index.withoutMethod[key])
+	methodKey := associationMethodCandidateKey{candidate: key, method: method}
+	return combineRuntimeCandidates(index.byMethod[methodKey], index.withoutMethod[key])
+}
+
+func runtimeAssociationScopes(request RuntimeRequest, parsed *url.URL) []associationCandidateScope {
+	authority := associationAuthorityScope(associationScopeAuthority, "", parsed)
+	scopes := []associationCandidateScope{
+		{kind: associationScopeGlobal},
+		authority,
+	}
+	if request.EntryURL != "" {
+		scopes = append(scopes,
+			associationCandidateScope{kind: associationScopeEntry, entryURL: request.EntryURL},
+			associationAuthorityScope(associationScopeEntryAuthority, request.EntryURL, parsed),
+		)
+	}
+	return scopes
+}
+
+func staticAssociationScope(static StaticEndpoint, reference *url.URL, sourceRelative bool) associationCandidateScope {
+	if reference.Host != "" {
+		if sourceRelative {
+			return associationAuthorityScope(associationScopeEntryAuthority, static.SourceIdentity.EntryURL, reference)
+		}
+		return associationAuthorityScope(associationScopeAuthority, "", reference)
+	}
+	if sourceRelative && static.SourceIdentity.EntryURL != "" {
+		return associationCandidateScope{kind: associationScopeEntry, entryURL: static.SourceIdentity.EntryURL}
+	}
+	return associationCandidateScope{kind: associationScopeGlobal}
+}
+
+func associationAuthorityScope(kind associationCandidateScopeKind, entryURL string, parsed *url.URL) associationCandidateScope {
+	return associationCandidateScope{
+		kind:     kind,
+		entryURL: entryURL,
+		scheme:   canonicalEqualFold(parsed.Scheme),
+		host:     canonicalEqualFold(parsed.Host),
+	}
+}
+
+func canonicalEqualFold(value string) string {
+	var folded strings.Builder
+	folded.Grow(len(value))
+	for _, current := range value {
+		canonical := current
+		for next := unicode.SimpleFold(current); next != current; next = unicode.SimpleFold(next) {
+			if next < canonical {
+				canonical = next
+			}
+		}
+		folded.WriteRune(canonical)
+	}
+	return folded.String()
 }
 
 func buildAssociationPathTrie(static []StaticEndpoint) *associationPathTrie {

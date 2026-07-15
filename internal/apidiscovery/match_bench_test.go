@@ -46,6 +46,14 @@ func BenchmarkBuildReportUnprovenProtocolRelativeSamePath10000(b *testing.B) {
 	benchmarkBuildReportUnprovenProtocolRelativeSamePath(b, 10000)
 }
 
+func BenchmarkBuildReportSamePathMultiAuthority1000(b *testing.B) {
+	benchmarkBuildReportSamePathMultiAuthority(b, 1000)
+}
+
+func BenchmarkBuildReportSamePathMultiAuthority10000(b *testing.B) {
+	benchmarkBuildReportSamePathMultiAuthority(b, 10000)
+}
+
 func benchmarkBuildReportAssociation(b *testing.B, count int) {
 	static := make([]StaticEndpoint, count)
 	runtime := make([]RuntimeRequest, count)
@@ -150,6 +158,36 @@ func benchmarkBuildReportUnprovenProtocolRelativeSamePath(b *testing.B, count in
 		report := BuildReport(static, runtime)
 		if len(report.Associations) != 0 {
 			b.Fatalf("associations = %d, want none", len(report.Associations))
+		}
+	}
+}
+
+func benchmarkBuildReportSamePathMultiAuthority(b *testing.B, count int) {
+	static := make([]StaticEndpoint, count)
+	runtime := make([]RuntimeRequest, count)
+	entry := "https://entry.example/app/"
+	for index := 0; index < count; index++ {
+		staticHost := fmt.Sprintf("API-%05d.EXAMPLE", index)
+		runtimeHost := strings.ToLower(staticHost)
+		static[index] = StaticEndpoint{Method: "GET"}
+		runtime[index] = RuntimeRequest{
+			RequestID: fmt.Sprintf("request-%05d", index),
+			URL:       "https://" + runtimeHost + "/api/users", Method: "GET", ResourceType: "Fetch",
+		}
+		if index%2 == 0 {
+			static[index].RawURL = "https://" + staticHost + "/api/users"
+		} else {
+			static[index].RawURL = "//" + staticHost + "/api/users"
+			static[index].SourceIdentity = SourceIdentity{EntryURL: entry}
+			runtime[index].EntryURL = entry
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for iteration := 0; iteration < b.N; iteration++ {
+		report := BuildReport(static, runtime)
+		if len(report.Associations) != count {
+			b.Fatalf("associations = %d, want %d", len(report.Associations), count)
 		}
 	}
 }

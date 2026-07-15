@@ -466,6 +466,76 @@ func TestAssociationIndexPartitionsSamePathBySourceEntry(t *testing.T) {
 	}
 }
 
+func TestAssociationIndexPartitionsSamePathByAuthority(t *testing.T) {
+	const count = 64
+	absolute := make([]StaticEndpoint, count)
+	absoluteRuntime := make([]RuntimeRequest, count)
+	protocolRelative := make([]StaticEndpoint, count)
+	protocolRuntime := make([]RuntimeRequest, count)
+	entry := "https://entry.example/app/"
+	for index := 0; index < count; index++ {
+		staticMethod := "GET"
+		runtimeMethod := "GET"
+		switch index % 3 {
+		case 1:
+			runtimeMethod = ""
+		case 2:
+			staticMethod = ""
+			runtimeMethod = "POST"
+		}
+		scheme := "https"
+		if index%2 == 1 {
+			scheme = "http"
+		}
+		staticHost := fmt.Sprintf("API-%03d.EXAMPLE", index)
+		runtimeHost := strings.ToLower(staticHost)
+		absolute[index] = StaticEndpoint{
+			RawURL: scheme + "://" + staticHost + "/api/users", Method: staticMethod,
+		}
+		absoluteRuntime[index] = RuntimeRequest{
+			URL: scheme + "://" + runtimeHost + "/api/users", Method: runtimeMethod, ResourceType: "Fetch",
+		}
+		protocolRelative[index] = StaticEndpoint{
+			RawURL: "//" + staticHost + "/api/users", Method: staticMethod,
+			SourceIdentity: SourceIdentity{EntryURL: entry},
+		}
+		protocolRuntime[index] = RuntimeRequest{
+			URL: "https://" + runtimeHost + "/api/users", Method: runtimeMethod, ResourceType: "Fetch", EntryURL: entry,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		static  []StaticEndpoint
+		runtime []RuntimeRequest
+	}{
+		{name: "absolute", static: absolute, runtime: absoluteRuntime},
+		{name: "proven protocol-relative", static: protocolRelative, runtime: protocolRuntime},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			associationIndex := newRuntimeAssociationIndex(test.static, test.runtime)
+			for staticIndex, endpoint := range test.static {
+				candidates := associationIndex.candidates(endpoint)
+				if len(candidates) != 1 || candidates[0] != staticIndex {
+					t.Fatalf("static[%d] candidates = %v, want only same-authority runtime %d", staticIndex, candidates, staticIndex)
+				}
+			}
+		})
+	}
+
+	portStatic := StaticEndpoint{RawURL: "https://API.EXAMPLE:443/api/users", Method: "GET"}
+	portRuntime := []RuntimeRequest{
+		{URL: "http://api.example:443/api/users", Method: "GET", ResourceType: "Fetch"},
+		{URL: "https://api.example/api/users", Method: "GET", ResourceType: "Fetch"},
+		{URL: "https://api.example:443/api/users", Method: "GET", ResourceType: "Fetch"},
+	}
+	portIndex := newRuntimeAssociationIndex([]StaticEndpoint{portStatic}, portRuntime)
+	if candidates := portIndex.candidates(portStatic); len(candidates) != 1 || candidates[0] != 2 {
+		t.Fatalf("explicit-port candidates = %v, want only same-scheme explicit-port runtime 2", candidates)
+	}
+}
+
 func TestAssociationIndexLongExactPathMetadataIsLinear(t *testing.T) {
 	const segmentCount = 512
 	segments := make([]string, segmentCount)
@@ -483,8 +553,8 @@ func TestAssociationIndexLongExactPathMetadataIsLinear(t *testing.T) {
 		t.Fatalf("trie nodes = %d, want %d for one %d-segment static path", nodes, segmentCount+1, segmentCount)
 	}
 	associationIndex := newRuntimeAssociationIndex(static, runtime)
-	if len(associationIndex.anyMethod) != 1 || len(associationIndex.byMethod) != 1 {
-		t.Fatalf("candidate map keys = any:%d method:%d, want one actual static match in each", len(associationIndex.anyMethod), len(associationIndex.byMethod))
+	if len(associationIndex.anyMethod) != 2 || len(associationIndex.byMethod) != 2 {
+		t.Fatalf("candidate map keys = any:%d method:%d, want one global and one authority scope", len(associationIndex.anyMethod), len(associationIndex.byMethod))
 	}
 	if candidates := associationIndex.candidates(static[0]); len(candidates) != 1 || candidates[0] != 0 {
 		t.Fatalf("candidates = %v, want runtime 0", candidates)
