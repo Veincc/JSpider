@@ -96,6 +96,8 @@ jspider -u https://example.com --api-discovery
 
 `--api-discovery` automatically enables the existing Headless/CDP flow; `--headless` does not automatically enable static API analysis. Chrome or Chromium must be available before the crawl starts.
 
+API Discovery keeps JavaScript provenance separate for every exact entry URL. It may therefore fetch a shared script once per entry; every such attempt, including failures, counts against the shared `-n` budget for that canonical origin. Normal and Headless-only runs continue to deduplicate crawling across same-origin entries.
+
 During API discovery JSpider:
 
 1. Completes Headless-assisted and recursive JavaScript discovery first, retaining each downloaded in-memory analysis body by source URL.
@@ -134,10 +136,12 @@ Static extraction, runtime capture, association evidence, base inference, and th
 
 Every mode uses the same JavaScript processing pipeline. There is no opt-out flag.
 
+One per-bundle processing timeout starts before source-map reference scanning, covers recovery and Node-based regeneration, and observes caller cancellation. An inferred adjacent-map probe receives a 3-second sub-deadline; if only that probe expires, processing continues with Node under the enclosing timeout.
+
 For each JavaScript bundle, JSpider:
 
 1. Uses its `sourceMappingURL` when present, including inline source maps.
-2. If no source map is declared, tries the adjacent `<bundle-url>.map`.
+2. If no source map is declared, tries the adjacent `<bundle-url>.map` within the 3-second sub-deadline.
 3. If the map contains application `sourcesContent`, exports those source files.
 4. Excludes obvious dependency and bundler runtime sources such as `node_modules`, Webpack runtime code, and Vite virtual modules.
 5. If no usable application source is available, parses and regenerates the bundle as readable JavaScript while safely restoring simple static strings and wrappers.
@@ -158,7 +162,7 @@ output/
     js-map.txt
 ```
 
-Complete source-map recovery within the limits analyzes the recovered application sources and writes only those recovered source artifacts; it does not also analyze or save the original compressed bundle. Recovery is capped at 512 application sources, 64 MiB of aggregate recovered content, and four nested indexed-map levels. If recovery is incomplete or exceeds a cap, crawl discovery analyzes only the original bundle, never both the original and recovered sources. Any usable recovered files may still be retained as the output artifact; when there are no usable recovered files, JSpider falls back to a generated readable bundle or, if parsing fails, the original bundle. Raw source maps are not saved.
+Complete source-map recovery within the limits analyzes the recovered application sources and writes only those recovered source artifacts; it does not also analyze or save the original compressed bundle. Decoded source-map input has a separate hard cap of 128 MiB. Recovered output is capped at 512 application source files, 64 MiB of aggregate content, and four nested indexed-map levels. If recovery is incomplete or exceeds a cap, crawl discovery analyzes only the original bundle, never both the original and recovered sources. Any usable recovered files within the output caps may still be retained as artifacts; when there are no usable recovered files, JSpider falls back to a generated readable bundle or, if parsing fails, the original bundle. Timeout or caller cancellation also persists the original bundle as the truthful fallback. Raw source maps are not saved.
 
 `js-map.txt` is Tab-separated. Each row contains the complete JavaScript URL, a Tab character, and a path relative to the site directory:
 
@@ -201,7 +205,7 @@ The `-t` value is also the total Headless discovery budget. It is divided by abs
 | `-c <domains>` | none | Comma-separated allowed CDN domains. |
 | `--proxy <url>` | none | HTTP, HTTPS, or SOCKS5 proxy used by requests and headless Chrome. |
 | `-t <seconds>` | `15` | HTTP timeout. |
-| `--process-timeout <seconds>` | `30` | Per-bundle JavaScript processing timeout; also bounds declared source-map recovery. Adjacent-map probing without a declaration uses a 3-second bound. |
+| `--process-timeout <seconds>` | `30` | Per-bundle timeout starting before source-map scanning; propagates caller cancellation and covers recovery plus Node processing. Adjacent-map probing without a declaration uses a 3-second sub-deadline. |
 | `--headless-body-mb <mb>` | `8` | Positive per-response cap for captured text/JSON XHR/Fetch bodies; see the Headless allocation caveat above. |
 | `-a <ua>` | Chrome-like UA | Custom User-Agent. |
 | `-k <cookie>` | none | Cookie header value. |

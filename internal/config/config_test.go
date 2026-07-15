@@ -255,16 +255,20 @@ func TestUsageDocumentsBehaviorAndLimits(t *testing.T) {
 	usage := string(usageBytes)
 
 	for name, want := range map[string]string{
-		"depth zero":          "-d 0 fetches entry-discovered JavaScript but does not recurse",
-		"fetch attempts":      "-n limits fetch attempts per canonical origin; failures count, entry HTML does not",
-		"source map timeout":  "adjacent .map probing has a 3-second bound",
-		"absolute deadlines":  "absolute deadlines: navigation 50%, scrolling 70%, click/DOM 95%, body drain 100%",
-		"CDP allocation":      "Chrome/CDP may fully materialize a response before the cap is applied",
-		"origin output names": "Canonical-origin output names include non-default ports",
-		"name collisions":     "collisions add an eight-hex-character SHA-256 suffix",
-		"partial failures":    "continue but produce an aggregate nonzero exit",
-		"source map complete": "Complete source-map recovery analyzes recovered sources only",
-		"source map fallback": "incomplete or capped recovery analyzes the original bundle only",
+		"depth zero":              "-d 0 fetches entry-discovered JavaScript but does not recurse",
+		"fetch attempts":          "-n limits fetch attempts per canonical origin; failures count, entry HTML does not",
+		"API entry attempts":      "API Discovery may refetch a shared script once per entry; every attempt counts against the canonical-origin -n budget",
+		"processing cancellation": "starts before source-map scanning and propagates caller cancellation",
+		"source map timeout":      "adjacent .map probing has a 3-second sub-deadline",
+		"source map input cap":    "Decoded source-map input is capped at 128 MiB",
+		"source recovery caps":    "recovered output remains capped at 512 files and 64 MiB",
+		"absolute deadlines":      "absolute deadlines: navigation 50%, scrolling 70%, click/DOM 95%, body drain 100%",
+		"CDP allocation":          "Chrome/CDP may fully materialize a response before the cap is applied",
+		"origin output names":     "Canonical-origin output names include non-default ports",
+		"name collisions":         "collisions add an eight-hex-character SHA-256 suffix",
+		"partial failures":        "continue but produce an aggregate nonzero exit",
+		"source map complete":     "Complete source-map recovery analyzes recovered sources only",
+		"source map fallback":     "incomplete or capped recovery analyzes the original bundle only",
 	} {
 		if !strings.Contains(usage, want) {
 			t.Errorf("usage missing %s contract %q\nusage:\n%s", name, want, usage)
