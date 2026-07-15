@@ -76,6 +76,16 @@ jspider -u https://example.com --proxy http://127.0.0.1:8080
 
 JSpider does not persist entry.html. It keeps entry HTML and recursive analysis bodies in memory while saving only processed JavaScript and `js-map.txt` in normal mode.
 
+## Sensitive Data and Output Handling
+
+JSpider is not a redaction boundary. Run it only on systems you are authorized to inspect, use narrowly scoped credentials, and protect the terminal, process environment, logs, and output directory as sensitive data.
+
+- Values passed with `-k` and `-H` can be visible in the command line, shell history, and process listings.
+- Full request URLs, query values, headers, request bodies, and body samples may remain in memory. Treat verbose logs as potentially containing the same raw data, including credentials and session values.
+- `endpoints.txt` deliberately preserves full query strings. `js-map.txt` likewise records complete JavaScript URLs, including queries.
+- JSpider does not create separate raw-header or raw-request-body artifacts. That does not make the in-memory data, verbose logs, downloaded code, or URL-bearing output files safe to share.
+- Output artifacts are created with restrictive file permissions, but directory access, backups, copied logs, and retention are still the operator's responsibility. Avoid `-v` for credentialed runs unless required, and remove outputs and logs according to your data-handling policy.
+
 ## Runtime API Discovery
 
 Use `--api-discovery` to extract API candidates from downloaded JavaScript with jsluice and correlate them with requests observed in Chrome:
@@ -101,9 +111,7 @@ During API discovery JSpider:
 
 The browser uses the configured proxy, User-Agent, Cookie, extra headers, same-origin/CDN policy, and TLS setting. Page behavior may make requests to cross-origin APIs; those observed APIs can still be recorded and associated.
 
-JSpider does not replay requests or send additional probing requests. It never replays POST, PUT, PATCH, or DELETE requests and does not save response bodies. Browser-side page execution and safe clicks can still trigger application requests, so use this feature only on systems you are authorized to test.
-
-Sensitive request headers such as `Authorization`, `Cookie`, `Set-Cookie`, and proxy authorization are never written. Common credential and session fields are stored as `[REDACTED]`; other values are truncated.
+JSpider does not replay requests or send additional probing requests. It never replays POST, PUT, PATCH, or DELETE requests and does not create response-body artifacts. Browser-side page execution and safe clicks can still trigger application requests, so use this feature only on systems you are authorized to test. Raw request metadata and samples may remain in memory or verbose logs as described in [Sensitive Data and Output Handling](#sensitive-data-and-output-handling).
 
 Output:
 
@@ -118,7 +126,7 @@ output/
     endpoints.txt
 ```
 
-`endpoints.txt` exists only in API Discovery mode. It contains one absolute HTTP(S) URL per line, with fragments removed and query strings preserved. Rows are deduplicated, sorted, atomically replaced, and written with `0600` permissions. An API run with no final endpoints creates a zero-byte file.
+`endpoints.txt` exists only in API Discovery mode. It contains one absolute HTTP(S) URL per line, with fragments removed and full query strings and values preserved. Rows are deduplicated, sorted, atomically replaced, and written with `0600` permissions. An API run with no final endpoints creates a zero-byte file.
 
 Static extraction, runtime capture, association evidence, base inference, and the final report remain available in memory during the run. JSpider does not persist API intermediate JSON or JSONL reports.
 
@@ -150,7 +158,7 @@ output/
     js-map.txt
 ```
 
-Successful source-map recovery does not also save the compressed bundle. Generated readable bundles do not also save the original compressed file. Raw source maps are not saved. A parsing failure writes the original bundle only once, directly beneath `js/`.
+Complete source-map recovery within the limits analyzes the recovered application sources and writes only those recovered source artifacts; it does not also analyze or save the original compressed bundle. Recovery is capped at 512 application sources, 64 MiB of aggregate recovered content, and four nested indexed-map levels. If recovery is incomplete or exceeds a cap, crawl discovery analyzes only the original bundle, never both the original and recovered sources. Any usable recovered files may still be retained as the output artifact; when there are no usable recovered files, JSpider falls back to a generated readable bundle or, if parsing fails, the original bundle. Raw source maps are not saved.
 
 `js-map.txt` is Tab-separated. Each row contains the complete JavaScript URL, a Tab character, and a path relative to the site directory:
 
@@ -172,6 +180,10 @@ jspider -u https://example.com --headless
 
 Browser discovery can trigger page-side requests and limited safe-looking interactions. Use it only against systems where you have authorization. `--headless` alone preserves its previous JavaScript-discovery behavior and does not run jsluice or write API discovery reports.
 
+The `-t` value is also the total Headless discovery budget. It is divided by absolute elapsed-time cutoffs: browser startup and navigation through 50%, scrolling through 70%, clicking/settling/DOM extraction through 95%, and pending body/request-data drain through 100%. A slow early phase does not shift the later deadlines; exhausted phases are skipped while already captured results are kept.
+
+`--headless-body-mb` caps each captured text or JSON XHR/Fetch response at 8 MiB by default. Oversized responses reported by Chrome are skipped, and returned bodies are truncated before parsing. Chrome's `Network.getResponseBody` API has no streaming limit, so a compressed response can still be fully materialized by Chrome/CDP before JSpider applies the post-read cap.
+
 ## Options
 
 | Option | Default | Description |
@@ -181,14 +193,16 @@ Browser discovery can trigger page-side requests and limited safe-looking intera
 | `-o <dir>` | `output` | Output directory. |
 | `--headless` | `false` | Add Chrome or Chromium browser discovery. |
 | `--api-discovery` | `false` | Extract static APIs and correlate them with browser XHR/Fetch/EventSource requests; safely clicks bounded elements, requires CGO and Chrome/Chromium, and implies `--headless`. |
-| `-n <count>` | unlimited | Maximum JavaScript fetch attempts across the run; failures count, entry HTML does not. |
-| `-d <depth>` | `10` | Maximum recursive discovery depth. |
+| `-n <count>` | unlimited | Maximum JavaScript fetch attempts per canonical origin across its entries; failed attempts count, entry HTML does not. |
+| `-d <depth>` | `10` | Maximum recursive discovery depth; `0` fetches entry-discovered JavaScript but does not schedule JavaScript discovered from it. |
 | `-s <mb>` | unlimited | Maximum compressed and decompressed resource size; `0` disables the limit. |
 | `-w <workers>` | `5` | Concurrent download workers. |
 | `--same-origin` | `true` | Restrict discovery to the entry origin and allowed CDN domains. |
 | `-c <domains>` | none | Comma-separated allowed CDN domains. |
 | `--proxy <url>` | none | HTTP, HTTPS, or SOCKS5 proxy used by requests and headless Chrome. |
 | `-t <seconds>` | `15` | HTTP timeout. |
+| `--process-timeout <seconds>` | `30` | Per-bundle JavaScript processing timeout; also bounds declared source-map recovery. Adjacent-map probing without a declaration uses a 3-second bound. |
+| `--headless-body-mb <mb>` | `8` | Positive per-response cap for captured text/JSON XHR/Fetch bodies; see the Headless allocation caveat above. |
 | `-a <ua>` | Chrome-like UA | Custom User-Agent. |
 | `-k <cookie>` | none | Cookie header value. |
 | `-H <headers>` | none | Extra headers as `Header1=Value1;Header2=Value2`. |
@@ -207,6 +221,8 @@ The previous `--insecure-skip-verify` option remains accepted as a deprecated co
 - Identical JavaScript content is saved once per entry site.
 - Multiple entry sites receive separate self-contained directories.
 - Multiple entry URLs for the same site accumulate into one site map and one optional endpoint file.
+- Canonical origins use the legacy host-only directory name when unambiguous (for example, `example_com`). A non-default port is included (for example, `example_com_8443`). If distinct origins sanitize to the same name, every colliding origin receives an eight-hex-character SHA-256 suffix; default ports normalize away before naming.
+- Entry failures do not discard successful output from other entries. JSpider continues after non-fatal entry failures, finalizes the accumulated outputs, prints success/failure/skipped counts, and exits nonzero if any entry or finalization failed. Process-wide initialization errors, cancellation, and fatal output errors can skip remaining entries.
 - Starting a new run resets only each affected site directory; unrelated top-level files and other site directories are preserved.
 - Normal and Headless-only runs write `js/` and `js-map.txt`. API Discovery additionally writes `endpoints.txt`.
 - Entry HTML, raw source maps, and API intermediate reports are retained only in memory when needed and are not persisted.

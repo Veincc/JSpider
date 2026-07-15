@@ -6,21 +6,21 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
       - name: Test
         env:
           CGO_ENABLED: "1"
-        run: go test ./...
+        run: go test -count=1 ./...
       - name: Vet
         env:
           CGO_ENABLED: "1"
@@ -64,8 +64,8 @@ jobs:
             asset: jspider-darwin-arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -85,7 +85,7 @@ jobs:
         run: |
           mkdir -p dist
           go build -trimpath -ldflags="-s -w" -o "dist/${ASSET}" ./cmd/jspider
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
@@ -94,10 +94,16 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
+          pattern: jspider-*
+          merge-multiple: false
+          skip-decompress: false
+          digest-mismatch: error
       - name: Collect release assets
         run: |
           mkdir -p dist

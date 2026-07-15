@@ -25,11 +25,13 @@ func NewASTAnalyzer(regex *RegexAnalyzer) *TdewolffASTAnalyzer {
 
 // astVisitor implements the IVisitor interface for AST traversal
 type astVisitor struct {
-	fromJS    string
-	framework string
-	imports   []DynamicImport
-	routes    []RouteChunk
-	newURLs   []JSAsset
+	fromJS     string
+	framework  string
+	imports    []DynamicImport
+	routes     []RouteChunk
+	newURLs    []JSAsset
+	seenImport map[string]struct{}
+	seenRoute  map[string]struct{}
 }
 
 func (v *astVisitor) Enter(n js.INode) js.IVisitor {
@@ -97,6 +99,11 @@ func (v *astVisitor) addImport(raw string) {
 	if raw == "" {
 		return
 	}
+	key := v.fromJS + "|" + raw
+	if _, exists := v.seenImport[key]; exists {
+		return
+	}
+	v.seenImport[key] = struct{}{}
 
 	resolvedURL := resolveImportURL(raw, v.fromJS)
 	confidence := ConfHigh
@@ -137,6 +144,11 @@ func (v *astVisitor) handleProperty(node *js.Property) {
 	if name == "path" || name == "route" {
 		value := extractStringLiteral(node.Value)
 		if value != "" && strings.HasPrefix(value, "/") {
+			key := v.fromJS + "|" + value
+			if _, exists := v.seenRoute[key]; exists {
+				return
+			}
+			v.seenRoute[key] = struct{}{}
 			route := RouteChunk{
 				Route:      value,
 				FromJS:     v.fromJS,
@@ -220,15 +232,17 @@ func (a *TdewolffASTAnalyzer) AnalyzeAST(jsContent string, fromJS string, framew
 func (a *TdewolffASTAnalyzer) parseAST(jsContent string, fromJS string, framework string) (*AnalysisResult, error) {
 	result := &AnalysisResult{Framework: framework}
 
-	input := parse.NewInputBytes([]byte(jsContent))
+	input := parse.NewInputString(jsContent)
 	ast, err := js.Parse(input, js.Options{})
 	if err != nil {
 		return nil, err
 	}
 
 	visitor := &astVisitor{
-		fromJS:    fromJS,
-		framework: framework,
+		fromJS:     fromJS,
+		framework:  framework,
+		seenImport: make(map[string]struct{}),
+		seenRoute:  make(map[string]struct{}),
 	}
 
 	js.Walk(visitor, ast)

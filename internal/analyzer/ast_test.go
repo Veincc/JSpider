@@ -116,6 +116,24 @@ var routes = [
 	}
 }
 
+func TestAST_DeduplicatesRepeatedImportsAndRoutesDuringTraversal(t *testing.T) {
+	analyzer := NewASTAnalyzer(NewRegexAnalyzer())
+	result := analyzer.AnalyzeAST(`
+var first = {path: "/items", component: function() { return import("./items.js") }};
+var second = {path: "/items", component: function() { return import("./items.js") }};
+`, "https://example.com/assets/app.js", "unknown")
+
+	if len(result.Imports) != 1 {
+		t.Fatalf("imports = %d, want 1: %+v", len(result.Imports), result.Imports)
+	}
+	if len(result.Routes) != 1 {
+		t.Fatalf("routes = %d, want 1: %+v", len(result.Routes), result.Routes)
+	}
+	if len(result.NewURLs) != 1 {
+		t.Fatalf("new URLs = %d, want 1: %+v", len(result.NewURLs), result.NewURLs)
+	}
+}
+
 func TestAST_FallbackOnLargeFile(t *testing.T) {
 	log := logging.New(false, t.TempDir())
 	defer log.Close()
