@@ -1,7 +1,7 @@
 # JSpider Integration Contract Fixes Design
 
-Date: 2026-07-15  
-Branch: `codex/full-audit-remediation`  
+Date: 2026-07-15
+Branch: `codex/full-audit-remediation`
 Base: `origin/main` at `3093ee9c3b6205516f64262d2981eaa9d1d8d6e4`
 
 ## Purpose
