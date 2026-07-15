@@ -2,6 +2,7 @@ package config
 
 import (
 	"flag"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -222,6 +223,52 @@ func TestDepthFlagDocumentsZeroAsNoRecursion(t *testing.T) {
 	depthFlag := flag.Lookup("d")
 	if depthFlag == nil || !strings.Contains(depthFlag.Usage, "0=no recursion") {
 		t.Fatalf("-d usage = %v, want 0=no recursion", depthFlag)
+	}
+}
+
+func TestUsageDocumentsBehaviorAndLimits(t *testing.T) {
+	originalFlags, originalArgs, originalStderr := flag.CommandLine, os.Args, os.Stderr
+	flag.CommandLine = flag.NewFlagSet("jspider-test", flag.ContinueOnError)
+	os.Args = []string{"jspider", "-u", "https://example.com"}
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	os.Stderr = writePipe
+	t.Cleanup(func() {
+		flag.CommandLine = originalFlags
+		os.Args = originalArgs
+		os.Stderr = originalStderr
+		_ = readPipe.Close()
+		_ = writePipe.Close()
+	})
+
+	_ = Parse()
+	flag.Usage()
+	if err := writePipe.Close(); err != nil {
+		t.Fatalf("close usage writer: %v", err)
+	}
+	usageBytes, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatalf("read usage: %v", err)
+	}
+	usage := string(usageBytes)
+
+	for name, want := range map[string]string{
+		"depth zero":          "-d 0 fetches entry-discovered JavaScript but does not recurse",
+		"fetch attempts":      "-n limits fetch attempts per canonical origin; failures count, entry HTML does not",
+		"source map timeout":  "adjacent .map probing has a 3-second bound",
+		"absolute deadlines":  "absolute deadlines: navigation 50%, scrolling 70%, click/DOM 95%, body drain 100%",
+		"CDP allocation":      "Chrome/CDP may fully materialize a response before the cap is applied",
+		"origin output names": "Canonical-origin output names include non-default ports",
+		"name collisions":     "collisions add an eight-hex-character SHA-256 suffix",
+		"partial failures":    "continue but produce an aggregate nonzero exit",
+		"source map complete": "Complete source-map recovery analyzes recovered sources only",
+		"source map fallback": "incomplete or capped recovery analyzes the original bundle only",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("usage missing %s contract %q\nusage:\n%s", name, want, usage)
+		}
 	}
 }
 
