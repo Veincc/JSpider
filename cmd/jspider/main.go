@@ -145,6 +145,7 @@ func (e *fatalOutputError) Unwrap() error { return e.err }
 
 var discoverBrowser = headless.DiscoverWithRuntime
 var checkBrowserAvailable = headless.CheckBrowserAvailable
+var newAPISession = func() apiDiscoverySession { return apidiscovery.NewSession() }
 
 func crawlStateForSite(states map[string]*crawlState, site string) *crawlState {
 	state := states[site]
@@ -190,6 +191,16 @@ func run(ctx context.Context, cfg *config.Config) (RunResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	effective := *cfg
+	effective.AllowCDN = append([]string(nil), cfg.AllowCDN...)
+	if cfg.Headers != nil {
+		effective.Headers = make(map[string]string, len(cfg.Headers))
+		for key, value := range cfg.Headers {
+			effective.Headers[key] = value
+		}
+	}
+	config.ApplyModeImplications(&effective)
+	cfg = &effective
 	if err := cfg.Validate(); err != nil {
 		return result, fmt.Errorf("invalid configuration: %w", err)
 	}
@@ -307,9 +318,13 @@ func run(ctx context.Context, cfg *config.Config) (RunResult, error) {
 		}
 		attemptsBefore := site.attempts
 		log.Info("[%d/%d] Analyzing: %s", i+1, len(planned), entry.url)
+		entryState := site.state
+		if cfg.APIDiscovery {
+			entryState = &crawlState{queued: make(map[string]bool), processed: make(map[string]bool)}
+		}
 		analyzed, entryErr := analyzeEntryContext(
 			ctx, cfg, site.store, site.fetcher, site.analyzer, site.html, log, site.processor, site.apiSession,
-			entry.url, site.directory, site.state.queued, site.state.processed, &site.analyzed, &site.attempts,
+			entry.url, site.directory, entryState.queued, entryState.processed, &site.analyzed, &site.attempts,
 		)
 		apiStats := apidiscovery.SessionStats{}
 		if site.apiSession != nil {
@@ -396,7 +411,7 @@ func newSiteRuntime(cfg *config.Config, log *logging.Logger, origin, directory s
 	}
 	site.processor = processor
 	if cfg.APIDiscovery {
-		site.apiSession = apidiscovery.NewSession()
+		site.apiSession = newAPISession()
 	}
 	log.Info("Processed JavaScript will be written to %s", filepath.Join(siteDir, "js"))
 	return site, nil

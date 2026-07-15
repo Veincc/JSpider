@@ -1043,6 +1043,112 @@ func TestSameSiteMultipleEntriesAccumulateJavaScriptMap(t *testing.T) {
 	assertMapTargetsExist(t, siteDir)
 }
 
+func TestRunSameOriginEntriesShareCrawlStateInNormalMode(t *testing.T) {
+	var appHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/first", "/second":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<script src="/app.js"></script>`))
+		case "/app.js":
+			appHits.Add(1)
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`console.log("shared");`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(server.URL+"/second\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(server.URL+"/first", t.TempDir())
+	cfg.URLList = listPath
+
+	result, err := run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Success) != 2 {
+		t.Fatalf("success results = %+v", result.Success)
+	}
+	if got := appHits.Load(); got != 1 {
+		t.Fatalf("app.js requests = %d, want 1 in normal mode", got)
+	}
+	if result.Success[0].FetchAttempts != 1 || result.Success[1].FetchAttempts != 0 {
+		t.Fatalf("entry fetch attempts = %d/%d, want 1/0", result.Success[0].FetchAttempts, result.Success[1].FetchAttempts)
+	}
+	origin, canonicalErr := urlutil.CanonicalOrigin(server.URL)
+	if canonicalErr != nil {
+		t.Fatal(canonicalErr)
+	}
+	if got := result.Sites[origin].FetchAttempts; got != 1 {
+		t.Fatalf("site fetch attempts = %d, want 1 in normal mode", got)
+	}
+}
+
+func TestRunSameOriginEntriesShareCrawlStateInHeadlessOnlyMode(t *testing.T) {
+	var appHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/first", "/second":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<script src="/app.js"></script>`))
+		case "/app.js":
+			appHits.Add(1)
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`console.log("shared");`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	firstURL := server.URL + "/first"
+	secondURL := server.URL + "/second"
+
+	originalCheck, originalDiscover := checkBrowserAvailable, discoverBrowser
+	checkBrowserAvailable = func() error { return nil }
+	discoverBrowser = func(context.Context, *headless.Config, *logging.Logger) (headless.DiscoveryResult, error) {
+		return headless.DiscoveryResult{}, nil
+	}
+	t.Cleanup(func() { checkBrowserAvailable, discoverBrowser = originalCheck, originalDiscover })
+
+	listPath := filepath.Join(t.TempDir(), "urls.txt")
+	if err := os.WriteFile(listPath, []byte(secondURL+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(firstURL, t.TempDir())
+	cfg.URLList = listPath
+	cfg.Headless = true
+	cfg.APIDiscovery = false
+
+	result, err := run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Success) != 2 {
+		t.Fatalf("success results = %+v", result.Success)
+	}
+	if got := appHits.Load(); got != 1 {
+		t.Fatalf("app.js requests = %d, want 1 in Headless-only mode", got)
+	}
+	if result.Success[0].EntryURL != firstURL || result.Success[0].FetchAttempts != 1 ||
+		result.Success[1].EntryURL != secondURL || result.Success[1].FetchAttempts != 0 {
+		t.Fatalf("entry fetch attempts = %s:%d / %s:%d, want exact first/second attempts 1/0",
+			result.Success[0].EntryURL, result.Success[0].FetchAttempts,
+			result.Success[1].EntryURL, result.Success[1].FetchAttempts)
+	}
+	origin, canonicalErr := urlutil.CanonicalOrigin(server.URL)
+	if canonicalErr != nil {
+		t.Fatal(canonicalErr)
+	}
+	if got := result.Sites[origin].FetchAttempts; got != 1 {
+		t.Fatalf("site fetch attempts = %d, want 1 in Headless-only mode", got)
+	}
+}
+
 func TestHeadlessOnlyWritesJavaScriptMapWithoutAPIArtifacts(t *testing.T) {
 	server := newSiteServer(t, map[string]string{
 		"/":            `<html></html>`,
