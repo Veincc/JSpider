@@ -6,51 +6,16 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
-	"net/textproto"
 	"net/url"
-	"regexp"
 	"sort"
 	"strings"
-	"unicode"
 	"unicode/utf8"
+
+	"github.com/vektah/gqlparser/v2/ast"
+	"github.com/vektah/gqlparser/v2/parser"
 )
 
-var forbiddenHeaders = map[string]bool{
-	"authorization":       true,
-	"cookie":              true,
-	"set-cookie":          true,
-	"proxy-authorization": true,
-}
-
-const sensitiveSourceKeyPattern = `password|passwd|token|access[_-]?token|refresh[_-]?token|secret|api[_-]?key|session|csrf|otp|authorization|cookie|set-cookie|proxy-authorization`
-
-// sensitiveSourcePatterns redact values in short source snippets while keeping
-// the surrounding key names. This preserves evidence without leaking secrets.
-var sensitiveSourcePatterns = []struct {
-	pattern     *regexp.Regexp
-	replacement string
-}{
-	{
-		regexp.MustCompile(`(?i)((?:"|')?(?:` + sensitiveSourceKeyPattern + `)(?:"|')?\s*[:=]\s*)"([^"\\]|\\.)*"`),
-		`$1"` + RedactedValue + `"`,
-	},
-	{
-		regexp.MustCompile(`(?i)((?:"|')?(?:` + sensitiveSourceKeyPattern + `)(?:"|')?\s*[:=]\s*)'([^'\\]|\\.)*'`),
-		`$1'` + RedactedValue + `'`,
-	},
-	{
-		regexp.MustCompile("(?i)((?:\"|')?(?:" + sensitiveSourceKeyPattern + ")(?:\"|')?\\s*[:=]\\s*)`([^`\\\\]|\\\\.)*`"),
-		"$1`" + RedactedValue + "`",
-	},
-	{
-		regexp.MustCompile(`(?i)(\b(?:` + sensitiveSourceKeyPattern + `)\b\s*[:=]\s*)[^,\s}]+`),
-		`$1` + RedactedValue,
-	},
-	{
-		regexp.MustCompile(`(?i)([?&](?:` + sensitiveSourceKeyPattern + `)=)[^&"'` + "`" + `\s]+`),
-		`$1` + RedactedValue,
-	},
-}
+const maxGraphQLTokens = 15000
 
 func ParseRequestData(rawURL string, headers map[string]string, body []byte, hasBody bool) RequestData {
 	data := RequestData{
@@ -71,6 +36,7 @@ func ParseRequestData(rawURL string, headers map[string]string, body []byte, has
 	data.Body.ContentType = contentType
 
 	if len(body) > MaxRequestBodyBytes {
+		data.Body.Truncated = true
 		body = body[:MaxRequestBodyBytes]
 	}
 	if !hasBody && len(body) == 0 {
@@ -89,51 +55,14 @@ func ParseRequestData(rawURL string, headers map[string]string, body []byte, has
 }
 
 func SanitizeHeaders(headers map[string]string) map[string]string {
-	if len(headers) == 0 {
-		return nil
-	}
-	out := make(map[string]string)
-	for name, value := range headers {
-		if forbiddenHeaders[strings.ToLower(strings.TrimSpace(name))] {
-			continue
-		}
-		canonicalName := textproto.CanonicalMIMEHeaderKey(name)
-		out[canonicalName] = sanitizeValue(canonicalName, value)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return cloneHeaders(headers)
 }
 
 func SanitizeURL(raw string) string {
-	parsed, err := url.Parse(raw)
-	if err != nil {
-		return SanitizeSourceSnippet(raw)
-	}
-	query := parsed.Query()
-	changed := false
-	for name, values := range query {
-		for i := range values {
-			cleaned := sanitizeValue(name, values[i])
-			if cleaned != values[i] {
-				values[i] = cleaned
-				changed = true
-			}
-		}
-		query[name] = values
-	}
-	if !changed {
-		return raw
-	}
-	parsed.RawQuery = query.Encode()
-	return parsed.String()
+	return raw
 }
 
 func SanitizeSourceSnippet(source string) string {
-	for _, item := range sensitiveSourcePatterns {
-		source = item.pattern.ReplaceAllString(source, item.replacement)
-	}
 	return source
 }
 
@@ -149,7 +78,7 @@ func parseQuery(rawURL string) []Parameter {
 			continue
 		}
 		for _, value := range values {
-			params = append(params, Parameter{Name: name, Value: sanitizeValue(name, value)})
+			params = append(params, Parameter{Name: name, Value: value})
 		}
 	}
 	sortParameters(params)
@@ -161,6 +90,16 @@ func parseJSONBody(body []byte, info *BodyInfo) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
+		info.ParseError = err.Error()
+		return
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			info.ParseError = "multiple JSON values"
+		} else {
+			info.ParseError = err.Error()
+		}
 		return
 	}
 
@@ -174,8 +113,7 @@ func parseJSONBody(body []byte, info *BodyInfo) {
 	sortParameters(params)
 	info.Params = deduplicateParameters(params)
 
-	sanitized := sanitizeJSONValue("", value, false)
-	if encoded, err := json.Marshal(sanitized); err == nil {
+	if encoded, err := json.Marshal(value); err == nil {
 		info.Sample = truncateBytes(encoded, MaxBodySampleBytes)
 	}
 }
@@ -183,7 +121,7 @@ func parseJSONBody(body []byte, info *BodyInfo) {
 func graphQLRoots(value any) ([]map[string]any, bool) {
 	switch typed := value.(type) {
 	case map[string]any:
-		if _, hasQuery := typed["query"]; hasQuery {
+		if isGraphQLDocument(typed["query"]) {
 			return []map[string]any{typed}, true
 		}
 	case []any:
@@ -193,7 +131,7 @@ func graphQLRoots(value any) ([]map[string]any, bool) {
 			if !ok {
 				return nil, false
 			}
-			if _, hasQuery := root["query"]; !hasQuery {
+			if !isGraphQLDocument(root["query"]) {
 				return nil, false
 			}
 			roots = append(roots, root)
@@ -203,6 +141,15 @@ func graphQLRoots(value any) ([]map[string]any, bool) {
 		}
 	}
 	return nil, false
+}
+
+func isGraphQLDocument(value any) bool {
+	document, ok := value.(string)
+	if !ok || strings.TrimSpace(document) == "" {
+		return false
+	}
+	parsed, err := parser.ParseQueryWithTokenLimit(&ast.Source{Name: "request.graphql", Input: document}, maxGraphQLTokens)
+	return err == nil && parsed != nil && len(parsed.Operations) > 0
 }
 
 func parseGraphQL(roots []map[string]any, info *BodyInfo) {
@@ -216,8 +163,9 @@ func parseGraphQL(roots []map[string]any, info *BodyInfo) {
 			operationNames = append(operationNames, truncateString(operationName, MaxParameterValueBytes))
 			params = append(params, Parameter{Name: "operationName", Value: sanitizeValue("operationName", operationName)})
 		}
-		sample := map[string]any{
-			"operationName": sanitizeValue("operationName", operationName),
+		sample := make(map[string]any, len(root))
+		for name, value := range root {
+			sample[name] = value
 		}
 		if variables, ok := root["variables"]; ok {
 			var variableParams []Parameter
@@ -228,7 +176,6 @@ func parseGraphQL(roots []map[string]any, info *BodyInfo) {
 					graphQL.Variables = append(graphQL.Variables, strings.TrimPrefix(param.Name, "variables."))
 				}
 			}
-			sample["variables"] = sanitizeJSONValue("variables", variables, false)
 		}
 		samples = append(samples, sample)
 	}
@@ -277,35 +224,6 @@ func collectJSONParams(prefix string, value any, params *[]Parameter) {
 				}
 			}
 		}
-	}
-}
-
-func sanitizeJSONValue(prefix string, value any, omitQuery bool) any {
-	switch typed := value.(type) {
-	case map[string]any:
-		out := make(map[string]any)
-		for key, child := range typed {
-			if omitQuery && strings.EqualFold(key, "query") {
-				continue
-			}
-			name := joinParam(prefix, key)
-			if isSensitiveName(name) {
-				out[key] = RedactedValue
-			} else {
-				out[key] = sanitizeJSONValue(name, child, omitQuery)
-			}
-		}
-		return out
-	case []any:
-		out := make([]any, 0, len(typed))
-		for _, child := range typed {
-			out = append(out, sanitizeJSONValue(prefix, child, omitQuery))
-		}
-		return out
-	case string:
-		return sanitizeValue(prefix, typed)
-	default:
-		return typed
 	}
 }
 
@@ -377,39 +295,7 @@ func sanitizeAny(name string, value any) string {
 }
 
 func sanitizeValue(name, value string) string {
-	if isSensitiveName(name) {
-		return RedactedValue
-	}
 	return truncateString(value, MaxParameterValueBytes)
-}
-
-func isSensitiveName(name string) bool {
-	last := name
-	if index := strings.LastIndex(last, "."); index >= 0 {
-		last = last[index+1:]
-	}
-	var normalized strings.Builder
-	for _, r := range strings.ToLower(last) {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			normalized.WriteRune(r)
-		}
-	}
-	key := normalized.String()
-	switch key {
-	case "password", "passwd", "accesstoken", "refreshtoken", "secret", "apikey", "session", "csrf", "otp",
-		"authorization", "cookie", "setcookie", "proxyauthorization":
-		return true
-	}
-	return strings.Contains(key, "token") ||
-		strings.Contains(key, "password") ||
-		strings.Contains(key, "passwd") ||
-		strings.Contains(key, "secret") ||
-		strings.Contains(key, "apikey") ||
-		strings.Contains(key, "session") ||
-		strings.Contains(key, "csrf") ||
-		strings.Contains(key, "otp") ||
-		strings.Contains(key, "authorization") ||
-		strings.Contains(key, "cookie")
 }
 
 func headerValue(headers map[string]string, name string) string {

@@ -529,7 +529,7 @@ func Discover(ctx context.Context, cfg *Config, log *logging.Logger) ([]analyzer
 	return result.Assets, err
 }
 
-// DiscoverWithRuntime runs browser discovery and optionally returns sanitized
+// DiscoverWithRuntime runs browser discovery and optionally returns captured
 // runtime API requests in addition to the existing JavaScript asset results.
 // It uses CDP network monitoring to capture:
 //   - Network requests with ResourceType=Script

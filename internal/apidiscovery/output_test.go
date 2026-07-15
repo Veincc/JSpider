@@ -53,6 +53,68 @@ func TestEndpointURLsFiltersInvalidAndDeduplicatesAcrossEntries(t *testing.T) {
 	}
 }
 
+func TestEndpointURLsResolvesRelativeStaticOnlyWithinOwnSourceEntry(t *testing.T) {
+	firstEntry := "https://first.example/app/page"
+	secondEntry := "https://second.example/root/page"
+	session := NewSession()
+	session.AddStatic([]StaticEndpoint{
+		{RawURL: "./api/first", Method: "GET", SourceIdentity: SourceIdentity{EntryURL: firstEntry}},
+		{RawURL: "./api/second", Method: "GET", SourceIdentity: SourceIdentity{EntryURL: secondEntry}},
+	})
+	got := EndpointURLs(session.Report(), []string{firstEntry, secondEntry})
+	want := []string{
+		"https://first.example/app/api/first",
+		"https://second.example/root/api/second",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs() = %v, want provenance-isolated %v", got, want)
+	}
+}
+
+func TestEndpointURLsUsesOwnEntrySchemeForProtocolRelativeStatic(t *testing.T) {
+	entry := "http://first.example/app/"
+	session := NewSession()
+	session.AddStatic([]StaticEndpoint{{
+		RawURL: "//api.example/users", Method: "GET",
+		SourceIdentity: SourceIdentity{EntryURL: entry},
+	}})
+	got := EndpointURLs(session.Report(), []string{entry, "https://second.example/"})
+	want := []string{"http://api.example/users"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs() = %v, want own-entry scheme %v", got, want)
+	}
+}
+
+func TestReportAndEndpointFilePreserveRawFullQueryValues(t *testing.T) {
+	longValue := strings.Repeat("x", MaxParameterValueBytes+73)
+	rawURL := "https://example.com/api/users?access_token=top-secret&query=" + longValue
+	report := BuildReport(nil, []RuntimeRequest{{
+		RequestID: "runtime", URL: rawURL, Method: "GET", ResourceType: "Fetch",
+		QueryParams: []Parameter{
+			{Name: "access_token", Value: "top-secret"},
+			{Name: "query", Value: longValue},
+		},
+	}})
+	if report.RuntimeRequests[0].URL != rawURL || report.Endpoints[0].ResolvedURL != rawURL {
+		t.Fatalf("report URLs = %q / %q, want %q", report.RuntimeRequests[0].URL, report.Endpoints[0].ResolvedURL, rawURL)
+	}
+	if valueFor(report.RuntimeRequests[0].QueryParams, "query") != longValue {
+		t.Fatalf("report query params = %+v, want full value", report.RuntimeRequests[0].QueryParams)
+	}
+	urls := EndpointURLs(report, nil)
+	if !reflect.DeepEqual(urls, []string{rawURL}) {
+		t.Fatalf("EndpointURLs() = %v, want raw URL", urls)
+	}
+	dir := t.TempDir()
+	if err := WriteEndpointURLs(dir, urls); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "endpoints.txt"))
+	if err != nil || string(data) != rawURL+"\n" {
+		t.Fatalf("endpoints.txt = %q, error = %v", data, err)
+	}
+}
+
 func TestEndpointURLsDoesNotReintroduceFilteredReportNoise(t *testing.T) {
 	report := BuildReport([]StaticEndpoint{
 		{RawURL: "examples/PDF.js/web/viewer.html", SourceJSURL: "https://example.com/vendor.js"},

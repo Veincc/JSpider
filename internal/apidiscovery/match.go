@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/Veincc/JSpider/internal/urlutil"
@@ -11,6 +12,12 @@ import (
 
 type normalizedPath struct {
 	segments []string
+}
+
+type associationRecord struct {
+	association  Association
+	staticIndex  int
+	runtimeIndex int
 }
 
 func BuildReport(static []StaticEndpoint, runtime []RuntimeRequest) Report {
@@ -24,20 +31,28 @@ func BuildReport(static []StaticEndpoint, runtime []RuntimeRequest) Report {
 }
 
 func buildReport(static []StaticEndpoint, runtime []RuntimeRequest, entryURLs []string) Report {
-	static = append([]StaticEndpoint(nil), static...)
-	runtime = append([]RuntimeRequest(nil), runtime...)
+	static = cloneStaticEndpoints(static)
+	runtime = cloneRuntimeRequests(runtime)
 	for i := range static {
+		if !static[i].sourceIndexSet {
+			static[i].SourceIndex = i
+			static[i].sourceIndexSet = true
+		}
 		static[i].Version = Version
 		ensureStaticCollections(&static[i])
 	}
 	for i := range runtime {
+		if !runtime[i].runtimeIndexSet {
+			runtime[i].RuntimeIndex = i
+			runtime[i].runtimeIndexSet = true
+		}
 		runtime[i].Version = Version
 		ensureRuntimeCollections(&runtime[i])
 	}
 	sortStaticEndpoints(static)
 	sortRuntimeRequests(runtime)
 
-	associations := make([]Association, 0)
+	records := make([]associationRecord, 0)
 	matchedStatic := make(map[int]bool)
 	matchedRuntime := make(map[int]bool)
 	runtimeIndex := newRuntimeAssociationIndex(runtime)
@@ -47,15 +62,23 @@ func buildReport(static []StaticEndpoint, runtime []RuntimeRequest, entryURLs []
 			if !ok {
 				continue
 			}
-			associations = append(associations, association)
+			records = append(records, associationRecord{
+				association:  association,
+				staticIndex:  staticIndex,
+				runtimeIndex: runtimeCandidate,
+			})
 			matchedStatic[staticIndex] = true
 			matchedRuntime[runtimeCandidate] = true
 		}
 	}
-	sortAssociations(associations)
+	sortAssociationRecords(records)
+	associations := make([]Association, len(records))
+	for index := range records {
+		associations[index] = records[index].association
+	}
 
 	bases := buildBases(associations)
-	endpoints := buildEndpoints(static, runtime, associations, matchedStatic, matchedRuntime, bases, collectEntryOrigins(entryURLs))
+	endpoints := buildEndpoints(static, runtime, records, matchedStatic, matchedRuntime, bases, collectEntryOrigins(entryURLs))
 	confirmed := 0
 	for _, association := range associations {
 		if association.Confidence == ConfidenceConfirmed {
@@ -108,6 +131,8 @@ func associateOne(static StaticEndpoint, runtime RuntimeRequest) (Association, b
 		if staticURL.Scheme != "" && !strings.EqualFold(staticURL.Scheme, runtimeURL.Scheme) {
 			return Association{}, false
 		}
+	} else if static.SourceIdentity.EntryURL != "" && runtime.EntryURL != static.SourceIdentity.EntryURL {
+		return Association{}, false
 	}
 	runtimePath := normalizePath(runtimeURL.EscapedPath())
 	// Match on whole path segments only. A suffix match can infer a gateway
@@ -190,6 +215,10 @@ func associateOne(static StaticEndpoint, runtime RuntimeRequest) (Association, b
 	}
 	return Association{
 		Version:        Version,
+		SourceIndex:    static.SourceIndex,
+		RuntimeIndex:   runtime.RuntimeIndex,
+		SourceIdentity: static.SourceIdentity,
+		EntryURL:       runtime.EntryURL,
 		StaticRawURL:   static.RawURL,
 		RuntimeURL:     runtime.URL,
 		Method:         method,
@@ -250,6 +279,16 @@ func matchPath(static, runtime normalizedPath) (int, []string, bool, bool) {
 	}
 	offset := len(runtime.segments) - len(static.segments)
 	usedExpression := false
+	for _, segment := range static.segments {
+		if segment == "EXPR" {
+			usedExpression = true
+			break
+		}
+	}
+	if usedExpression && (static.segments[0] == "EXPR" || static.segments[len(static.segments)-1] == "EXPR") {
+		return 0, nil, false, false
+	}
+	usedExpression = false
 	for i, segment := range static.segments {
 		runtimeSegment := runtime.segments[offset+i]
 		if segment == "EXPR" {
@@ -267,17 +306,24 @@ func matchPath(static, runtime normalizedPath) (int, []string, bool, bool) {
 }
 
 type runtimeAssociationIndex struct {
-	all           []int
-	byLastSegment map[string][]int
+	exactAnyMethod      map[string][]int
+	exactByMethod       map[string][]int
+	exactWithoutMethod  map[string][]int
+	expressionAnyMethod map[string][]int
+	expressionByMethod  map[string][]int
+	expressionNoMethod  map[string][]int
 }
 
 func newRuntimeAssociationIndex(runtime []RuntimeRequest) runtimeAssociationIndex {
 	index := runtimeAssociationIndex{
-		all:           make([]int, 0, len(runtime)),
-		byLastSegment: make(map[string][]int),
+		exactAnyMethod:      make(map[string][]int),
+		exactByMethod:       make(map[string][]int),
+		exactWithoutMethod:  make(map[string][]int),
+		expressionAnyMethod: make(map[string][]int),
+		expressionByMethod:  make(map[string][]int),
+		expressionNoMethod:  make(map[string][]int),
 	}
 	for runtimeIndex, request := range runtime {
-		index.all = append(index.all, runtimeIndex)
 		parsed, err := url.Parse(request.URL)
 		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 			continue
@@ -286,8 +332,34 @@ func newRuntimeAssociationIndex(runtime []RuntimeRequest) runtimeAssociationInde
 		if len(pathValue.segments) == 0 {
 			continue
 		}
-		lastSegment := pathValue.segments[len(pathValue.segments)-1]
-		index.byLastSegment[lastSegment] = append(index.byLastSegment[lastSegment], runtimeIndex)
+		method := strings.ToUpper(strings.TrimSpace(request.Method))
+		for start := range pathValue.segments {
+			suffix := pathValue.segments[start:]
+			exactKey := strings.Join(suffix, "\x1f")
+			index.exactAnyMethod[exactKey] = append(index.exactAnyMethod[exactKey], runtimeIndex)
+			if method == "" {
+				index.exactWithoutMethod[exactKey] = append(index.exactWithoutMethod[exactKey], runtimeIndex)
+			} else {
+				key := method + "\x00" + exactKey
+				index.exactByMethod[key] = append(index.exactByMethod[key], runtimeIndex)
+			}
+
+			// Expression candidates are keyed by their fixed prefix before the
+			// first EXPR segment, the exact suffix length, and the final segment.
+			// Generate each possible fixed-prefix length for this runtime suffix;
+			// the paths are short and this avoids scanning every request sharing a
+			// generic last segment.
+			for prefixLength := 1; prefixLength < len(suffix); prefixLength++ {
+				expressionKey := expressionAssociationKey(len(suffix), suffix[:prefixLength], suffix[len(suffix)-1])
+				index.expressionAnyMethod[expressionKey] = append(index.expressionAnyMethod[expressionKey], runtimeIndex)
+				if method == "" {
+					index.expressionNoMethod[expressionKey] = append(index.expressionNoMethod[expressionKey], runtimeIndex)
+				} else {
+					key := method + "\x00" + expressionKey
+					index.expressionByMethod[key] = append(index.expressionByMethod[key], runtimeIndex)
+				}
+			}
+		}
 	}
 	return index
 }
@@ -297,38 +369,81 @@ func (index runtimeAssociationIndex) candidates(static StaticEndpoint) []int {
 	if !ok || len(staticPath.segments) == 0 {
 		return nil
 	}
-	lastSegment := staticPath.segments[len(staticPath.segments)-1]
-	if lastSegment == "EXPR" {
-		return index.all
+	method := strings.ToUpper(strings.TrimSpace(static.Method))
+	firstExpression := -1
+	for segmentIndex, segment := range staticPath.segments {
+		if segment == "EXPR" {
+			firstExpression = segmentIndex
+			break
+		}
 	}
-	return index.byLastSegment[lastSegment]
+	if firstExpression < 0 {
+		key := strings.Join(staticPath.segments, "\x1f")
+		if method == "" {
+			return index.exactAnyMethod[key]
+		}
+		return combineRuntimeCandidates(index.exactByMethod[method+"\x00"+key], index.exactWithoutMethod[key])
+	}
+	if firstExpression == 0 || staticPath.segments[len(staticPath.segments)-1] == "EXPR" {
+		return nil
+	}
+	key := expressionAssociationKey(len(staticPath.segments), staticPath.segments[:firstExpression], staticPath.segments[len(staticPath.segments)-1])
+	if method == "" {
+		return index.expressionAnyMethod[key]
+	}
+	return combineRuntimeCandidates(index.expressionByMethod[method+"\x00"+key], index.expressionNoMethod[key])
+}
+
+func expressionAssociationKey(pathLength int, fixedPrefix []string, lastSegment string) string {
+	return strconv.Itoa(pathLength) + "\x00" + strings.Join(fixedPrefix, "\x1f") + "\x00" + lastSegment
+}
+
+func combineRuntimeCandidates(first, second []int) []int {
+	if len(first) == 0 {
+		return second
+	}
+	if len(second) == 0 {
+		return first
+	}
+	combined := make([]int, 0, len(first)+len(second))
+	combined = append(combined, first...)
+	combined = append(combined, second...)
+	return combined
 }
 
 func buildBases(associations []Association) []RuntimeBase {
 	type aggregate struct {
 		origin      string
 		prefix      string
+		runtimeBase string
 		pairs       []MatchedPair
 		staticPaths map[string]bool
 		singleHigh  bool
 		totalScore  int
+		entryURLs   map[string]bool
 	}
 	aggregates := make(map[string]*aggregate)
 	for _, association := range associations {
-		item := aggregates[association.RuntimeBase]
+		aggregateKey := association.RuntimeBase + "\x00" + association.EntryURL
+		item := aggregates[aggregateKey]
 		if item == nil {
 			item = &aggregate{
 				origin:      association.RuntimeOrigin,
 				prefix:      association.Prefix,
+				runtimeBase: association.RuntimeBase,
 				staticPaths: make(map[string]bool),
+				entryURLs:   make(map[string]bool),
 			}
-			aggregates[association.RuntimeBase] = item
+			aggregates[aggregateKey] = item
 		}
 		item.pairs = append(item.pairs, MatchedPair{
 			StaticRawURL: association.StaticRawURL,
 			RuntimeURL:   association.RuntimeURL,
 			Score:        association.Score,
 		})
+		if association.EntryURL != "" {
+			item.entryURLs[association.EntryURL] = true
+		}
 		// Count unique static interfaces, not query variants of the same path.
 		item.staticPaths[staticInterfaceKey(association.StaticRawURL, association.Method)] = true
 		item.totalScore += association.Score
@@ -338,7 +453,7 @@ func buildBases(associations []Association) []RuntimeBase {
 	}
 
 	bases := make([]RuntimeBase, 0, len(aggregates))
-	for runtimeBase, item := range aggregates {
+	for _, item := range aggregates {
 		sort.Slice(item.pairs, func(i, j int) bool {
 			if item.pairs[i].StaticRawURL != item.pairs[j].StaticRawURL {
 				return item.pairs[i].StaticRawURL < item.pairs[j].StaticRawURL
@@ -353,10 +468,12 @@ func buildBases(associations []Association) []RuntimeBase {
 			Version:       Version,
 			Origin:        item.origin,
 			Prefix:        item.prefix,
-			RuntimeBase:   runtimeBase,
+			RuntimeBase:   item.runtimeBase,
 			Confidence:    confidence,
 			EvidenceCount: len(item.pairs),
 			MatchedPairs:  item.pairs,
+			EntryURLs:     sortedStringSet(item.entryURLs),
+			totalScore:    item.totalScore,
 		})
 	}
 	sort.Slice(bases, func(i, j int) bool {
@@ -366,23 +483,30 @@ func buildBases(associations []Association) []RuntimeBase {
 		if bases[i].EvidenceCount != bases[j].EvidenceCount {
 			return bases[i].EvidenceCount > bases[j].EvidenceCount
 		}
-		leftScore := totalPairScore(bases[i].MatchedPairs)
-		rightScore := totalPairScore(bases[j].MatchedPairs)
+		leftScore := bases[i].totalScore
+		rightScore := bases[j].totalScore
 		if leftScore != rightScore {
 			return leftScore > rightScore
 		}
-		return bases[i].RuntimeBase < bases[j].RuntimeBase
+		if bases[i].RuntimeBase != bases[j].RuntimeBase {
+			return bases[i].RuntimeBase < bases[j].RuntimeBase
+		}
+		return strings.Join(bases[i].EntryURLs, "\x00") < strings.Join(bases[j].EntryURLs, "\x00")
 	})
 	return bases
 }
 
-func buildEndpoints(static []StaticEndpoint, runtime []RuntimeRequest, associations []Association, matchedStatic, matchedRuntime map[int]bool, bases []RuntimeBase, entryOrigins map[string]bool) []Endpoint {
+func buildEndpoints(static []StaticEndpoint, runtime []RuntimeRequest, associations []associationRecord, matchedStatic, matchedRuntime map[int]bool, bases []RuntimeBase, entryOrigins map[string]bool) []Endpoint {
 	endpoints := make([]Endpoint, 0, len(associations)+len(static)+len(runtime))
-	for _, association := range associations {
-		staticEndpoint := findStatic(static, association.StaticRawURL, association.SourceJSURL)
-		runtimeRequest := findRuntime(runtime, association.RuntimeURL, association.Method)
+	for _, record := range associations {
+		association := record.association
+		staticEndpoint := static[record.staticIndex]
+		runtimeRequest := runtime[record.runtimeIndex]
 		endpoints = append(endpoints, Endpoint{
 			Version:            Version,
+			SourceIndex:        staticEndpoint.SourceIndex,
+			RuntimeIndex:       runtimeRequest.RuntimeIndex,
+			SourceIdentity:     staticEndpoint.SourceIdentity,
 			Kind:               EndpointMatched,
 			RawURL:             association.StaticRawURL,
 			ResolvedURL:        association.RuntimeURL,
@@ -412,9 +536,12 @@ func buildEndpoints(static []StaticEndpoint, runtime []RuntimeRequest, associati
 		if !isReportableStaticOnly(endpoint, entryOrigins) {
 			continue
 		}
-		candidates := resolveCandidates(endpoint.RawURL, confirmedBases)
+		candidates := resolveCandidates(endpoint, confirmedBases)
 		endpoints = append(endpoints, Endpoint{
 			Version:            Version,
+			SourceIndex:        endpoint.SourceIndex,
+			RuntimeIndex:       -1,
+			SourceIdentity:     endpoint.SourceIdentity,
 			Kind:               EndpointStaticOnly,
 			RawURL:             endpoint.RawURL,
 			ResolvedCandidates: candidates,
@@ -432,6 +559,8 @@ func buildEndpoints(static []StaticEndpoint, runtime []RuntimeRequest, associati
 		}
 		endpoints = append(endpoints, Endpoint{
 			Version:            Version,
+			SourceIndex:        -1,
+			RuntimeIndex:       request.RuntimeIndex,
 			Kind:               EndpointRuntimeOnly,
 			ResolvedURL:        request.URL,
 			ResolvedCandidates: []string{},
@@ -449,7 +578,8 @@ func buildEndpoints(static []StaticEndpoint, runtime []RuntimeRequest, associati
 	return endpoints
 }
 
-func resolveCandidates(raw string, bases []RuntimeBase) []string {
+func resolveCandidates(endpoint StaticEndpoint, bases []RuntimeBase) []string {
+	raw := endpoint.RawURL
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Scheme != "" || parsed.Host != "" {
 		return []string{}
@@ -465,12 +595,33 @@ func resolveCandidates(raw string, bases []RuntimeBase) []string {
 	out := make([]string, 0, len(bases))
 	seen := make(map[string]bool)
 	for _, base := range bases {
+		if endpoint.SourceIdentity.EntryURL != "" && !containsString(base.EntryURLs, endpoint.SourceIdentity.EntryURL) {
+			continue
+		}
 		candidate := resolveAgainstBase(suffix, base)
 		if !seen[candidate] {
 			seen[candidate] = true
 			out = append(out, candidate)
 		}
 	}
+	if len(out) == 0 && endpoint.SourceIdentity.EntryURL != "" {
+		base, baseErr := url.Parse(endpoint.SourceIdentity.EntryURL)
+		if baseErr == nil && base.Scheme != "" && base.Host != "" {
+			out = append(out, base.ResolveReference(parsed).String())
+		}
+	}
+	return out
+}
+
+func sortedStringSet(values map[string]bool) []string {
+	if len(values) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -596,14 +747,6 @@ func containsString(items []string, value string) bool {
 	return false
 }
 
-func totalPairScore(pairs []MatchedPair) int {
-	total := 0
-	for _, pair := range pairs {
-		total += pair.Score
-	}
-	return total
-}
-
 func countConfirmedBases(bases []RuntimeBase) int {
 	count := 0
 	for _, base := range bases {
@@ -689,24 +832,6 @@ func cloneParameters(values []Parameter) []Parameter {
 	return append([]Parameter(nil), values...)
 }
 
-func findStatic(static []StaticEndpoint, rawURL, source string) StaticEndpoint {
-	for _, endpoint := range static {
-		if endpoint.RawURL == rawURL && endpoint.SourceJSURL == source {
-			return endpoint
-		}
-	}
-	return StaticEndpoint{QueryParams: []Parameter{}, BodyParams: []Parameter{}}
-}
-
-func findRuntime(runtime []RuntimeRequest, rawURL, method string) RuntimeRequest {
-	for _, request := range runtime {
-		if request.URL == rawURL && (method == "" || strings.EqualFold(request.Method, method)) {
-			return request
-		}
-	}
-	return RuntimeRequest{QueryParams: []Parameter{}, BodyParams: []Parameter{}}
-}
-
 func sortStaticEndpoints(endpoints []StaticEndpoint) {
 	sort.Slice(endpoints, func(i, j int) bool {
 		if endpoints[i].RawURL != endpoints[j].RawURL {
@@ -718,7 +843,10 @@ func sortStaticEndpoints(endpoints []StaticEndpoint) {
 		if endpoints[i].SourceJSURL != endpoints[j].SourceJSURL {
 			return endpoints[i].SourceJSURL < endpoints[j].SourceJSURL
 		}
-		return endpoints[i].Type < endpoints[j].Type
+		if endpoints[i].Type != endpoints[j].Type {
+			return endpoints[i].Type < endpoints[j].Type
+		}
+		return endpoints[i].SourceIndex < endpoints[j].SourceIndex
 	})
 }
 
@@ -733,19 +861,30 @@ func sortRuntimeRequests(requests []RuntimeRequest) {
 		if requests[i].RequestID != requests[j].RequestID {
 			return requests[i].RequestID < requests[j].RequestID
 		}
-		return requests[i].RedirectIndex < requests[j].RedirectIndex
+		if requests[i].RedirectIndex != requests[j].RedirectIndex {
+			return requests[i].RedirectIndex < requests[j].RedirectIndex
+		}
+		return requests[i].RuntimeIndex < requests[j].RuntimeIndex
 	})
 }
 
-func sortAssociations(associations []Association) {
-	sort.Slice(associations, func(i, j int) bool {
-		if associations[i].StaticRawURL != associations[j].StaticRawURL {
-			return associations[i].StaticRawURL < associations[j].StaticRawURL
+func sortAssociationRecords(records []associationRecord) {
+	sort.Slice(records, func(i, j int) bool {
+		left := records[i].association
+		right := records[j].association
+		if left.StaticRawURL != right.StaticRawURL {
+			return left.StaticRawURL < right.StaticRawURL
 		}
-		if associations[i].RuntimeURL != associations[j].RuntimeURL {
-			return associations[i].RuntimeURL < associations[j].RuntimeURL
+		if left.RuntimeURL != right.RuntimeURL {
+			return left.RuntimeURL < right.RuntimeURL
 		}
-		return associations[i].Score > associations[j].Score
+		if left.Score != right.Score {
+			return left.Score > right.Score
+		}
+		if records[i].staticIndex != records[j].staticIndex {
+			return records[i].staticIndex < records[j].staticIndex
+		}
+		return records[i].runtimeIndex < records[j].runtimeIndex
 	})
 }
 
@@ -760,6 +899,12 @@ func sortEndpoints(endpoints []Endpoint) {
 		if endpoints[i].ResolvedURL != endpoints[j].ResolvedURL {
 			return endpoints[i].ResolvedURL < endpoints[j].ResolvedURL
 		}
-		return endpoints[i].Method < endpoints[j].Method
+		if endpoints[i].Method != endpoints[j].Method {
+			return endpoints[i].Method < endpoints[j].Method
+		}
+		if endpoints[i].SourceIndex != endpoints[j].SourceIndex {
+			return endpoints[i].SourceIndex < endpoints[j].SourceIndex
+		}
+		return endpoints[i].RuntimeIndex < endpoints[j].RuntimeIndex
 	})
 }

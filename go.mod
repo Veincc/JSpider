@@ -8,6 +8,7 @@ require (
 	github.com/chromedp/cdproto v0.0.0-20260321001828-e3e3800016bc
 	github.com/chromedp/chromedp v0.15.1
 	github.com/tdewolff/parse/v2 v2.7.15
+	github.com/vektah/gqlparser/v2 v2.5.36
 	golang.org/x/net v0.15.0
 )
 

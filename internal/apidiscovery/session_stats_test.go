@@ -53,7 +53,7 @@ func TestSessionStatsAreCheapAndIsolatedPerEntry(t *testing.T) {
 	if report := session.Report(); report.Summary.Static != 0 {
 		t.Fatalf("Stats performed static analysis: %+v", report.StaticEndpoints)
 	}
-	if session.SourceCount() != 1 {
-		t.Fatalf("matching source set changed shape: count = %d, want current URL-keyed behavior", session.SourceCount())
+	if session.SourceCount() != 2 {
+		t.Fatalf("source count = %d, want distinct provenance records for the two entries", session.SourceCount())
 	}
 }

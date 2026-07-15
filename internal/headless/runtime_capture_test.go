@@ -56,14 +56,14 @@ func TestRuntimeCaptureMergesRequestResponseAndFinished(t *testing.T) {
 	if got.Stage != "click" || got.StatusCode != 200 || !got.Completed || got.EncodedDataLength != 123 {
 		t.Fatalf("merged request = %+v", got)
 	}
-	if _, ok := got.Headers["Authorization"]; ok {
-		t.Fatalf("Authorization header was retained: %#v", got.Headers)
+	if got.Headers["Authorization"] != "secret" {
+		t.Fatalf("Authorization header = %#v, want original value", got.Headers)
 	}
-	if valueForRuntime(got.BodyParams, "token") != "[REDACTED]" {
+	if valueForRuntime(got.BodyParams, "token") != "secret" {
 		t.Fatalf("token body param = %q", valueForRuntime(got.BodyParams, "token"))
 	}
-	if strings.Contains(got.URL, "url-secret") {
-		t.Fatalf("runtime URL leaked a sensitive query value: %q", got.URL)
+	if !strings.Contains(got.URL, "url-secret") {
+		t.Fatalf("runtime URL did not preserve query value: %q", got.URL)
 	}
 	if len(got.Initiator.StackURLs) != 1 || got.Initiator.StackURLs[0] != "https://example.com/app.js" {
 		t.Fatalf("initiator = %+v", got.Initiator)
@@ -97,8 +97,31 @@ func TestRuntimeCaptureAppliesPostDataAfterRequestCompletes(t *testing.T) {
 	if valueForRuntime(requests[0].BodyParams, "filters.status") != "active" {
 		t.Fatalf("body params after completion = %+v", requests[0].BodyParams)
 	}
-	if valueForRuntime(requests[0].BodyParams, "api_key") != apidiscovery.RedactedValue {
+	if valueForRuntime(requests[0].BodyParams, "api_key") != "secret" {
 		t.Fatalf("api_key after completion = %+v", requests[0].BodyParams)
+	}
+}
+
+func TestRuntimeCaptureCarriesBodyTruncationAndParseError(t *testing.T) {
+	capture := newRuntimeCapture("https://example.com/")
+	capture.handleRequest(&network.EventRequestWillBeSent{
+		RequestID: "large-post", Type: network.ResourceTypeFetch,
+		Request: &network.Request{
+			URL: "https://example.com/api", Method: "POST",
+			Headers: network.Headers{"Content-Type": "application/json"}, HasPostData: true,
+		},
+	})
+	capture.setPostData(
+		"large-post",
+		"https://example.com/api",
+		[]byte(`{"padding":"`+strings.Repeat("x", apidiscovery.MaxRequestBodyBytes+1)+`"}`),
+	)
+	requests := capture.snapshot()
+	if len(requests) != 1 {
+		t.Fatalf("requests = %+v", requests)
+	}
+	if !requests[0].BodyTruncated || requests[0].BodyParseError == "" {
+		t.Fatalf("runtime body flags = truncated %v parse error %q", requests[0].BodyTruncated, requests[0].BodyParseError)
 	}
 }
 

@@ -205,3 +205,160 @@ func TestAbsoluteStaticURLDoesNotMatchDifferentRuntimeOrigin(t *testing.T) {
 		t.Fatalf("cross-origin absolute static URL was associated: %+v", report.Associations)
 	}
 }
+
+func TestRepeatedEndpointAssociationsKeepTheirRuntimeRecords(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{
+			{RawURL: "/api/users", Method: "GET", SourceJSURL: "https://example.com/a.js"},
+			{RawURL: "/api/users", Method: "GET", SourceJSURL: "https://example.com/b.js"},
+		},
+		[]RuntimeRequest{
+			{RequestID: "first", URL: "https://example.com/api/users", Method: "GET", ResourceType: "Fetch", StatusCode: 201},
+			{RequestID: "second", URL: "https://example.com/api/users", Method: "GET", ResourceType: "Fetch", StatusCode: 503, Failed: true},
+		},
+	)
+
+	statuses := map[int64]int{}
+	failed := 0
+	for _, endpoint := range report.Endpoints {
+		if endpoint.Kind != EndpointMatched {
+			continue
+		}
+		statuses[endpoint.RuntimeStatus]++
+		if endpoint.RuntimeFailed {
+			failed++
+		}
+	}
+	if statuses[201] != 2 || statuses[503] != 2 || failed != 2 {
+		t.Fatalf("matched runtime records = statuses %v failed %d, want each repeated request retained twice", statuses, failed)
+	}
+}
+
+func TestStableCollectionIndicesSurviveReportSorting(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{
+			{RawURL: "/api/z", Method: "GET", SourceJSURL: "https://example.com/z.js"},
+			{RawURL: "/api/a", Method: "GET", SourceJSURL: "https://example.com/a.js"},
+		},
+		[]RuntimeRequest{
+			{RequestID: "z", URL: "https://example.com/api/z", Method: "GET", ResourceType: "Fetch"},
+			{RequestID: "a", URL: "https://example.com/api/a", Method: "GET", ResourceType: "Fetch"},
+		},
+	)
+
+	if report.StaticEndpoints[0].RawURL != "/api/a" || report.StaticEndpoints[0].SourceIndex != 1 ||
+		report.StaticEndpoints[1].RawURL != "/api/z" || report.StaticEndpoints[1].SourceIndex != 0 {
+		t.Fatalf("sorted static indices = %+v", report.StaticEndpoints)
+	}
+	if report.RuntimeRequests[0].RequestID != "a" || report.RuntimeRequests[0].RuntimeIndex != 1 ||
+		report.RuntimeRequests[1].RequestID != "z" || report.RuntimeRequests[1].RuntimeIndex != 0 {
+		t.Fatalf("sorted runtime indices = %+v", report.RuntimeRequests)
+	}
+	if len(report.Associations) != 2 ||
+		report.Associations[0].SourceIndex != 1 || report.Associations[0].RuntimeIndex != 1 ||
+		report.Associations[1].SourceIndex != 0 || report.Associations[1].RuntimeIndex != 0 {
+		t.Fatalf("association indices = %+v", report.Associations)
+	}
+	if report.Endpoints[0].SourceIndex != 1 || report.Endpoints[0].RuntimeIndex != 1 ||
+		report.Endpoints[1].SourceIndex != 0 || report.Endpoints[1].RuntimeIndex != 0 {
+		t.Fatalf("endpoint indices = %+v", report.Endpoints)
+	}
+}
+
+func TestRelativeStaticAssociationIsIsolatedToItsSourceEntry(t *testing.T) {
+	firstEntry := "https://first.example/app/"
+	report := BuildReport(
+		[]StaticEndpoint{{
+			RawURL: "/api/users", Method: "GET", SourceJSURL: "https://cdn.example/app.js",
+			SourceIdentity: SourceIdentity{EntryURL: firstEntry, FinalURL: "https://cdn.example/app.js", ContentHash: "first"},
+		}},
+		[]RuntimeRequest{
+			{RequestID: "first", URL: "https://api.example/api/users", Method: "GET", ResourceType: "Fetch", EntryURL: firstEntry},
+			{RequestID: "second", URL: "https://api.example/api/users", Method: "GET", ResourceType: "Fetch", EntryURL: "https://second.example/app/"},
+		},
+	)
+	if len(report.Associations) != 1 || report.Associations[0].RuntimeIndex != 0 {
+		t.Fatalf("associations = %+v, want only the source entry's runtime request", report.Associations)
+	}
+}
+
+func TestExpressionWithoutFixedPrefixRemainsStaticOnly(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{{
+			RawURL: "/EXPR/users", Method: "GET", SourceJSURL: "https://example.com/app.js",
+		}},
+		[]RuntimeRequest{{
+			RequestID: "runtime", URL: "https://example.com/42/users", Method: "GET", ResourceType: "Fetch",
+			Initiator: Initiator{StackURLs: []string{"https://example.com/app.js"}},
+		}},
+	)
+	if len(report.Associations) != 0 {
+		t.Fatalf("associations = %+v, want no-prefix expression to remain static-only", report.Associations)
+	}
+	foundStaticOnly := false
+	for _, endpoint := range report.Endpoints {
+		if endpoint.Kind == EndpointStaticOnly && endpoint.RawURL == "/EXPR/users" {
+			foundStaticOnly = true
+		}
+	}
+	if !foundStaticOnly {
+		t.Fatalf("endpoints = %+v, want expression static evidence retained", report.Endpoints)
+	}
+}
+
+func TestExpressionMatchesOnlyAnExactPathSegment(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{{RawURL: "/api/preEXPRpost/users", Method: "GET"}},
+		[]RuntimeRequest{{URL: "https://example.com/api/42/users", Method: "GET", ResourceType: "Fetch"}},
+	)
+	if len(report.Associations) != 0 {
+		t.Fatalf("associations = %+v, want EXPR wildcard only for an exact segment", report.Associations)
+	}
+}
+
+func TestAssociationIndexUsesMethodFinalSegmentAndFixedPrefix(t *testing.T) {
+	report := BuildReport(
+		[]StaticEndpoint{
+			{RawURL: "/api/alpha/users", Method: "GET"},
+			{RawURL: "/api/beta/users", Method: "POST"},
+		},
+		[]RuntimeRequest{
+			{RequestID: "alpha", URL: "https://example.com/gw/api/alpha/users", Method: "GET", ResourceType: "Fetch"},
+			{RequestID: "wrong-prefix", URL: "https://example.com/gw/other/alpha/users", Method: "GET", ResourceType: "Fetch"},
+			{RequestID: "beta", URL: "https://example.com/gw/api/beta/users", Method: "POST", ResourceType: "Fetch"},
+			{RequestID: "wrong-method", URL: "https://example.com/gw/api/beta/users", Method: "GET", ResourceType: "Fetch"},
+		},
+	)
+	if len(report.Associations) != 2 {
+		t.Fatalf("associations = %+v, want only exact method/final-segment/fixed-prefix pairs", report.Associations)
+	}
+	if report.Associations[0].Prefix != "/gw" || report.Associations[1].Prefix != "/gw" {
+		t.Fatalf("association prefixes = %+v, want fixed /gw", report.Associations)
+	}
+}
+
+func TestRuntimeBaseEvidenceDoesNotCrossSourceEntries(t *testing.T) {
+	firstEntry := "https://first.example/"
+	secondEntry := "https://second.example/"
+	report := BuildReport(
+		[]StaticEndpoint{
+			{RawURL: "/user/list", Method: "GET", SourceIdentity: SourceIdentity{EntryURL: firstEntry}},
+			{RawURL: "/order/list", Method: "GET", SourceIdentity: SourceIdentity{EntryURL: secondEntry}},
+		},
+		[]RuntimeRequest{
+			{URL: "https://api.example/gw/user/list", Method: "GET", ResourceType: "Fetch", EntryURL: firstEntry},
+			{URL: "https://api.example/gw/order/list", Method: "GET", ResourceType: "Fetch", EntryURL: secondEntry},
+		},
+	)
+	if len(report.Bases) != 2 {
+		t.Fatalf("bases = %+v, want one provenance-isolated base record per entry", report.Bases)
+	}
+	for _, base := range report.Bases {
+		if base.Confidence != ConfidenceCandidate || base.EvidenceCount != 1 || len(base.EntryURLs) != 1 {
+			t.Fatalf("cross-entry evidence confirmed a base: %+v", base)
+		}
+	}
+	if report.Bases[0].EntryURLs[0] != firstEntry || report.Bases[1].EntryURLs[0] != secondEntry {
+		t.Fatalf("base ordering = %+v, want stable entry URL tie-break", report.Bases)
+	}
+}

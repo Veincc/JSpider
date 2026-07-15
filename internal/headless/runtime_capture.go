@@ -97,25 +97,27 @@ func (c *runtimeCapture) handleRequest(event *network.EventRequestWillBeSent) bo
 	}
 
 	request := apidiscovery.RuntimeRequest{
-		Version:       apidiscovery.Version,
-		RequestID:     string(event.RequestID),
-		RedirectIndex: redirectIndex,
-		URL:           apidiscovery.SanitizeURL(event.Request.URL),
-		Method:        strings.ToUpper(event.Request.Method),
-		ResourceType:  string(event.Type),
-		Stage:         c.stage,
-		EntryURL:      c.entryURL,
-		DocumentURL:   apidiscovery.SanitizeURL(event.DocumentURL),
-		Headers:       data.Headers,
-		QueryParams:   data.QueryParams,
-		BodyParams:    data.Body.Params,
-		ContentType:   data.Body.ContentType,
-		HasBody:       data.Body.HasBody,
-		BodySample:    data.Body.Sample,
-		GraphQL:       data.Body.GraphQL,
-		Initiator:     convertInitiator(event.Initiator),
-		RedirectFrom:  redirectFrom,
-		Preflight:     strings.EqualFold(event.Request.Method, "OPTIONS"),
+		Version:        apidiscovery.Version,
+		RequestID:      string(event.RequestID),
+		RedirectIndex:  redirectIndex,
+		URL:            apidiscovery.SanitizeURL(event.Request.URL),
+		Method:         strings.ToUpper(event.Request.Method),
+		ResourceType:   string(event.Type),
+		Stage:          c.stage,
+		EntryURL:       c.entryURL,
+		DocumentURL:    apidiscovery.SanitizeURL(event.DocumentURL),
+		Headers:        data.Headers,
+		QueryParams:    data.QueryParams,
+		BodyParams:     data.Body.Params,
+		ContentType:    data.Body.ContentType,
+		HasBody:        data.Body.HasBody,
+		BodyTruncated:  data.Body.Truncated,
+		BodyParseError: data.Body.ParseError,
+		BodySample:     data.Body.Sample,
+		GraphQL:        data.Body.GraphQL,
+		Initiator:      convertInitiator(event.Initiator),
+		RedirectFrom:   redirectFrom,
+		Preflight:      strings.EqualFold(event.Request.Method, "OPTIONS"),
 	}
 	tracked := &trackedRuntimeRequest{
 		request:    request,
@@ -133,10 +135,6 @@ func (c *runtimeCapture) handleRequest(event *network.EventRequestWillBeSent) bo
 }
 
 func (c *runtimeCapture) setPostData(requestID network.RequestID, requestURL string, body []byte) {
-	if len(body) > apidiscovery.MaxRequestBodyBytes {
-		body = body[:apidiscovery.MaxRequestBodyBytes]
-	}
-
 	c.mu.Lock()
 	key := runtimeRequestKey(requestID, requestURL)
 	tracked := c.trackedByKey[key]
@@ -161,6 +159,8 @@ func (c *runtimeCapture) setPostData(requestID network.RequestID, requestURL str
 	tracked.request.BodyParams = data.Body.Params
 	tracked.request.ContentType = data.Body.ContentType
 	tracked.request.HasBody = data.Body.HasBody
+	tracked.request.BodyTruncated = data.Body.Truncated
+	tracked.request.BodyParseError = data.Body.ParseError
 	tracked.request.BodySample = data.Body.Sample
 	tracked.request.GraphQL = data.Body.GraphQL
 	delete(c.trackedByKey, key)

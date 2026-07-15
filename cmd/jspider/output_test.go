@@ -2,12 +2,14 @@ package main
 
 import (
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Veincc/JSpider/internal/apidiscovery"
+	"github.com/Veincc/JSpider/internal/logging"
 	"github.com/Veincc/JSpider/internal/preprocess"
 	"github.com/Veincc/JSpider/internal/store"
 )
@@ -213,5 +215,34 @@ func TestFinalizeOutputsBuildsRecoverableReportAfterAnalysisFailureAndJoinsWrite
 		if session.analyzeCalls != 1 || session.reportCalls != 1 {
 			t.Errorf("%s calls: AnalyzeSources=%d Report=%d, want once each", name, session.analyzeCalls, session.reportCalls)
 		}
+	}
+}
+
+func TestVerboseAPIReportPreservesRawFullQueryValues(t *testing.T) {
+	longValue := strings.Repeat("q", apidiscovery.MaxParameterValueBytes+73)
+	staticURL := "/api/users?access_token=static-secret&query=" + longValue
+	runtimeURL := "https://example.com/api/users?access_token=runtime-secret&query=" + longValue
+	report := apidiscovery.BuildReport(
+		[]apidiscovery.StaticEndpoint{{RawURL: staticURL, Method: "GET"}},
+		[]apidiscovery.RuntimeRequest{{URL: runtimeURL, Method: "GET", ResourceType: "Fetch"}},
+	)
+
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdout := os.Stdout
+	os.Stdout = writePipe
+	logAPIReport(logging.New(true, ""), "example", report)
+	_ = writePipe.Close()
+	os.Stdout = originalStdout
+	output, readErr := io.ReadAll(readPipe)
+	_ = readPipe.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	text := string(output)
+	if !strings.Contains(text, staticURL) || !strings.Contains(text, runtimeURL) {
+		t.Fatalf("verbose API report = %q, want raw static and runtime query values", text)
 	}
 }

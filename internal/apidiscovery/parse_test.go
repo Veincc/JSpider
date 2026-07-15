@@ -61,9 +61,8 @@ func TestParseRequestData(t *testing.T) {
 			if (got.Body.GraphQL != nil) != tt.wantGraphQL {
 				t.Fatalf("GraphQL metadata present = %v, want %v", got.Body.GraphQL != nil, tt.wantGraphQL)
 			}
-			if strings.Contains(got.Body.Sample, "hunter2") || strings.Contains(got.Body.Sample, "secret") ||
-				strings.Contains(got.Body.Sample, "query ListUsers") || strings.Contains(got.Body.Sample, "file contents") {
-				t.Fatalf("body sample contains sensitive or forbidden content: %q", got.Body.Sample)
+			if strings.Contains(got.Body.Sample, "file contents") {
+				t.Fatalf("multipart file contents leaked into body sample: %q", got.Body.Sample)
 			}
 			if len(got.Body.Sample) > MaxBodySampleBytes {
 				t.Fatalf("body sample length = %d, want <= %d", len(got.Body.Sample), MaxBodySampleBytes)
@@ -72,7 +71,7 @@ func TestParseRequestData(t *testing.T) {
 	}
 }
 
-func TestRequestDataRedactsHeadersAndValues(t *testing.T) {
+func TestRequestDataPreservesHeadersAndQueryWhileBoundingBodyFields(t *testing.T) {
 	got := ParseRequestData(
 		"https://example.com/api?access_token=top-secret&name="+strings.Repeat("x", 200),
 		map[string]string{
@@ -87,33 +86,115 @@ func TestRequestDataRedactsHeadersAndValues(t *testing.T) {
 		true,
 	)
 
-	if len(got.Headers) != 3 || got.Headers["X-Trace"] != "trace-value" ||
-		got.Headers["Content-Type"] != "application/json" || got.Headers["X-Api-Key"] != RedactedValue {
-		t.Fatalf("sanitized headers = %#v", got.Headers)
+	if len(got.Headers) != 6 || got.Headers["X-Trace"] != "trace-value" ||
+		got.Headers["Content-Type"] != "application/json" || got.Headers["X-API-Key"] != "header-secret" ||
+		got.Headers["Authorization"] != "Bearer secret" || got.Headers["Cookie"] != "session=secret" {
+		t.Fatalf("preserved headers = %#v", got.Headers)
 	}
-	if valueFor(got.QueryParams, "access_token") != RedactedValue {
+	if valueFor(got.QueryParams, "access_token") != "top-secret" {
 		t.Fatalf("access_token = %q", valueFor(got.QueryParams, "access_token"))
 	}
-	if valueFor(got.Body.Params, "api_key") != RedactedValue {
+	if valueFor(got.Body.Params, "api_key") != "secret" {
 		t.Fatalf("api_key = %q", valueFor(got.Body.Params, "api_key"))
 	}
-	if len(valueFor(got.QueryParams, "name")) != MaxParameterValueBytes {
-		t.Fatalf("query value length = %d, want %d", len(valueFor(got.QueryParams, "name")), MaxParameterValueBytes)
+	if len(valueFor(got.QueryParams, "name")) != 200 {
+		t.Fatalf("query value length = %d, want full 200", len(valueFor(got.QueryParams, "name")))
 	}
 	if len(valueFor(got.Body.Params, "display")) != MaxParameterValueBytes {
 		t.Fatalf("body value length = %d, want %d", len(valueFor(got.Body.Params, "display")), MaxParameterValueBytes)
 	}
 	sanitizedURL := SanitizeURL("https://example.com/api?access_token=top-secret&name=" + strings.Repeat("z", 200))
-	if strings.Contains(sanitizedURL, "top-secret") || !strings.Contains(sanitizedURL, "access_token=%5BREDACTED%5D") {
+	if sanitizedURL != "https://example.com/api?access_token=top-secret&name="+strings.Repeat("z", 200) {
 		t.Fatalf("SanitizeURL() = %q", sanitizedURL)
 	}
 	parsedURL := ParseRequestData(sanitizedURL, nil, nil, false)
-	if len(valueFor(parsedURL.QueryParams, "name")) != MaxParameterValueBytes {
+	if len(valueFor(parsedURL.QueryParams, "name")) != 200 {
 		t.Fatalf("sanitized URL name length = %d", len(valueFor(parsedURL.QueryParams, "name")))
 	}
 }
 
-func TestRequestDataRedactsAuthorizationAndCookieParameterNames(t *testing.T) {
+func TestRequestDataPreservesExistingRawValuesWithoutSanitization(t *testing.T) {
+	longQuery := strings.Repeat("q", MaxParameterValueBytes+73)
+	rawURL := "https://example.com/api?access_token=top-secret&query=" + longQuery
+	got := ParseRequestData(
+		rawURL,
+		map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer raw-secret",
+			"Cookie":        "session=raw-secret",
+		},
+		[]byte(`{"password":"raw-password","display":"raw-display"}`),
+		true,
+	)
+
+	if valueFor(got.QueryParams, "access_token") != "top-secret" {
+		t.Fatalf("access_token = %q, want raw value", valueFor(got.QueryParams, "access_token"))
+	}
+	if valueFor(got.QueryParams, "query") != longQuery {
+		t.Fatalf("query length = %d, want full %d", len(valueFor(got.QueryParams, "query")), len(longQuery))
+	}
+	if got.Headers["Authorization"] != "Bearer raw-secret" || got.Headers["Cookie"] != "session=raw-secret" {
+		t.Fatalf("headers = %#v, want original values", got.Headers)
+	}
+	if valueFor(got.Body.Params, "password") != "raw-password" || !strings.Contains(got.Body.Sample, "raw-password") {
+		t.Fatalf("body = %+v, want original values", got.Body)
+	}
+	if sanitized := SanitizeURL(rawURL); sanitized != rawURL {
+		t.Fatalf("SanitizeURL changed existing URL value: %q", sanitized)
+	}
+}
+
+func TestParseJSONBodyUsesOneMiBLimitBeforeSampling(t *testing.T) {
+	body := []byte(`{"padding":"` + strings.Repeat("x", 96*1024) + `","tail":"seen"}`)
+	got := ParseRequestData(
+		"https://example.com/api",
+		map[string]string{"Content-Type": "application/json"},
+		body,
+		true,
+	)
+	if got.Body.Truncated {
+		t.Fatal("Truncated = true for JSON body below 1 MiB")
+	}
+	if got.Body.ParseError != "" {
+		t.Fatalf("ParseError = %q, want empty", got.Body.ParseError)
+	}
+	if valueFor(got.Body.Params, "tail") != "seen" {
+		t.Fatalf("body params = %+v, want tail parsed after previous 64 KiB boundary", got.Body.Params)
+	}
+	if len(got.Body.Sample) > MaxBodySampleBytes {
+		t.Fatalf("sample length = %d, want <= %d", len(got.Body.Sample), MaxBodySampleBytes)
+	}
+}
+
+func TestParseJSONBodyReportsTruncationAndParseErrors(t *testing.T) {
+	t.Run("over 1 MiB", func(t *testing.T) {
+		body := []byte(`{"padding":"` + strings.Repeat("x", MaxRequestBodyBytes+1) + `"}`)
+		got := ParseRequestData("https://example.com/api", map[string]string{"Content-Type": "application/json"}, body, true)
+		if !got.Body.Truncated {
+			t.Fatal("Truncated = false, want true")
+		}
+		if got.Body.ParseError == "" {
+			t.Fatal("ParseError is empty for a JSON document cut at the 1 MiB limit")
+		}
+	})
+	t.Run("malformed", func(t *testing.T) {
+		got := ParseRequestData("https://example.com/api", map[string]string{"Content-Type": "application/json"}, []byte(`{"broken":`), true)
+		if got.Body.Truncated {
+			t.Fatal("Truncated = true for malformed short JSON")
+		}
+		if got.Body.ParseError == "" {
+			t.Fatal("ParseError is empty for malformed JSON")
+		}
+	})
+	t.Run("trailing invalid data", func(t *testing.T) {
+		got := ParseRequestData("https://example.com/api", map[string]string{"Content-Type": "application/json"}, []byte(`{"valid":1} trailing`), true)
+		if got.Body.ParseError == "" {
+			t.Fatal("ParseError is empty for trailing invalid JSON data")
+		}
+	})
+}
+
+func TestRequestDataPreservesAuthorizationAndCookieParameterValues(t *testing.T) {
 	got := ParseRequestData(
 		"https://example.com/api?authorization=Bearer+secret&cookie=session-secret&proxy_authorization=Basic+secret&set-cookie=sid%3Dsecret",
 		map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
@@ -121,28 +202,27 @@ func TestRequestDataRedactsAuthorizationAndCookieParameterNames(t *testing.T) {
 		true,
 	)
 
-	for _, name := range []string{"authorization", "cookie", "proxy_authorization", "set-cookie"} {
-		if valueFor(got.QueryParams, name) != RedactedValue {
-			t.Fatalf("query param %q = %q, want redacted", name, valueFor(got.QueryParams, name))
+	wantQuery := map[string]string{
+		"authorization": "Bearer secret", "cookie": "session-secret",
+		"proxy_authorization": "Basic secret", "set-cookie": "sid=secret",
+	}
+	for name, want := range wantQuery {
+		if valueFor(got.QueryParams, name) != want {
+			t.Fatalf("query param %q = %q, want %q", name, valueFor(got.QueryParams, name), want)
 		}
 	}
-	for _, name := range []string{"Authorization", "Cookie"} {
-		if valueFor(got.Body.Params, name) != RedactedValue {
-			t.Fatalf("form param %q = %q, want redacted", name, valueFor(got.Body.Params, name))
+	for name, want := range map[string]string{"Authorization": "form-secret", "Cookie": "form-cookie"} {
+		if valueFor(got.Body.Params, name) != want {
+			t.Fatalf("form param %q = %q, want %q", name, valueFor(got.Body.Params, name), want)
 		}
 	}
 }
 
-func TestSanitizeSourceSnippetRedactsCookieAndProxyAuthorizationVariants(t *testing.T) {
+func TestSanitizeSourceSnippetPreservesExistingSource(t *testing.T) {
 	source := `fetch("/api", {setCookie: "sid=secret", proxyAuthorization: "Basic secret", proxy_authorization: "Basic secret"})`
 	got := SanitizeSourceSnippet(source)
-	if strings.Contains(got, "sid=secret") || strings.Contains(got, "Basic secret") {
-		t.Fatalf("SanitizeSourceSnippet() leaked sensitive source: %q", got)
-	}
-	for _, name := range []string{"setCookie", "proxyAuthorization", "proxy_authorization"} {
-		if !strings.Contains(got, name) {
-			t.Fatalf("SanitizeSourceSnippet() removed key %q instead of only redacting the value: %q", name, got)
-		}
+	if got != source {
+		t.Fatalf("SanitizeSourceSnippet() = %q, want original source", got)
 	}
 }
 
@@ -181,7 +261,7 @@ func urlQueryEscape(value string) string {
 	return strings.ReplaceAll(value, "界", "%E7%95%8C")
 }
 
-func TestBatchedGraphQLDoesNotStoreQueryText(t *testing.T) {
+func TestBatchedGraphQLPreservesExistingBodySample(t *testing.T) {
 	got := ParseRequestData(
 		"https://example.com/graphql",
 		map[string]string{"Content-Type": "application/json"},
@@ -195,8 +275,8 @@ func TestBatchedGraphQLDoesNotStoreQueryText(t *testing.T) {
 	if got.Body.GraphQL == nil {
 		t.Fatal("batched GraphQL metadata was not detected")
 	}
-	if strings.Contains(got.Body.Sample, "query List") || strings.Contains(got.Body.Sample, "secret") {
-		t.Fatalf("batched GraphQL sample leaked query or secret: %q", got.Body.Sample)
+	if !strings.Contains(got.Body.Sample, "query ListUsers") || !strings.Contains(got.Body.Sample, "secret") {
+		t.Fatalf("batched GraphQL sample did not preserve existing body values: %q", got.Body.Sample)
 	}
 	for _, name := range []string{"filters.status", "page", "token"} {
 		found := false
@@ -210,6 +290,45 @@ func TestBatchedGraphQLDoesNotStoreQueryText(t *testing.T) {
 			t.Fatalf("GraphQL variables = %v, missing %q", got.Body.GraphQL.Variables, name)
 		}
 	}
+}
+
+func TestGraphQLClassificationRequiresParsedDocument(t *testing.T) {
+	t.Run("ordinary URL query parameter", func(t *testing.T) {
+		got := ParseRequestData("https://example.com/api?query=foo", nil, nil, false)
+		if got.Body.GraphQL != nil {
+			t.Fatalf("GraphQL = %+v, want nil", got.Body.GraphQL)
+		}
+		if valueFor(got.QueryParams, "query") != "foo" {
+			t.Fatalf("query params = %+v, want ordinary query evidence", got.QueryParams)
+		}
+	})
+
+	t.Run("ordinary JSON query field", func(t *testing.T) {
+		got := ParseRequestData(
+			"https://example.com/search",
+			map[string]string{"Content-Type": "application/json"},
+			[]byte(`{"query":"foo","page":2}`),
+			true,
+		)
+		if got.Body.GraphQL != nil {
+			t.Fatalf("GraphQL = %+v, want nil", got.Body.GraphQL)
+		}
+		if valueFor(got.Body.Params, "query") != "foo" || valueFor(got.Body.Params, "page") != "2" {
+			t.Fatalf("body params = %+v, want ordinary JSON evidence", got.Body.Params)
+		}
+	})
+
+	t.Run("parsed GraphQL document", func(t *testing.T) {
+		got := ParseRequestData(
+			"https://example.com/graphql",
+			map[string]string{"Content-Type": "application/json"},
+			[]byte(`{"operationName":"UserByID","query":"query UserByID($id: ID!) { user(id: $id) { id } }","variables":{"id":"42"}}`),
+			true,
+		)
+		if got.Body.GraphQL == nil || got.Body.GraphQL.OperationName != "UserByID" {
+			t.Fatalf("GraphQL = %+v, want parsed UserByID metadata", got.Body.GraphQL)
+		}
+	})
 }
 
 func parameterNames(params []Parameter) []string {
