@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -42,9 +43,9 @@ func CanonicalOrigin(rawURL string) (string, error) {
 		return "", fmt.Errorf("URL is missing a hostname")
 	}
 	isIPv6 := strings.Contains(host, ":")
-	if ip := net.ParseIP(host); ip != nil {
-		host = strings.ToLower(ip.String())
-		isIPv6 = strings.Contains(host, ":")
+	if canonicalHost, ipv6, ok := canonicalIPAddress(host); ok {
+		host = canonicalHost
+		isIPv6 = ipv6
 	} else {
 		if isIPv6 {
 			return "", fmt.Errorf("invalid IPv6 hostname %q", host)
@@ -82,6 +83,14 @@ func CanonicalOrigin(rawURL string) (string, error) {
 		authority = net.JoinHostPort(host, port)
 	}
 	return scheme + "://" + authority, nil
+}
+
+func canonicalIPAddress(host string) (canonical string, isIPv6 bool, ok bool) {
+	ip, err := netip.ParseAddr(host)
+	if err != nil || ip.Zone() != "" {
+		return "", false, false
+	}
+	return strings.ToLower(ip.String()), ip.Is6(), true
 }
 
 // OriginDirectoryNames precomputes deterministic output directory names for

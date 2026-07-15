@@ -361,6 +361,33 @@ func TestDefaultPortAuthorityUsesCanonicalOrigin(t *testing.T) {
 	}
 }
 
+func TestMappedIPv6AuthorityDoesNotCollapseToIPv4Origin(t *testing.T) {
+	ipv4Static := StaticEndpoint{RawURL: "https://192.0.2.1/api/users", Method: "GET"}
+	mappedRuntime := RuntimeRequest{
+		URL: "https://[::ffff:192.0.2.1]/api/users", Method: "GET", ResourceType: "Fetch",
+	}
+	ipv4Index := newRuntimeAssociationIndex([]StaticEndpoint{ipv4Static}, []RuntimeRequest{mappedRuntime})
+	if candidates := ipv4Index.candidates(ipv4Static); len(candidates) != 0 {
+		t.Fatalf("IPv4 candidates = %v, want mapped IPv6 authority isolated", candidates)
+	}
+	if report := BuildReport([]StaticEndpoint{ipv4Static}, []RuntimeRequest{mappedRuntime}); len(report.Associations) != 0 {
+		t.Fatalf("IPv4/mapped-IPv6 associations = %+v, want none", report.Associations)
+	}
+
+	mappedStatic := StaticEndpoint{RawURL: "https://[::ffff:192.0.2.1]/api/users", Method: "GET"}
+	equivalentRuntime := RuntimeRequest{
+		URL: "https://[::ffff:c000:201]/api/users", Method: "GET", ResourceType: "Fetch",
+	}
+	mappedIndex := newRuntimeAssociationIndex([]StaticEndpoint{mappedStatic}, []RuntimeRequest{equivalentRuntime})
+	if candidates := mappedIndex.candidates(mappedStatic); len(candidates) != 1 || candidates[0] != 0 {
+		t.Fatalf("mapped IPv6 candidates = %v, want equivalent runtime 0", candidates)
+	}
+	report := BuildReport([]StaticEndpoint{mappedStatic}, []RuntimeRequest{equivalentRuntime})
+	if len(report.Associations) != 1 || report.Associations[0].RuntimeOrigin != "https://[::ffff:192.0.2.1]" {
+		t.Fatalf("mapped IPv6 associations = %+v, want canonical mapped origin", report.Associations)
+	}
+}
+
 func TestProtocolRelativeDefaultPortAuthorityUsesCanonicalOrigin(t *testing.T) {
 	entry := "https://entry.example/app/"
 	static := StaticEndpoint{

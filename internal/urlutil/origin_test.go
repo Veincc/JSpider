@@ -20,6 +20,8 @@ func TestCanonicalOrigin(t *testing.T) {
 		{name: "IDNA hostname", raw: "https://BÜCHER.example/path", want: "https://xn--bcher-kva.example"},
 		{name: "IPv6 default port", raw: "HTTP://[2001:DB8::1]:80/path", want: "http://[2001:db8::1]"},
 		{name: "IPv6 non-default port", raw: "https://[2001:DB8::1]:8443/path", want: "https://[2001:db8::1]:8443"},
+		{name: "IPv4-mapped IPv6 dotted form", raw: "http://[::ffff:192.0.2.1]/path", want: "http://[::ffff:192.0.2.1]"},
+		{name: "IPv4-mapped IPv6 hexadecimal form", raw: "http://[::ffff:c000:201]/path", want: "http://[::ffff:192.0.2.1]"},
 	}
 
 	for _, tt := range tests {
@@ -42,6 +44,7 @@ func TestCanonicalOriginRejectsInvalidAuthorities(t *testing.T) {
 		"https://example.com:",
 		"https://example.com:0",
 		"https://example.com:65536",
+		"https://[fe80::1%25eth0]/",
 		"https://\u200d.example",
 	} {
 		t.Run(raw, func(t *testing.T) {

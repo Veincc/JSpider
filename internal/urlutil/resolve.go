@@ -128,8 +128,8 @@ func normalizeAllowedDomain(domain string) string {
 	if len(d) >= 2 && d[0] == '[' && d[len(d)-1] == ']' {
 		d = d[1 : len(d)-1]
 	}
-	if ip := net.ParseIP(d); ip != nil {
-		return strings.ToLower(ip.String())
+	if canonicalIP, _, ok := canonicalIPAddress(d); ok {
+		return canonicalIP
 	}
 	d, err := originIDNA.ToASCII(d)
 	if err != nil {

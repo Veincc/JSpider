@@ -92,6 +92,26 @@ func TestHeadlessExternalAndClickablePolicyUsesCanonicalOrigin(t *testing.T) {
 	}
 }
 
+func TestHeadlessMappedIPv6DoesNotCollapseToIPv4Origin(t *testing.T) {
+	ipv4Cfg := &Config{EntryURL: "https://192.0.2.1/start", SameOrigin: true}
+	mappedURL := "https://[::ffff:192.0.2.1]/app.js"
+	if isAllowedByPolicy(mappedURL, ipv4Cfg) {
+		t.Fatal("IPv4-mapped IPv6 JavaScript was allowed for IPv4 entry origin")
+	}
+	if !shouldSkipClickableHref(mappedURL, ipv4Cfg.EntryURL) {
+		t.Fatal("IPv4-mapped IPv6 link was treated as an IPv4-origin link")
+	}
+
+	mappedCfg := &Config{EntryURL: "https://[::ffff:192.0.2.1]/start", SameOrigin: true}
+	equivalentURL := "https://[::ffff:c000:201]/app.js"
+	if !isAllowedByPolicy(equivalentURL, mappedCfg) {
+		t.Fatal("equivalent IPv4-mapped IPv6 JavaScript was classified as external")
+	}
+	if shouldSkipClickableHref(equivalentURL, mappedCfg.EntryURL) {
+		t.Fatal("equivalent IPv4-mapped IPv6 link was skipped")
+	}
+}
+
 func TestInitializeBrowserCancelsLaunchAtAbsoluteCutoff(t *testing.T) {
 	browserCtx, browserCancel := context.WithCancel(context.Background())
 	defer browserCancel()

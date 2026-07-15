@@ -43,6 +43,12 @@ func TestShouldSendCookiesUsesCanonicalOrigin(t *testing.T) {
 	if shouldSendCookies("https://example.com:444/app.js", "https://example.com/") {
 		t.Fatal("non-default port received same-origin cookies")
 	}
+	if shouldSendCookies("https://[::ffff:192.0.2.1]/app.js", "https://192.0.2.1/") {
+		t.Fatal("IPv4-mapped IPv6 request received IPv4-origin cookies")
+	}
+	if !shouldSendCookies("https://[::ffff:c000:201]/app.js", "https://[::ffff:192.0.2.1]/") {
+		t.Fatal("equivalent IPv4-mapped IPv6 request lost cookies")
+	}
 }
 
 func TestRedirectPolicyUsesCanonicalOrigin(t *testing.T) {
@@ -73,6 +79,32 @@ func TestRedirectPolicyUsesCanonicalOrigin(t *testing.T) {
 	}
 	if err := checker(nonDefaultTarget, nil); err == nil {
 		t.Fatal("non-default-port redirect accepted as same-origin")
+	}
+
+	mappedTarget, err := http.NewRequestWithContext(
+		context.WithValue(context.Background(), redirectPolicyKey{}, "https://192.0.2.1/start"),
+		http.MethodGet,
+		"https://[::ffff:192.0.2.1]/next",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(mappedTarget, nil); err == nil {
+		t.Fatal("IPv4-mapped IPv6 redirect accepted for IPv4 entry origin")
+	}
+
+	equivalentMappedTarget, err := http.NewRequestWithContext(
+		context.WithValue(context.Background(), redirectPolicyKey{}, "https://[::ffff:192.0.2.1]/start"),
+		http.MethodGet,
+		"https://[::ffff:c000:201]/next",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(equivalentMappedTarget, nil); err != nil {
+		t.Fatalf("equivalent IPv4-mapped IPv6 redirect rejected: %v", err)
 	}
 }
 
