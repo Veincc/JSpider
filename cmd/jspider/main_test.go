@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,11 +20,114 @@ import (
 	"github.com/Veincc/JSpider/internal/config"
 	"github.com/Veincc/JSpider/internal/fetcher"
 	"github.com/Veincc/JSpider/internal/headless"
+	"github.com/Veincc/JSpider/internal/html"
 	"github.com/Veincc/JSpider/internal/logging"
 	"github.com/Veincc/JSpider/internal/preprocess"
 	"github.com/Veincc/JSpider/internal/store"
 	"github.com/Veincc/JSpider/internal/urlutil"
 )
+
+func TestAnalyzeEntryLogsOneSummaryPerCompletedBatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<script src="/app.js"></script><script src="/data"></script><script src="/missing.js"></script>`)
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = io.WriteString(w, `import("./child.js");`)
+		case "/child.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = io.WriteString(w, `export const child = true;`)
+		case "/data":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	log := logging.NewWithWriters(false, &stdout, &stderr)
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor, err := preprocess.New(filepath.Join(outDir, "site"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer processor.Close()
+	progress := newEntryProgress(1, 1, time.Now())
+	queued, processed := make(map[string]bool), make(map[string]bool)
+	totalAnalyzed, totalAttempts := 0, 0
+
+	got, err := analyzeEntryContext(context.Background(), cfg, store.New(outDir), f, analyzer.NewAnalyzer(log), html.NewExtractor(), log, processor, nil,
+		server.URL+"/", "site", queued, processed, &totalAnalyzed, &totalAttempts, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Fatalf("analyzed = %d, want 2", got)
+	}
+	output := stdout.String()
+	if strings.Count(output, " Batch ") != 2 {
+		t.Fatalf("batch lines = %q, want exactly two", output)
+	}
+	for _, want := range []string{
+		"[1/1] Discovery complete: static=3 headless=0 unique=3 elapsed=",
+		"[1/1] Batch 1: depth=0 attempted=3 js=1 non-js=1 failed=1 analyzed=1 discovered=1 next=1 total=1 elapsed=",
+		"[1/1] Batch 2: depth=1 attempted=1 js=1 non-js=0 failed=0 analyzed=1 discovered=0 next=0 total=2 elapsed=",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(stderr.String(), server.URL+"/data") {
+		t.Fatalf("non-JavaScript response logged as normal error: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), server.URL+"/missing.js") {
+		t.Fatalf("real fetch failure missing from stderr: %s", stderr.String())
+	}
+}
+
+func TestAnalyzeResultLogsNonJavaScriptURLOnlyInVerboseMode(t *testing.T) {
+	const rawURL = "https://example.com/data"
+	for _, verbose := range []bool{false, true} {
+		t.Run(fmt.Sprintf("verbose=%t", verbose), func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			log := logging.NewWithWriters(verbose, &stdout, &stderr)
+			cfg := testConfig("https://example.com/", t.TempDir())
+			queued := map[string]bool{rawURL: true}
+			processed := make(map[string]bool)
+			var queue []fetchReq
+			analyzed, total := 0, 0
+			res := fetchRes{
+				req: fetchReq{url: rawURL, from: "https://example.com/"},
+				result: &fetcher.Result{
+					ContentType: "application/json",
+					Err:         &fetcher.ErrNotJavaScript{ContentType: "application/json"},
+				},
+			}
+
+			err := analyzeResultWithPreprocess(context.Background(), cfg, store.New(cfg.OutDir), analyzer.NewAnalyzer(log), log,
+				nil, nil, res, "https://example.com/", "example_com", queued, processed, &queue, &analyzed, &total)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(stdout.String(), rawURL); got != verbose {
+				t.Fatalf("stdout URL visibility = %t, want %t: %s", got, verbose, stdout.String())
+			}
+			if strings.Contains(stderr.String(), rawURL) {
+				t.Fatalf("non-JavaScript URL written as error: %s", stderr.String())
+			}
+		})
+	}
+}
 
 func runTest(cfg *config.Config) error {
 	_, err := run(context.Background(), cfg)

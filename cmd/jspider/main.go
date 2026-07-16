@@ -317,7 +317,8 @@ func run(ctx context.Context, cfg *config.Config) (RunResult, error) {
 			site.apiSession.AddEntryURL(entry.url)
 		}
 		attemptsBefore := site.attempts
-		log.Info("[%d/%d] Analyzing: %s", i+1, len(planned), entry.url)
+		progress := newEntryProgress(i+1, len(planned), time.Now())
+		log.Info("%s Analyzing: %s", progress.prefix(), entry.url)
 		entryState := site.state
 		if cfg.APIDiscovery {
 			entryState = &crawlState{queued: make(map[string]bool), processed: make(map[string]bool)}
@@ -325,6 +326,7 @@ func run(ctx context.Context, cfg *config.Config) (RunResult, error) {
 		analyzed, entryErr := analyzeEntryContext(
 			ctx, cfg, site.store, site.fetcher, site.analyzer, site.html, log, site.processor, site.apiSession,
 			entry.url, site.directory, entryState.queued, entryState.processed, &site.analyzed, &site.attempts,
+			progress,
 		)
 		apiStats := apidiscovery.SessionStats{}
 		if site.apiSession != nil {
@@ -353,7 +355,9 @@ func run(ctx context.Context, cfg *config.Config) (RunResult, error) {
 		} else {
 			result.Success = append(result.Success, entryResult)
 			stats.Success++
-			log.Info("[%d/%d] Done: %s (analyzed %d JS)", i+1, len(planned), entry.url, analyzed)
+			log.Info("%s Done: %s attempts=%d analyzed=%d failed=%d elapsed=%s",
+				progress.prefix(), entry.url, site.attempts-attemptsBefore, analyzed, progress.failed,
+				formatElapsed(time.Since(progress.started)))
 		}
 		result.Sites[entry.origin] = stats
 	}
@@ -421,12 +425,12 @@ func newSiteRuntime(cfg *config.Config, log *logging.Logger, origin, directory s
 // It always runs static HTML extraction, and additionally runs headless browser
 // discovery if cfg.Headless is enabled, merging and deduplicating the results.
 func analyzeEntry(cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession apiDiscoverySession, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
-	return analyzeEntryContext(context.Background(), cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, site, queued, processed, totalAnalyzed, totalAttempts)
+	return analyzeEntryContext(context.Background(), cfg, s, f, a, htmlEx, log, prep, apiSession, entryURL, site, queued, processed, totalAnalyzed, totalAttempts, newEntryProgress(1, 1, time.Now()))
 }
 
-func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession apiDiscoverySession, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int) (int, error) {
+func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store, f *fetcher.Fetcher, a *analyzer.Analyzer, htmlEx *html.Extractor, log *logging.Logger, prep javaScriptProcessor, apiSession apiDiscoverySession, entryURL, site string, queued, processed map[string]bool, totalAnalyzed, totalAttempts *int, progress *entryProgress) (int, error) {
 	// 1. Static HTML extraction (always)
-	log.Info("Downloading entry HTML: %s", entryURL)
+	log.Info("%s Discovery: downloading entry HTML: %s", progress.prefix(), entryURL)
 	htmlResult := f.FetchForEntryContext(ctx, entryURL, entryURL)
 	if htmlResult.Err != nil {
 		return 0, fmt.Errorf("download entry HTML: %w", htmlResult.Err)
@@ -436,20 +440,21 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 	}
 
 	htmlContent := string(htmlResult.Body)
-	log.Info("Entry HTML size: %d bytes", len(htmlContent))
+	log.Verbose("Entry HTML size: %d bytes", len(htmlContent))
 
 	htmlBaseURL := htmlResult.FinalURL
 	if htmlBaseURL == "" {
 		htmlBaseURL = entryURL
 	}
 	staticAssets := htmlEx.ExtractEntryJS(htmlContent, htmlBaseURL)
-	log.Info("Static extraction found %d JS assets", len(staticAssets))
+	log.Verbose("Static extraction found %d JS assets", len(staticAssets))
 
 	entryAssets := staticAssets
+	headlessCount := 0
 
 	// 2. Headless discovery (optional)
 	if cfg.Headless {
-		log.Info("Running headless discovery: %s", entryURL)
+		log.Info("%s Discovery: running headless browser: %s", progress.prefix(), entryURL)
 		discovery, err := discoverBrowser(ctx, buildHeadlessConfig(cfg, entryURL), log)
 		var hlAssets []analyzer.JSAsset
 		if err != nil {
@@ -462,7 +467,8 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 			if apiSession != nil {
 				apiSession.AddRuntimeForEntry(entryURL, discovery.Requests)
 			}
-			log.Info("Headless discovery found %d JS assets", len(hlAssets))
+			headlessCount = len(hlAssets)
+			log.Verbose("Headless discovery found %d JS assets", len(hlAssets))
 		}
 
 		// Merge: deduplicate by URL, prefer static source info
@@ -484,7 +490,7 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 		for _, v := range merged {
 			entryAssets = append(entryAssets, *v)
 		}
-		log.Info("Merged: %d unique JS assets", len(entryAssets))
+		log.Verbose("Merged: %d unique JS assets", len(entryAssets))
 	}
 	sort.SliceStable(entryAssets, func(i, j int) bool {
 		if entryAssets[i].URL != entryAssets[j].URL {
@@ -495,6 +501,8 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 		}
 		return entryAssets[i].Type < entryAssets[j].Type
 	})
+	log.Info("%s Discovery complete: static=%d headless=%d unique=%d elapsed=%s",
+		progress.prefix(), len(staticAssets), headlessCount, len(entryAssets), formatElapsed(time.Since(progress.started)))
 
 	// Add entry JS assets to store
 	for i := range entryAssets {
@@ -532,6 +540,10 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 				batch = batch[:remaining]
 			}
 		}
+		progress.batchNumber++
+		batchStats := newCrawlBatchStats(progress.batchNumber, batch)
+		batchStarted := time.Now()
+		analyzedBefore := analyzed
 		queue = nil
 		// Reserve the complete batch before any worker can schedule a request.
 		// Failed requests consume the same budget as successful requests.
@@ -543,6 +555,8 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 		completedAttempts := 0
 		for res := range results {
 			completedAttempts++
+			batchStats.observeFetch(res.result)
+			nextBefore := len(queue)
 			if err := analyzeResultWithPreprocess(ctx, cfg, s, a, log, prep, apiSession, res, entryURL, site, queued, processed, &queue, &analyzed, totalAnalyzed); err != nil {
 				// Cancel before acknowledging the failed ordinal. Acknowledgement
 				// normally advances the sliding launch window.
@@ -555,6 +569,7 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 				*totalAttempts -= len(batch) - completedAttempts
 				return analyzed, err
 			}
+			batchStats.discovered += len(queue) - nextBefore
 			res.acknowledgeConsumption()
 		}
 		cancelBatch()
@@ -562,6 +577,11 @@ func analyzeEntryContext(ctx context.Context, cfg *config.Config, s *store.Store
 		if err := ctx.Err(); err != nil {
 			return analyzed, err
 		}
+		batchStats.analyzed = analyzed - analyzedBefore
+		batchStats.next = len(queue)
+		batchStats.total = analyzed
+		progress.failed += batchStats.failed
+		batchStats.log(log, progress, time.Since(batchStarted))
 	}
 
 	// Mark undownloaded entry JS as candidate
@@ -718,7 +738,11 @@ func analyzeResultWithPreprocess(ctx context.Context, cfg *config.Config, s *sto
 	processed[item.url] = true
 
 	if res.result.Err != nil {
-		log.LogError("Download failed", "URL=%s error=%v", item.url, res.result.Err)
+		if fetcher.IsNotJavaScript(res.result.Err) {
+			log.Verbose("Skipping non-JavaScript response: URL=%s content-type=%s", item.url, res.result.ContentType)
+		} else {
+			log.LogError("Download failed", "URL=%s error=%v", item.url, res.result.Err)
+		}
 		s.AddJS(&analyzer.JSAsset{
 			URL: item.url, FromURL: item.from,
 			Type: analyzer.TypeUnknownJS, Source: analyzer.SourceRegexCandidate,
