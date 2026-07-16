@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -33,6 +34,22 @@ type ErrDecompressTooLarge struct {
 
 func (e *ErrDecompressTooLarge) Error() string {
 	return fmt.Sprintf("Decompressed content too large: %d bytes exceeds limit of %d bytes", e.Size, e.Limit)
+}
+
+type ErrNotJavaScript struct {
+	ContentType string
+}
+
+func (e *ErrNotJavaScript) Error() string {
+	if strings.TrimSpace(e.ContentType) == "" {
+		return "Not a JS resource: content-type missing"
+	}
+	return fmt.Sprintf("Not a JS resource: content-type=%s", e.ContentType)
+}
+
+func IsNotJavaScript(err error) bool {
+	var rejected *ErrNotJavaScript
+	return errors.As(err, &rejected)
 }
 
 // Result represents a download result (immutable, safe to share)
@@ -350,7 +367,7 @@ func validateJSResult(result *Result, rawURL string) *Result {
 	// server that says the response is HTML, JSON, an image, or another type.
 	if strings.TrimSpace(clone.ContentType) != "" {
 		if !clone.IsJS {
-			clone.Err = fmt.Errorf("Not a JS resource: content-type=%s", clone.ContentType)
+			clone.Err = &ErrNotJavaScript{ContentType: clone.ContentType}
 		}
 		return clone
 	}
@@ -360,7 +377,7 @@ func validateJSResult(result *Result, rawURL string) *Result {
 	if looksLikeJS(clone.Body) {
 		clone.IsJS = true
 	} else {
-		clone.Err = fmt.Errorf("Not a JS resource: content-type missing")
+		clone.Err = &ErrNotJavaScript{}
 	}
 
 	return clone

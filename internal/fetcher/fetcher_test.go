@@ -535,6 +535,43 @@ func TestFetchJS_RejectsJSONWhoseParameterMentionsJavaScript(t *testing.T) {
 	}
 }
 
+func TestFetchJSNonJavaScriptErrorsAreClassifiable(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{name: "explicit JSON", contentType: "application/json", body: `{"ok":true}`},
+		{name: "missing content type", body: `{"ok":true}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tt.contentType == "" {
+					w.Header()["Content-Type"] = nil
+				} else {
+					w.Header().Set("Content-Type", tt.contentType)
+				}
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer ts.Close()
+
+			result := newTestFetcher(t, ts).FetchJS(ts.URL + "/candidate")
+			var rejected *ErrNotJavaScript
+			if !errors.As(result.Err, &rejected) || !IsNotJavaScript(result.Err) {
+				t.Fatalf("FetchJS() error = %T %v, want ErrNotJavaScript", result.Err, result.Err)
+			}
+			if rejected.ContentType != tt.contentType {
+				t.Fatalf("ContentType = %q, want %q", rejected.ContentType, tt.contentType)
+			}
+		})
+	}
+
+	if IsNotJavaScript(context.DeadlineExceeded) {
+		t.Fatal("deadline error classified as non-JavaScript")
+	}
+}
+
 func TestFetchJSWithoutContentTypeAcceptsStaticESM(t *testing.T) {
 	tests := []struct {
 		name string
