@@ -272,31 +272,78 @@ func TestFetch_DoesNotCacheCompletedBodies(t *testing.T) {
 }
 
 func TestFetch_Singleflight(t *testing.T) {
+	const callers = 10
+
 	var httpCount int32
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseRequest) })
+	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&httpCount, 1)
-		w.Write([]byte("data"))
+		startedOnce.Do(func() { close(requestStarted) })
+		<-releaseRequest
+		_, _ = w.Write([]byte("data"))
 	}))
-	defer ts.Close()
+	t.Cleanup(func() {
+		release()
+		ts.Close()
+	})
 
 	f := newTestFetcher(t, ts)
+	rawURL := ts.URL + "/same"
 
-	// Launch 10 concurrent fetches for the same URL
+	start := make(chan struct{})
+	var ready sync.WaitGroup
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	ready.Add(callers)
+	for i := 0; i < callers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := f.Fetch(ts.URL + "/same")
+			ready.Done()
+			<-start
+			r := f.Fetch(rawURL)
 			if r == nil {
 				t.Error("Got nil result")
 			}
 		}()
 	}
+	ready.Wait()
+	close(start)
+
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("HTTP request did not start")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f.mu.Lock()
+		waiters := 0
+		if inf := f.pending[rawURL]; inf != nil {
+			waiters = inf.waiters
+		}
+		f.mu.Unlock()
+		if waiters == callers {
+			break
+		}
+		if time.Now().After(deadline) {
+			release()
+			wg.Wait()
+			t.Fatalf("in-flight waiters = %d, want %d", waiters, callers)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	release()
 	wg.Wait()
 
-	// Only 1 HTTP request should have been made (singleflight)
 	if c := atomic.LoadInt32(&httpCount); c != 1 {
 		t.Errorf("Expected 1 HTTP request, got %d", c)
 	}
