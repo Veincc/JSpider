@@ -32,6 +32,7 @@ const NodeRuntimeError = "JSpider requires Node.js runtime"
 const NodeVersionError = "JSpider requires Node.js 18 or newer"
 
 const workerStartupTimeout = 5 * time.Second
+const nodeVersionWaitDelay = 100 * time.Millisecond
 
 var sourceMapDirective = regexp.MustCompile(`//[#@]\s*sourceMappingURL\s*=\s*(\S+)|(?s:/\*[#@]\s*sourceMappingURL\s*=\s*(.*?)\s*\*/)`)
 
@@ -162,7 +163,9 @@ func checkNodeRuntime(timeout time.Duration) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, nodePath, "--version").Output()
+	cmd := exec.CommandContext(ctx, nodePath, "--version")
+	cmd.WaitDelay = nodeVersionWaitDelay
+	output, err := cmd.Output()
 	if err != nil {
 		return errors.New(NodeRuntimeError)
 	}

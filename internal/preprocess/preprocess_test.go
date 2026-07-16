@@ -21,6 +21,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("JSPIDER_FAKE_NODE_PIPE_HOLDER") == "1" {
+		time.Sleep(3 * time.Second)
+		os.Exit(0)
+	}
 	if mode := os.Getenv("JSPIDER_FAKE_NODE_MODE"); mode != "" {
 		runFakeNode(mode)
 		os.Exit(0)
@@ -35,6 +39,14 @@ func TestMain(m *testing.M) {
 func runFakeNode(mode string) {
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		if mode == "version_hang" {
+			child := exec.Command(os.Args[0])
+			child.Env = append(os.Environ(), "JSPIDER_FAKE_NODE_PIPE_HOLDER=1")
+			child.Stdout = os.Stdout
+			if err := child.Start(); err != nil {
+				_ = os.WriteFile(os.Getenv("JSPIDER_FAKE_NODE_STATE")+".child-error", []byte(err.Error()), 0644)
+				return
+			}
+			_ = os.WriteFile(os.Getenv("JSPIDER_FAKE_NODE_STATE")+".child-started", []byte(strconv.Itoa(child.Process.Pid)), 0644)
 			time.Sleep(time.Hour)
 		}
 		_, _ = os.Stdout.WriteString("v20.1.0\n")
@@ -1305,13 +1317,17 @@ func TestMissingNodeProducesClearGlobalError(t *testing.T) {
 }
 
 func TestNodeVersionCheckTimesOut(t *testing.T) {
-	installFakeNode(t, "version_hang")
+	stateFile, _ := installFakeNode(t, "version_hang")
 	started := time.Now()
-	err := checkNodeRuntime(50 * time.Millisecond)
+	err := checkNodeRuntime(time.Second)
+	if _, statErr := os.Stat(stateFile + ".child-started"); statErr != nil {
+		detail, _ := os.ReadFile(stateFile + ".child-error")
+		t.Fatalf("fake node pipe holder did not start: %v (%s)", statErr, detail)
+	}
 	if err == nil || err.Error() != NodeRuntimeError {
 		t.Fatalf("checkNodeRuntime() error = %v", err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("version timeout took %s", elapsed)
 	}
 }
@@ -1550,7 +1566,7 @@ func installFakeNode(t *testing.T, mode string) (stateFile, requestFile string) 
 		nodeName += ".exe"
 	}
 	node := filepath.Join(dir, nodeName)
-	if runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" || mode == "version_hang" {
 		binary, readErr := os.ReadFile(executable)
 		if readErr != nil {
 			t.Fatal(readErr)
