@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 )
 
 type Logger struct {
+	mu      sync.Mutex
 	verbose bool
 	stdout  io.Writer
 	stderr  io.Writer
@@ -29,29 +31,59 @@ func NewWithWriters(verbose bool, stdout, stderr io.Writer) *Logger {
 
 func (l *Logger) Info(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.stdout, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	stdout := l.stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	fmt.Fprintf(stdout, "[%s] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
 func (l *Logger) Verbose(format string, args ...interface{}) {
 	if l.verbose {
 		msg := fmt.Sprintf(format, args...)
-		fmt.Fprintf(l.stdout, "[%s] [V] %s\n", time.Now().Format("15:04:05"), msg)
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		stdout := l.stdout
+		if stdout == nil {
+			stdout = os.Stdout
+		}
+		fmt.Fprintf(stdout, "[%s] [V] %s\n", time.Now().Format("15:04:05"), msg)
 	}
 }
 
 func (l *Logger) Warn(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.stderr, "[%s] [WARN] %s\n", time.Now().Format("15:04:05"), msg)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	stderr := l.stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	fmt.Fprintf(stderr, "[%s] [WARN] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
 func (l *Logger) Error(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.stderr, "[%s] [ERROR] %s\n", time.Now().Format("15:04:05"), msg)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	stderr := l.stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	fmt.Fprintf(stderr, "[%s] [ERROR] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
 func (l *Logger) LogError(context, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	fmt.Fprintf(l.stderr, "[%s] [ERR] %s: %s\n", time.Now().Format("15:04:05"), context, msg)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	stderr := l.stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	fmt.Fprintf(stderr, "[%s] [ERR] %s: %s\n", time.Now().Format("15:04:05"), context, msg)
 }
 
 func (l *Logger) Close() {}

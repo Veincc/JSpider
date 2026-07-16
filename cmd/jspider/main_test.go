@@ -94,6 +94,189 @@ func TestAnalyzeEntryLogsOneSummaryPerCompletedBatch(t *testing.T) {
 	}
 }
 
+func TestAnalyzeEntryBatchCountsOnlyAdmittedDiscoveries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<script src="/app.js"></script>`)
+		case "/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = io.WriteString(w, `import("./too-deep.js"); import("https://other.invalid/off-origin.js");`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	cfg.MaxDepth = 0
+	cfg.Verbose = true
+	var stdout bytes.Buffer
+	log := logging.NewWithWriters(true, &stdout, nil)
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor, err := preprocess.New(filepath.Join(outDir, "site"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer processor.Close()
+	progress := newEntryProgress(1, 1, time.Now())
+	queued, processed := make(map[string]bool), make(map[string]bool)
+	totalAnalyzed, totalAttempts := 0, 0
+
+	got, err := analyzeEntryContext(context.Background(), cfg, store.New(outDir), f, analyzer.NewAnalyzer(log), html.NewExtractor(), log, processor, nil,
+		server.URL+"/", "site", queued, processed, &totalAnalyzed, &totalAttempts, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 || totalAttempts != 1 {
+		t.Fatalf("crawl totals = analyzed %d attempted %d, want 1/1", got, totalAttempts)
+	}
+	output := stdout.String()
+	for _, want := range []string{
+		"Skipping (exceeds depth limit 0): " + server.URL + "/too-deep.js",
+		"Skipping (not same-origin): https://other.invalid/off-origin.js",
+		"Batch 1: depth=0 attempted=1 js=1 non-js=0 failed=0 analyzed=1 discovered=0 next=0 total=1",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestAnalyzeEntryMaxJSTruncatedBatchLogsActualAttemptedCount(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/":     `<script src="/a.js"></script><script src="/b.js"></script><script src="/c.js"></script>`,
+		"/a.js": `const a = true;`,
+		"/b.js": `const b = true;`,
+		"/c.js": `const c = true;`,
+	})
+	defer server.Close()
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	cfg.MaxJS = 2
+	var stdout bytes.Buffer
+	log := logging.NewWithWriters(false, &stdout, nil)
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor, err := preprocess.New(filepath.Join(outDir, "site"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer processor.Close()
+	progress := newEntryProgress(1, 1, time.Now())
+	queued, processed := make(map[string]bool), make(map[string]bool)
+	totalAnalyzed, totalAttempts := 0, 0
+
+	got, err := analyzeEntryContext(context.Background(), cfg, store.New(outDir), f, analyzer.NewAnalyzer(log), html.NewExtractor(), log, processor, nil,
+		server.URL+"/", "site", queued, processed, &totalAnalyzed, &totalAttempts, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 || totalAttempts != 2 {
+		t.Fatalf("crawl totals = analyzed %d attempted %d, want 2/2", got, totalAttempts)
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "Batch 1: depth=0 attempted=2 js=2") || strings.Count(output, " Batch ") != 1 {
+		t.Fatalf("partial batch output = %q, want one batch with actual attempted=2", output)
+	}
+}
+
+func TestAnalyzeEntryFatalPersistenceDoesNotLogCompletedBatch(t *testing.T) {
+	server := newSiteServer(t, map[string]string{
+		"/":       `<script src="/app.js"></script>`,
+		"/app.js": `const app = true;`,
+	})
+	defer server.Close()
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	var stdout bytes.Buffer
+	log := logging.NewWithWriters(false, &stdout, nil)
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processor := &fixedResultProcessor{result: preprocess.FileResult{
+		Failed: true, Error: "persistence failed", FallbackWriteFailed: true,
+	}}
+	progress := newEntryProgress(1, 1, time.Now())
+	queued, processed := make(map[string]bool), make(map[string]bool)
+	totalAnalyzed, totalAttempts := 0, 0
+
+	_, err = analyzeEntryContext(context.Background(), cfg, store.New(outDir), f, analyzer.NewAnalyzer(log), html.NewExtractor(), log, processor, nil,
+		server.URL+"/", "site", queued, processed, &totalAnalyzed, &totalAttempts, progress)
+	var fatal *fatalOutputError
+	if !errors.As(err, &fatal) {
+		t.Fatalf("analyzeEntryContext() error = %v, want fatal persistence error", err)
+	}
+	if strings.Contains(stdout.String(), " Batch ") {
+		t.Fatalf("fatal incomplete batch was logged as completed: %s", stdout.String())
+	}
+}
+
+func TestAnalyzeEntryCancellationDoesNotLogCompletedBatch(t *testing.T) {
+	requestStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = io.WriteString(w, `<script src="/slow.js"></script>`)
+		case "/slow.js":
+			close(requestStarted)
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	outDir := t.TempDir()
+	cfg := testConfig(server.URL+"/", outDir)
+	var stdout bytes.Buffer
+	log := logging.NewWithWriters(false, &stdout, nil)
+	f, err := fetcher.New(cfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress := newEntryProgress(1, 1, time.Now())
+	queued, processed := make(map[string]bool), make(map[string]bool)
+	totalAnalyzed, totalAttempts := 0, 0
+	ctx, cancel := context.WithCancel(context.Background())
+	type outcome struct {
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		_, err := analyzeEntryContext(ctx, cfg, store.New(outDir), f, analyzer.NewAnalyzer(log), html.NewExtractor(), log, nil, nil,
+			server.URL+"/", "site", queued, processed, &totalAnalyzed, &totalAttempts, progress)
+		done <- outcome{err: err}
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("JavaScript request did not start")
+	}
+	cancel()
+
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("analyzeEntryContext() error = %v, want context canceled", got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("analyzeEntryContext did not return after cancellation")
+	}
+	if strings.Contains(stdout.String(), " Batch ") {
+		t.Fatalf("canceled incomplete batch was logged as completed: %s", stdout.String())
+	}
+}
+
 func TestAnalyzeResultLogsNonJavaScriptURLOnlyInVerboseMode(t *testing.T) {
 	const rawURL = "https://example.com/data"
 	for _, verbose := range []bool{false, true} {
