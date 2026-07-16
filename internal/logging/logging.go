@@ -9,11 +9,17 @@ import (
 )
 
 type Logger struct {
-	mu      sync.Mutex
 	verbose bool
-	stdout  io.Writer
-	stderr  io.Writer
+	state   *loggerState
 }
+
+type loggerState struct {
+	mu     sync.Mutex
+	stdout io.Writer
+	stderr io.Writer
+}
+
+var processOutputState loggerState
 
 func New(verbose bool, _ string) *Logger {
 	return NewWithWriters(verbose, os.Stdout, os.Stderr)
@@ -26,14 +32,25 @@ func NewWithWriters(verbose bool, stdout, stderr io.Writer) *Logger {
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	return &Logger{verbose: verbose, stdout: stdout, stderr: stderr}
+	return &Logger{
+		verbose: verbose,
+		state:   &loggerState{stdout: stdout, stderr: stderr},
+	}
+}
+
+func (l *Logger) sharedState() *loggerState {
+	if l.state != nil {
+		return l.state
+	}
+	return &processOutputState
 }
 
 func (l *Logger) Info(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	stdout := l.stdout
+	state := l.sharedState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	stdout := state.stdout
 	if stdout == nil {
 		stdout = os.Stdout
 	}
@@ -43,9 +60,10 @@ func (l *Logger) Info(format string, args ...interface{}) {
 func (l *Logger) Verbose(format string, args ...interface{}) {
 	if l.verbose {
 		msg := fmt.Sprintf(format, args...)
-		l.mu.Lock()
-		defer l.mu.Unlock()
-		stdout := l.stdout
+		state := l.sharedState()
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		stdout := state.stdout
 		if stdout == nil {
 			stdout = os.Stdout
 		}
@@ -55,9 +73,10 @@ func (l *Logger) Verbose(format string, args ...interface{}) {
 
 func (l *Logger) Warn(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	stderr := l.stderr
+	state := l.sharedState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	stderr := state.stderr
 	if stderr == nil {
 		stderr = os.Stderr
 	}
@@ -66,9 +85,10 @@ func (l *Logger) Warn(format string, args ...interface{}) {
 
 func (l *Logger) Error(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	stderr := l.stderr
+	state := l.sharedState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	stderr := state.stderr
 	if stderr == nil {
 		stderr = os.Stderr
 	}
@@ -77,9 +97,10 @@ func (l *Logger) Error(format string, args ...interface{}) {
 
 func (l *Logger) LogError(context, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	stderr := l.stderr
+	state := l.sharedState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	stderr := state.stderr
 	if stderr == nil {
 		stderr = os.Stderr
 	}

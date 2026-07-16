@@ -50,6 +50,32 @@ func TestLoggerSerializesConcurrentVerboseWrites(t *testing.T) {
 	}
 }
 
+func TestCopiedLoggerSerializesSharedWriter(t *testing.T) {
+	var stdout bytes.Buffer
+	original := NewWithWriters(true, &stdout, nil)
+	copied := *original
+	logs := []*Logger{original, &copied}
+
+	const writers = 32
+	const writesPerWriter = 100
+	var wg sync.WaitGroup
+	for writer := 0; writer < writers; writer++ {
+		wg.Add(1)
+		go func(writer int) {
+			defer wg.Done()
+			log := logs[writer%len(logs)]
+			for write := 0; write < writesPerWriter; write++ {
+				log.Verbose("writer=%d write=%d", writer, write)
+			}
+		}(writer)
+	}
+	wg.Wait()
+
+	if got, want := strings.Count(stdout.String(), "\n"), writers*writesPerWriter; got != want {
+		t.Fatalf("complete log lines = %d, want %d", got, want)
+	}
+}
+
 func TestZeroValueLoggerUsesProcessOutput(t *testing.T) {
 	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
