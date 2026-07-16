@@ -1,8 +1,30 @@
 package html
 
 import (
+	"fmt"
+	"strings"
 	"testing"
+
+	"github.com/Veincc/JSpider/internal/analyzer"
 )
+
+func TestExtractEntryJS_FindsTwentyAdjacentScripts(t *testing.T) {
+	var document strings.Builder
+	for i := 0; i < 20; i++ {
+		fmt.Fprintf(&document, `<script src="/assets/%02d.js"></script>`, i)
+	}
+
+	assets := NewExtractor().ExtractEntryJS(document.String(), "https://example.com/index.html")
+	if len(assets) != 20 {
+		t.Fatalf("adjacent script assets = %d, want 20: %+v", len(assets), assets)
+	}
+	for i, asset := range assets {
+		want := fmt.Sprintf("https://example.com/assets/%02d.js", i)
+		if asset.URL != want {
+			t.Fatalf("asset[%d].URL = %q, want %q", i, asset.URL, want)
+		}
+	}
+}
 
 func TestExtractEntryJS(t *testing.T) {
 	ex := NewExtractor()
@@ -102,6 +124,68 @@ func TestExtractBaseHref(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("ExtractBaseHref(%q) = %q, want %q", tt.html, got, tt.want)
 		}
+	}
+}
+
+func TestExtractModuleScriptsUsesDocumentBase(t *testing.T) {
+	extractor := NewExtractor()
+	urls := extractor.ExtractModuleScripts(`
+<base href="/nested/assets/">
+<script type="module" src="main.js"></script>
+`, "https://example.com/pages/index.html")
+
+	if len(urls) != 1 || urls[0] != "https://example.com/nested/assets/main.js" {
+		t.Fatalf("module script URLs = %v, want document-base resolution", urls)
+	}
+}
+
+func TestExtractEntryJSHandlesLinkRelationTokenLists(t *testing.T) {
+	assets := NewExtractor().ExtractEntryJS(
+		`<link rel="preload MODULEPRELOAD" href="/assets/module.js">`,
+		"https://example.com/",
+	)
+	if len(assets) != 1 || assets[0].URL != "https://example.com/assets/module.js" {
+		t.Fatalf("relation-token assets = %+v, want modulepreload URL", assets)
+	}
+	if assets[0].Source != analyzer.SourceModulepreload {
+		t.Fatalf("asset source = %q, want %q", assets[0].Source, analyzer.SourceModulepreload)
+	}
+}
+
+func TestExtractEntryJSFindsInlineModuleImports(t *testing.T) {
+	assets := NewExtractor().ExtractEntryJS(`
+<script type="module">
+import value from "./entry.js";
+export * from "./shared.js";
+</script>
+`, "https://example.com/app/index.html")
+
+	want := map[string]bool{
+		"https://example.com/app/entry.js":  false,
+		"https://example.com/app/shared.js": false,
+	}
+	for _, asset := range assets {
+		if _, ok := want[asset.URL]; ok {
+			want[asset.URL] = true
+		}
+	}
+	for rawURL, found := range want {
+		if !found {
+			t.Errorf("inline module dependency %s not found; assets=%+v", rawURL, assets)
+		}
+	}
+}
+
+func TestParseAllTagsDecodesAttributesAndKeepsScriptRawText(t *testing.T) {
+	tags := parseAllTags(`<script src="/a&amp;b.js">const marker = "&amp;<tag>";</script>`)
+	if len(tags) != 1 {
+		t.Fatalf("tags = %d, want 1", len(tags))
+	}
+	if tags[0].Attrs["src"] != "/a&b.js" {
+		t.Fatalf("decoded src = %q, want %q", tags[0].Attrs["src"], "/a&b.js")
+	}
+	if want := `const marker = "&amp;<tag>";`; tags[0].Body != want {
+		t.Fatalf("script body = %q, want raw text %q", tags[0].Body, want)
 	}
 }
 
@@ -283,6 +367,22 @@ func TestExtractEntryJS_BaseHref(t *testing.T) {
 				t.Errorf("Expected %s, got: %v", tt.expected, assets)
 			}
 		})
+	}
+}
+
+func TestFirstBaseWithEmptyHrefWins(t *testing.T) {
+	ex := NewExtractor()
+	const documentURL = "https://example.com/page/index.html"
+	const content = `<base href=""><base href="/wrong/"><script type="module" src="app.js"></script>`
+	const want = "https://example.com/page/app.js"
+
+	assets := ex.ExtractEntryJS(content, documentURL)
+	if len(assets) != 1 || assets[0].URL != want {
+		t.Fatalf("ExtractEntryJS() = %+v, want only %q", assets, want)
+	}
+	modules := ex.ExtractModuleScripts(content, documentURL)
+	if len(modules) != 1 || modules[0] != want {
+		t.Fatalf("ExtractModuleScripts() = %+v, want only %q", modules, want)
 	}
 }
 

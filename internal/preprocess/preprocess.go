@@ -1,13 +1,12 @@
 package preprocess
 
 import (
+	"context"
 	"crypto/sha256"
 	_ "embed"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -22,6 +21,8 @@ import (
 
 	"github.com/Veincc/JSpider/internal/fileutil"
 	"github.com/Veincc/JSpider/internal/urlutil"
+	parsepkg "github.com/tdewolff/parse/v2"
+	jslexer "github.com/tdewolff/parse/v2/js"
 )
 
 //go:embed audit-prep.cjs
@@ -30,34 +31,43 @@ var workerBundle []byte
 const NodeRuntimeError = "JSpider requires Node.js runtime"
 const NodeVersionError = "JSpider requires Node.js 18 or newer"
 
+const workerStartupTimeout = 5 * time.Second
+const nodeVersionWaitDelay = 100 * time.Millisecond
+
 var sourceMapDirective = regexp.MustCompile(`//[#@]\s*sourceMappingURL\s*=\s*(\S+)|(?s:/\*[#@]\s*sourceMappingURL\s*=\s*(.*?)\s*\*/)`)
 
-type FetchFunc func(entryURL, rawURL string) ([]byte, error)
+var sourceMapWorkSlots = make(chan struct{}, 4)
+
+type FetchFunc func(ctx context.Context, entryURL, rawURL string) ([]byte, error)
 
 type Processor struct {
 	outputDir string
 	tempDir   string
 	fetch     FetchFunc
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	stdout    *json.Decoder
-	stderr    strings.Builder
-	stderrMu  sync.Mutex
+	outputMu  sync.Mutex
+	actor     *workerActor
 
-	mu          sync.Mutex
-	nextID      int
+	processTimeout time.Duration
+
+	stateMu     sync.Mutex
 	closed      bool
-	workerErr   string
 	contentRefs map[string]string
 	pathHashes  map[string]string
 }
 
 type FileResult struct {
-	AnalysisBody []byte
-	Status       string
-	Outputs      []string
-	Failed       bool
-	Error        string
+	Analysis            []AnalysisUnit
+	Status              string
+	Outputs             []string
+	Failed              bool
+	FallbackWriteFailed bool
+	Error               string
+}
+
+type AnalysisUnit struct {
+	SourceName string
+	BaseURL    string
+	Body       []byte
 }
 
 type workerRequest struct {
@@ -72,19 +82,90 @@ type workerResponse struct {
 	Error       string `json:"error,omitempty"`
 	Code        string `json:"code,omitempty"`
 	NodeVersion string `json:"node_version,omitempty"`
+
+	idPresent          bool `json:"-"`
+	okPresent          bool `json:"-"`
+	codePresent        bool `json:"-"`
+	nodeVersionPresent bool `json:"-"`
+}
+
+func (r *workerResponse) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		ID          *int    `json:"id"`
+		OK          *bool   `json:"ok"`
+		Error       *string `json:"error"`
+		Code        *string `json:"code"`
+		NodeVersion *string `json:"node_version"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.ID != nil {
+		r.ID = *wire.ID
+		r.idPresent = true
+	}
+	if wire.OK != nil {
+		r.OK = *wire.OK
+		r.okPresent = true
+	}
+	if wire.Error != nil {
+		r.Error = *wire.Error
+	}
+	if wire.Code != nil {
+		r.Code = *wire.Code
+		r.codePresent = true
+	}
+	if wire.NodeVersion != nil {
+		r.NodeVersion = *wire.NodeVersion
+		r.nodeVersionPresent = true
+	}
+	return nil
 }
 
 type sourceFile struct {
-	Name    string
-	Content string
+	Name       string
+	OutputPath string
+	Content    string
+	HasContent bool
+}
+
+type sourceMapRecovery struct {
+	Files       []sourceFile
+	Complete    bool
+	SourceCount int
+	ContentSize int64
+}
+
+type sourceMapCollection struct {
+	Files    []sourceFile
+	Complete bool
+}
+
+type sourceMapOffset struct {
+	Line   int
+	Column int
+}
+
+type sourceMapResolver struct {
+	p        *Processor
+	entryURL string
+	ctx      context.Context
 }
 
 func CheckNodeRuntime() error {
+	return checkNodeRuntime(workerStartupTimeout)
+}
+
+func checkNodeRuntime(timeout time.Duration) error {
 	nodePath, err := exec.LookPath("node")
 	if err != nil {
 		return errors.New(NodeRuntimeError)
 	}
-	output, err := exec.Command(nodePath, "--version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, nodePath, "--version")
+	cmd.WaitDelay = nodeVersionWaitDelay
+	output, err := cmd.Output()
 	if err != nil {
 		return errors.New(NodeRuntimeError)
 	}
@@ -98,6 +179,20 @@ func CheckNodeRuntime() error {
 }
 
 func New(siteDir string, fetch FetchFunc) (*Processor, error) {
+	return NewWithTimeout(siteDir, fetch, 30*time.Second)
+}
+
+func NewWithTimeout(siteDir string, fetch FetchFunc, processTimeout time.Duration) (*Processor, error) {
+	return newProcessor(siteDir, fetch, processTimeout, workerStartupTimeout)
+}
+
+func newProcessor(siteDir string, fetch FetchFunc, processTimeout, startupTimeout time.Duration) (*Processor, error) {
+	if processTimeout <= 0 {
+		return nil, errors.New("JavaScript processing timeout must be greater than zero")
+	}
+	if startupTimeout <= 0 {
+		return nil, errors.New("audit-prep startup timeout must be greater than zero")
+	}
 	nodePath, err := exec.LookPath("node")
 	if err != nil {
 		return nil, errors.New(NodeRuntimeError)
@@ -121,133 +216,144 @@ func New(siteDir string, fetch FetchFunc) (*Processor, error) {
 		return nil, fmt.Errorf("write audit-prep worker: %w", err)
 	}
 
-	cmd := exec.Command(nodePath, helper)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		_ = os.RemoveAll(tempDir)
-		return nil, fmt.Errorf("open audit-prep stdin: %w", err)
-	}
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = os.RemoveAll(tempDir)
-		return nil, fmt.Errorf("open audit-prep stdout: %w", err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		_ = os.RemoveAll(tempDir)
-		return nil, fmt.Errorf("open audit-prep stderr: %w", err)
-	}
-
 	p := &Processor{
-		outputDir:   outputDir,
-		tempDir:     tempDir,
-		fetch:       fetch,
-		cmd:         cmd,
-		stdin:       stdin,
-		stdout:      json.NewDecoder(stdoutPipe),
-		contentRefs: make(map[string]string),
-		pathHashes:  make(map[string]string),
+		outputDir:      outputDir,
+		tempDir:        tempDir,
+		fetch:          fetch,
+		processTimeout: processTimeout,
+		contentRefs:    make(map[string]string),
+		pathHashes:     make(map[string]string),
 	}
-	if err := cmd.Start(); err != nil {
+	p.actor = newWorkerActor(nodePath, helper, processTimeout, startupTimeout)
+	if err := p.actor.warmup(); err != nil {
+		_ = p.actor.close()
 		_ = os.RemoveAll(tempDir)
-		return nil, fmt.Errorf("start audit-prep worker: %w", err)
-	}
-	go func() {
-		_, _ = io.Copy(lockedBuilder{mu: &p.stderrMu, b: &p.stderr}, stderrPipe)
-	}()
-	if err := p.checkWorker(); err != nil {
-		_ = p.Close()
 		return nil, err
 	}
 	return p, nil
 }
 
 func (p *Processor) Process(entryURL, jsURL string, body []byte) FileResult {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	return p.ProcessContext(context.Background(), entryURL, jsURL, body)
+}
 
-	result := FileResult{AnalysisBody: body, Outputs: make([]string, 0)}
-	if p.closed {
+func (p *Processor) ProcessContext(parent context.Context, entryURL, jsURL string, body []byte) FileResult {
+	p.stateMu.Lock()
+	closed := p.closed
+	p.stateMu.Unlock()
+	if closed {
 		return p.recordFailure(jsURL, body, "audit-prep processor is closed")
 	}
+	parent = processingContext(parent)
+	ctx, cancel := context.WithTimeout(parent, p.processTimeout)
+	defer cancel()
 
-	_, _, sources := p.recoverSourceMap(entryURL, jsURL, body)
-	if len(sources) > 0 {
-		outputs := make([]string, 0, len(sources))
-		for _, source := range sources {
-			rel, err := p.writeSource(source.Name, []byte(source.Content))
+	result := FileResult{Analysis: originalAnalysis(jsURL, body), Outputs: make([]string, 0)}
+	recovery, recoveryErr := p.recoverForBundle(ctx, entryURL, jsURL, body)
+	if recoveryErr != nil {
+		return p.recordFailure(jsURL, body, recoveryErr.Error())
+	}
+	if len(recovery.Files) > 0 {
+		outputs := make([]string, 0, len(recovery.Files))
+		for _, source := range recovery.Files {
+			if err := ctx.Err(); err != nil {
+				return p.recordFailureWithOutputs(jsURL, body, err.Error(), outputs)
+			}
+			rel, err := p.writeSourceContext(ctx, source.OutputPath, []byte(source.Content))
 			if err != nil {
-				return p.recordFailure(jsURL, body, fmt.Sprintf("write recovered source: %v", err))
+				if rel != "" && !contains(outputs, rel) {
+					outputs = append(outputs, rel)
+				}
+				return p.recordFailureWithOutputs(jsURL, body, fmt.Sprintf("write recovered source: %v", err), outputs)
 			}
 			if !contains(outputs, rel) {
 				outputs = append(outputs, rel)
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return p.recordFailureWithOutputs(jsURL, body, err.Error(), outputs)
+		}
 		sort.Strings(outputs)
 		result.Status = "sourcemap"
 		result.Outputs = outputs
+		if recovery.Complete {
+			result.Analysis = recoveredAnalysis(jsURL, recovery.Files)
+		}
+		if err := ctx.Err(); err != nil {
+			return p.recordFailureWithOutputs(jsURL, body, err.Error(), outputs)
+		}
 		return result
 	}
-
-	if p.workerErr != "" {
-		return p.recordFailure(jsURL, body, "audit-prep worker unavailable after previous failure: "+p.workerErr)
+	if err := ctx.Err(); err != nil {
+		return p.recordFailure(jsURL, body, err.Error())
 	}
-
-	p.nextID++
-	id := p.nextID
-	if err := json.NewEncoder(p.stdin).Encode(workerRequest{ID: id, Source: string(body)}); err != nil {
-		errText := fmt.Sprintf("send audit-prep request: %v", err)
-		p.latchWorkerFailure(errText)
-		return p.recordFailure(jsURL, body, errText)
+	code, err := p.actor.processContext(ctx, body)
+	if err != nil {
+		return p.recordFailure(jsURL, body, err.Error())
 	}
-
-	var response workerResponse
-	if err := p.stdout.Decode(&response); err != nil {
-		errText := "audit-prep worker stopped"
-		if !errors.Is(err, io.EOF) {
-			errText = fmt.Sprintf("decode audit-prep response: %v", err)
-		}
-		if stderr := strings.TrimSpace(p.stderrString()); stderr != "" {
-			errText += ": " + stderr
-		}
-		p.latchWorkerFailure(errText)
-		return p.recordFailure(jsURL, body, errText)
-	}
-	if response.ID != id {
-		errText := fmt.Sprintf("audit-prep response id mismatch: got %d want %d", response.ID, id)
-		p.latchWorkerFailure(errText)
-		return p.recordFailure(jsURL, body, errText)
-	}
-	if !response.OK {
-		errText := response.Error
-		if errText == "" {
-			errText = "audit-prep processing failed"
-		}
-		return p.recordFailure(jsURL, body, errText)
-	}
-
-	code := []byte(response.Code)
 	if len(code) == 0 {
 		code = body
 	}
-	rel, err := p.writeGenerated(jsURL, ".js", code)
+	if err := ctx.Err(); err != nil {
+		return p.recordFailure(jsURL, body, err.Error())
+	}
+	rel, err := p.writeGeneratedContext(ctx, jsURL, ".js", code)
 	if err != nil {
+		if rel != "" {
+			return p.recordFailureWithOutputs(jsURL, body, fmt.Sprintf("write processed bundle: %v", err), []string{rel})
+		}
 		return p.recordFailure(jsURL, body, fmt.Sprintf("write processed bundle: %v", err))
+	}
+	if err := ctx.Err(); err != nil {
+		return p.recordFailureWithOutputs(jsURL, body, err.Error(), []string{rel})
 	}
 	result.Status = "processed"
 	result.Outputs = []string{rel}
 	return result
 }
 
-func (p *Processor) recoverSourceMap(entryURL, jsURL string, body []byte) (string, string, []sourceFile) {
-	reference := extractSourceMapReference(string(body))
-	if strings.HasPrefix(reference, "data:") {
-		data, err := decodeDataURL(reference)
+func (p *Processor) recoverForBundle(ctx context.Context, entryURL, jsURL string, body []byte) (sourceMapRecovery, error) {
+	return runSourceMapAttempt(ctx, func(operationContext context.Context) (sourceMapRecovery, error) {
+		reference, err := extractSourceMapReferenceContext(operationContext, body)
 		if err != nil {
-			return "inline", "parse_error", nil
+			return sourceMapRecovery{}, err
 		}
-		sources, status := parseApplicationSources(data)
-		return "inline", status, sources
+
+		mapContext := operationContext
+		cancelMap := func() {}
+		if reference == "" {
+			mapContext, cancelMap = context.WithTimeout(operationContext, 3*time.Second)
+		}
+		defer cancelMap()
+
+		_, _, recovery, err := p.recoverSourceMap(mapContext, entryURL, jsURL, reference)
+		if reference == "" && errors.Is(err, context.DeadlineExceeded) && operationContext.Err() == nil {
+			return sourceMapRecovery{}, nil
+		}
+		return recovery, err
+	})
+}
+
+func (p *Processor) recoverSourceMap(ctx context.Context, entryURL, jsURL, reference string) (string, string, sourceMapRecovery, error) {
+	ctx = processingContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return "", "canceled", sourceMapRecovery{}, err
+	}
+	if strings.HasPrefix(reference, "data:") {
+		data, err := decodeSourceMapDataURL(ctx, reference)
+		if err != nil {
+			if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+				return "inline", "parse_error", sourceMapRecovery{}, operationErr
+			}
+			return "inline", "parse_error", sourceMapRecovery{}, nil
+		}
+		resolver := sourceMapResolver{p: p, entryURL: entryURL, ctx: ctx}
+		collection, err := resolver.collect(data, jsURL, 0, map[string]bool{reference: true})
+		if err != nil {
+			return "inline", "parse_error", sourceMapRecovery{}, err
+		}
+		recovery, status, err := applicationRecoveryContext(ctx, collection)
+		return "inline", status, recovery, err
 	}
 
 	mapURL := ""
@@ -255,37 +361,96 @@ func (p *Processor) recoverSourceMap(entryURL, jsURL string, body []byte) (strin
 	if explicit {
 		resolved, err := urlutil.Resolve(jsURL, reference)
 		if err != nil || resolved == "" {
-			return reference, "invalid_url", nil
+			return reference, "invalid_url", sourceMapRecovery{}, nil
 		}
 		mapURL = resolved
 	} else {
 		mapURL = adjacentMapURL(jsURL)
 	}
 	if mapURL == "" || p.fetch == nil {
-		return mapURL, "not_found", nil
+		return mapURL, "not_found", sourceMapRecovery{}, nil
 	}
 
-	data, err := p.fetch(entryURL, mapURL)
+	data, err := p.fetchSourceMap(ctx, entryURL, mapURL)
 	if err != nil {
-		if explicit {
-			return mapURL, "fetch_error", nil
+		if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+			return mapURL, "fetch_error", sourceMapRecovery{}, operationErr
 		}
-		return mapURL, "not_found", nil
+		if explicit {
+			return mapURL, "fetch_error", sourceMapRecovery{}, nil
+		}
+		return mapURL, "not_found", sourceMapRecovery{}, nil
 	}
-	sources, status := parseApplicationSources(data)
-	return mapURL, status, sources
+	resolver := sourceMapResolver{p: p, entryURL: entryURL, ctx: ctx}
+	active := map[string]bool{mapURL: true}
+	collection, err := resolver.collect(data, mapURL, 0, active)
+	if err != nil {
+		return mapURL, "parse_error", sourceMapRecovery{}, err
+	}
+	recovery, status, err := applicationRecoveryContext(ctx, collection)
+	return mapURL, status, recovery, err
+}
+
+func sourceMapOperationError(ctx context.Context, err error) error {
+	if ctx != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
+	}
+	if errors.Is(err, errSourceMapTooLarge) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
+}
+
+func (p *Processor) fetchSourceMap(ctx context.Context, entryURL, mapURL string) ([]byte, error) {
+	data, err := p.fetch(ctx, entryURL, mapURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkSourceMapInputLength(len(data)); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func extractSourceMapReference(source string) string {
-	matches := sourceMapDirective.FindAllStringSubmatch(source, -1)
-	if len(matches) == 0 {
-		return ""
+	reference, _ := extractSourceMapReferenceContext(context.Background(), []byte(source))
+	return reference
+}
+
+func extractSourceMapReferenceContext(ctx context.Context, source []byte) (string, error) {
+	ctx = processingContext(ctx)
+	input := parsepkg.NewInputBytes(source)
+	defer input.Restore()
+	lexer := jslexer.NewLexer(input)
+	reference := ""
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		tokenType, data := lexer.Next()
+		if tokenType == jslexer.ErrorToken && len(data) == 0 {
+			break
+		}
+		if tokenType != jslexer.CommentToken && tokenType != jslexer.CommentLineTerminatorToken {
+			continue
+		}
+		matches := sourceMapDirective.FindAllStringSubmatch(string(data), -1)
+		if len(matches) == 0 {
+			continue
+		}
+		last := matches[len(matches)-1]
+		if last[1] != "" {
+			reference = strings.TrimSpace(last[1])
+		} else {
+			reference = strings.TrimSpace(last[2])
+		}
 	}
-	last := matches[len(matches)-1]
-	if last[1] != "" {
-		return strings.TrimSpace(last[1])
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	return strings.TrimSpace(last[2])
+	return reference, nil
 }
 
 func adjacentMapURL(jsURL string) string {
@@ -300,77 +465,291 @@ func adjacentMapURL(jsURL string) string {
 }
 
 func decodeDataURL(value string) ([]byte, error) {
-	comma := strings.IndexByte(value, ',')
-	if comma < 0 {
-		return nil, errors.New("invalid source map data URL")
-	}
-	metadata := strings.ToLower(value[:comma])
-	payload := value[comma+1:]
-	if strings.Contains(metadata, ";base64") {
-		return base64.StdEncoding.DecodeString(payload)
-	}
-	decoded, err := url.PathUnescape(payload)
-	if err != nil {
-		return nil, err
-	}
-	return []byte(decoded), nil
+	return decodeSourceMapDataURL(context.Background(), value)
 }
 
-func parseApplicationSources(data []byte) ([]sourceFile, string) {
-	var raw json.RawMessage = data
-	files, err := collectSourceFiles(raw)
-	if err != nil {
-		return nil, "parse_error"
-	}
-	if len(files) == 0 {
-		return nil, "no_sources_content"
-	}
+func parseApplicationSources(data []byte) (sourceMapRecovery, string) {
+	recovery, status, _ := parseApplicationSourcesContext(context.Background(), data)
+	return recovery, status
+}
 
-	application := make([]sourceFile, 0, len(files))
-	for _, file := range files {
+func parseApplicationSourcesContext(ctx context.Context, data []byte) (sourceMapRecovery, string, error) {
+	ctx = processingContext(ctx)
+	resolver := sourceMapResolver{ctx: ctx}
+	collection, err := resolver.collect(data, "", 0, make(map[string]bool))
+	if err != nil {
+		return sourceMapRecovery{}, "parse_error", err
+	}
+	recovery, status, err := applicationRecoveryContext(ctx, collection)
+	return recovery, status, err
+}
+
+func applicationRecovery(collection sourceMapCollection) (sourceMapRecovery, string) {
+	recovery, status, _ := applicationRecoveryContext(context.Background(), collection)
+	return recovery, status
+}
+
+func applicationRecoveryContext(ctx context.Context, collection sourceMapCollection) (sourceMapRecovery, string, error) {
+	ctx = processingContext(ctx)
+	recovery := sourceMapRecovery{
+		Files:    make([]sourceFile, 0, len(collection.Files)),
+		Complete: collection.Complete,
+	}
+	for _, file := range collection.Files {
+		if err := ctx.Err(); err != nil {
+			return sourceMapRecovery{}, "canceled", err
+		}
 		safeName := safeApplicationSourcePath(file.Name)
-		if safeName == "" || file.Content == "" {
+		if safeName == "" {
 			continue
 		}
-		application = append(application, sourceFile{Name: safeName, Content: file.Content})
-	}
-	if len(application) == 0 {
-		return nil, "no_application_sources"
-	}
-	return application, "used"
-}
-
-func collectSourceFiles(data json.RawMessage) ([]sourceFile, error) {
-	var envelope struct {
-		SourceRoot     string    `json:"sourceRoot"`
-		Sources        []string  `json:"sources"`
-		SourcesContent []*string `json:"sourcesContent"`
-		Sections       []struct {
-			Map json.RawMessage `json:"map"`
-		} `json:"sections"`
-	}
-	if err := json.Unmarshal(data, &envelope); err != nil {
-		return nil, err
-	}
-
-	files := make([]sourceFile, 0)
-	for i, name := range envelope.Sources {
-		if i >= len(envelope.SourcesContent) || envelope.SourcesContent[i] == nil {
+		recovery.SourceCount++
+		if !file.HasContent || file.Content == "" {
+			recovery.Complete = false
 			continue
 		}
-		files = append(files, sourceFile{
-			Name:    joinSourceRoot(envelope.SourceRoot, name),
-			Content: *envelope.SourcesContent[i],
+		recovery.ContentSize += int64(len(file.Content))
+		if len(recovery.Files) >= 512 || recovery.ContentSize > 64*1024*1024 {
+			recovery.Complete = false
+			continue
+		}
+		recovery.Files = append(recovery.Files, sourceFile{
+			Name:       file.Name,
+			OutputPath: safeName,
+			Content:    file.Content,
+			HasContent: true,
 		})
 	}
-	for _, section := range envelope.Sections {
-		nested, err := collectSourceFiles(section.Map)
-		if err != nil {
-			return nil, err
-		}
-		files = append(files, nested...)
+	if recovery.SourceCount == 0 || len(recovery.Files) == 0 {
+		recovery.Complete = false
+		return recovery, "no_application_sources", ctx.Err()
 	}
-	return files, nil
+	if recovery.SourceCount > 512 || recovery.ContentSize > 64*1024*1024 {
+		recovery.Complete = false
+	}
+	if err := ctx.Err(); err != nil {
+		return sourceMapRecovery{}, "canceled", err
+	}
+	return recovery, "used", nil
+}
+
+func (r sourceMapResolver) collect(data []byte, parentMapURL string, depth int, active map[string]bool) (sourceMapCollection, error) {
+	ctx := processingContext(r.ctx)
+	if err := ctx.Err(); err != nil {
+		return sourceMapCollection{}, err
+	}
+	if depth > 4 {
+		return sourceMapCollection{Complete: false}, nil
+	}
+	var envelope struct {
+		Version        json.RawMessage `json:"version"`
+		SourceRoot     string          `json:"sourceRoot"`
+		Sources        json.RawMessage `json:"sources"`
+		SourcesContent json.RawMessage `json:"sourcesContent"`
+		Sections       json.RawMessage `json:"sections"`
+	}
+	if err := decodeSourceMapJSON(ctx, data, &envelope); err != nil {
+		if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+			return sourceMapCollection{}, operationErr
+		}
+		return sourceMapCollection{Complete: false}, nil
+	}
+	var version int
+	if len(envelope.Version) == 0 || decodeSourceMapJSON(ctx, envelope.Version, &version) != nil || version != 3 {
+		if err := ctx.Err(); err != nil {
+			return sourceMapCollection{}, err
+		}
+		return sourceMapCollection{Complete: false}, nil
+	}
+
+	var sources []string
+	hasSources, err := sourceMapJSONPresent(ctx, envelope.Sources)
+	if err != nil {
+		return sourceMapCollection{}, err
+	}
+	if hasSources {
+		if err := decodeSourceMapJSON(ctx, envelope.Sources, &sources); err != nil {
+			if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+				return sourceMapCollection{}, operationErr
+			}
+			return sourceMapCollection{Complete: false}, nil
+		}
+	}
+	var sourcesContent []*string
+	hasSourcesContent, err := sourceMapJSONPresent(ctx, envelope.SourcesContent)
+	if err != nil {
+		return sourceMapCollection{}, err
+	}
+	if hasSourcesContent {
+		if err := decodeSourceMapJSON(ctx, envelope.SourcesContent, &sourcesContent); err != nil {
+			if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+				return sourceMapCollection{}, operationErr
+			}
+			return sourceMapCollection{Complete: false}, nil
+		}
+	}
+	var sections []struct {
+		Offset json.RawMessage `json:"offset"`
+		Map    json.RawMessage `json:"map"`
+		URL    string          `json:"url"`
+	}
+	hasSections, err := sourceMapJSONPresent(ctx, envelope.Sections)
+	if err != nil {
+		return sourceMapCollection{}, err
+	}
+	if hasSections {
+		if err := decodeSourceMapJSON(ctx, envelope.Sections, &sections); err != nil {
+			if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+				return sourceMapCollection{}, operationErr
+			}
+			return sourceMapCollection{Complete: false}, nil
+		}
+	}
+	if !hasSources && !hasSections {
+		return sourceMapCollection{Complete: false}, nil
+	}
+
+	collection := sourceMapCollection{Files: make([]sourceFile, 0, len(sources)), Complete: true}
+	for i, name := range sources {
+		if err := ctx.Err(); err != nil {
+			return sourceMapCollection{}, err
+		}
+		file := sourceFile{Name: joinSourceRoot(envelope.SourceRoot, name)}
+		if i < len(sourcesContent) && sourcesContent[i] != nil {
+			file.Content = *sourcesContent[i]
+			file.HasContent = true
+		}
+		collection.Files = append(collection.Files, file)
+	}
+	var previousOffset *sourceMapOffset
+	for _, section := range sections {
+		if err := ctx.Err(); err != nil {
+			return sourceMapCollection{}, err
+		}
+		offset, validOffset, err := parseSourceMapOffsetContext(ctx, section.Offset)
+		if err != nil {
+			return sourceMapCollection{}, err
+		}
+		if !validOffset {
+			collection.Complete = false
+		} else {
+			if previousOffset != nil && sourceMapOffsetLess(offset, *previousOffset) {
+				collection.Complete = false
+			}
+			previousOffset = &offset
+		}
+
+		hasMap, err := sourceMapJSONPresent(ctx, section.Map)
+		if err != nil {
+			return sourceMapCollection{}, err
+		}
+		hasURL, err := sourceMapStringPresent(ctx, section.URL)
+		if err != nil {
+			return sourceMapCollection{}, err
+		}
+		if hasMap == hasURL {
+			collection.Complete = false
+			continue
+		}
+
+		var nested sourceMapCollection
+		if hasMap {
+			nested, err = r.collect(section.Map, parentMapURL, depth+1, active)
+		} else {
+			nested, err = r.collectURLSection(section.URL, parentMapURL, depth+1, active)
+		}
+		if err != nil {
+			return sourceMapCollection{}, err
+		}
+		collection.Files = append(collection.Files, nested.Files...)
+		collection.Complete = collection.Complete && nested.Complete
+	}
+	if err := ctx.Err(); err != nil {
+		return sourceMapCollection{}, err
+	}
+	return collection, nil
+}
+
+func parseSourceMapOffset(raw json.RawMessage) (sourceMapOffset, bool) {
+	offset, ok, _ := parseSourceMapOffsetContext(context.Background(), raw)
+	return offset, ok
+}
+
+func parseSourceMapOffsetContext(ctx context.Context, raw json.RawMessage) (sourceMapOffset, bool, error) {
+	var wire struct {
+		Line   json.RawMessage `json:"line"`
+		Column json.RawMessage `json:"column"`
+	}
+	if len(raw) == 0 {
+		return sourceMapOffset{}, false, nil
+	}
+	if err := decodeSourceMapJSON(ctx, raw, &wire); err != nil {
+		if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+			return sourceMapOffset{}, false, operationErr
+		}
+		return sourceMapOffset{}, false, nil
+	}
+	var offset sourceMapOffset
+	if len(wire.Line) == 0 || len(wire.Column) == 0 ||
+		decodeSourceMapJSON(ctx, wire.Line, &offset.Line) != nil ||
+		decodeSourceMapJSON(ctx, wire.Column, &offset.Column) != nil ||
+		offset.Line < 0 || offset.Column < 0 {
+		if err := ctx.Err(); err != nil {
+			return sourceMapOffset{}, false, err
+		}
+		return sourceMapOffset{}, false, nil
+	}
+	return offset, true, nil
+}
+
+func sourceMapOffsetLess(left, right sourceMapOffset) bool {
+	return left.Line < right.Line || (left.Line == right.Line && left.Column < right.Column)
+}
+
+func (r sourceMapResolver) collectURLSection(reference, parentMapURL string, depth int, active map[string]bool) (sourceMapCollection, error) {
+	ctx := processingContext(r.ctx)
+	if err := ctx.Err(); err != nil {
+		return sourceMapCollection{}, err
+	}
+	if depth > 4 {
+		return sourceMapCollection{Complete: false}, nil
+	}
+
+	mapURL := reference
+	nestedParentURL := parentMapURL
+	var data []byte
+	var err error
+	if strings.HasPrefix(reference, "data:") {
+		if active[mapURL] {
+			return sourceMapCollection{Complete: false}, nil
+		}
+		data, err = decodeSourceMapDataURL(ctx, reference)
+	} else {
+		mapURL, err = urlutil.Resolve(parentMapURL, reference)
+		nestedParentURL = mapURL
+		if err == nil && mapURL != "" && active[mapURL] {
+			return sourceMapCollection{Complete: false}, nil
+		}
+		if err == nil && mapURL != "" && r.p != nil && r.p.fetch != nil {
+			data, err = r.p.fetchSourceMap(r.ctx, r.entryURL, mapURL)
+		} else if err == nil {
+			err = errors.New("source map section fetch unavailable")
+		}
+	}
+	if err != nil {
+		if operationErr := sourceMapOperationError(ctx, err); operationErr != nil {
+			return sourceMapCollection{}, operationErr
+		}
+		return sourceMapCollection{Complete: false}, nil
+	}
+	if mapURL == "" {
+		return sourceMapCollection{Complete: false}, nil
+	}
+
+	active[mapURL] = true
+	nested, err := r.collect(data, nestedParentURL, depth, active)
+	delete(active, mapURL)
+	return nested, err
 }
 
 func joinSourceRoot(root, name string) string {
@@ -432,14 +811,34 @@ func (p *Processor) writeSource(name string, data []byte) (string, error) {
 	return p.writeContent(filepath.ToSlash(filepath.FromSlash(name)), data)
 }
 
+func (p *Processor) writeSourceContext(ctx context.Context, name string, data []byte) (string, error) {
+	return p.writeContentContext(ctx, filepath.ToSlash(filepath.FromSlash(name)), data)
+}
+
 func (p *Processor) writeGenerated(sourceURL, fallbackExt string, data []byte) (string, error) {
 	return p.writeContent(urlutil.ArtifactFilename(sourceURL, fallbackExt, "script"), data)
 }
 
+func (p *Processor) writeGeneratedContext(ctx context.Context, sourceURL, fallbackExt string, data []byte) (string, error) {
+	return p.writeContentContext(ctx, urlutil.ArtifactFilename(sourceURL, fallbackExt, "script"), data)
+}
+
 func (p *Processor) writeContent(preferredRel string, data []byte) (string, error) {
+	return p.writeContentContext(context.Background(), preferredRel, data)
+}
+
+func (p *Processor) writeContentContext(ctx context.Context, preferredRel string, data []byte) (string, error) {
+	ctx = processingContext(ctx)
+	p.outputMu.Lock()
+	defer p.outputMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	hash := fullHash(data)
 	if rel, ok := p.contentRefs[hash]; ok {
-		return filepath.ToSlash(filepath.Join("js", rel)), nil
+		output := filepath.ToSlash(filepath.Join("js", rel))
+		return output, ctx.Err()
 	}
 
 	rel := filepath.ToSlash(preferredRel)
@@ -456,111 +855,74 @@ func (p *Processor) writeContent(preferredRel string, data []byte) (string, erro
 	}
 	p.contentRefs[hash] = rel
 	p.pathHashes[rel] = hash
-	return filepath.ToSlash(filepath.Join("js", rel)), nil
+	output := filepath.ToSlash(filepath.Join("js", rel))
+	return output, ctx.Err()
 }
 
 func (p *Processor) recordFailure(jsURL string, body []byte, errText string) FileResult {
+	return p.recordFailureWithOutputs(jsURL, body, errText, nil)
+}
+
+func (p *Processor) recordFailureWithOutputs(jsURL string, body []byte, errText string, existingOutputs []string) FileResult {
+	outputs := append([]string(nil), existingOutputs...)
 	rel, writeErr := p.writeGenerated(jsURL, ".js", body)
+	fallbackWriteFailed := writeErr != nil
 	if writeErr != nil {
 		errText += fmt.Sprintf("; write fallback file: %v", writeErr)
 		rel = ""
 	}
-	outputs := make([]string, 0, 1)
-	if rel != "" {
+	if rel != "" && !contains(outputs, rel) {
 		outputs = append(outputs, rel)
 	}
+	sort.Strings(outputs)
 	return FileResult{
-		AnalysisBody: body,
-		Status:       "failed",
-		Outputs:      outputs,
-		Failed:       true,
-		Error:        errText,
+		Analysis:            originalAnalysis(jsURL, body),
+		Status:              "failed",
+		Outputs:             outputs,
+		Failed:              true,
+		FallbackWriteFailed: fallbackWriteFailed,
+		Error:               errText,
 	}
 }
 
-func (p *Processor) checkWorker() error {
-	if err := json.NewEncoder(p.stdin).Encode(workerRequest{Command: "ping"}); err != nil {
-		return fmt.Errorf("start audit-prep worker: %w", err)
-	}
-	var response workerResponse
-	if err := p.stdout.Decode(&response); err != nil {
-		errText := "audit-prep worker stopped during startup"
-		if !errors.Is(err, io.EOF) {
-			errText = fmt.Sprintf("decode audit-prep startup response: %v", err)
-		}
-		if stderr := strings.TrimSpace(p.stderrString()); stderr != "" {
-			errText += ": " + stderr
-		}
-		return errors.New(errText)
-	}
-	if !response.OK {
-		if response.Error == "" {
-			response.Error = "audit-prep worker failed to start"
-		}
-		return errors.New(response.Error)
-	}
-	majorText, _, _ := strings.Cut(response.NodeVersion, ".")
-	major, err := strconv.Atoi(majorText)
-	if err != nil || major < 18 {
-		return errors.New(NodeVersionError)
-	}
-	return nil
+func originalAnalysis(jsURL string, body []byte) []AnalysisUnit {
+	return []AnalysisUnit{{SourceName: jsURL, BaseURL: jsURL, Body: body}}
 }
 
-func (p *Processor) latchWorkerFailure(errText string) {
-	if p.workerErr == "" {
-		p.workerErr = errText
+func recoveredAnalysis(bundleURL string, files []sourceFile) []AnalysisUnit {
+	units := make([]AnalysisUnit, 0, len(files))
+	for _, file := range files {
+		baseURL := bundleURL
+		if parsed, err := url.Parse(file.Name); err == nil &&
+			(strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https")) && parsed.Host != "" {
+			baseURL = file.Name
+		}
+		units = append(units, AnalysisUnit{
+			SourceName: file.Name,
+			BaseURL:    baseURL,
+			Body:       []byte(file.Content),
+		})
 	}
+	return units
 }
 
 func (p *Processor) Close() error {
-	p.mu.Lock()
+	p.stateMu.Lock()
 	if p.closed {
-		p.mu.Unlock()
+		p.stateMu.Unlock()
 		return nil
 	}
 	p.closed = true
-	stdin := p.stdin
-	cmd := p.cmd
+	actor := p.actor
 	tempDir := p.tempDir
-	p.mu.Unlock()
+	p.stateMu.Unlock()
 
-	_ = json.NewEncoder(stdin).Encode(workerRequest{Command: "shutdown"})
-	_ = stdin.Close()
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-	select {
-	case err := <-done:
-		_ = os.RemoveAll(tempDir)
-		if err != nil && !strings.Contains(err.Error(), "signal: killed") {
-			return err
-		}
-		return nil
-	case <-time.After(2 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
-		_ = os.RemoveAll(tempDir)
-		return nil
+	err := actor.close()
+	removeErr := os.RemoveAll(tempDir)
+	if err != nil {
+		return err
 	}
-}
-
-type lockedBuilder struct {
-	mu *sync.Mutex
-	b  *strings.Builder
-}
-
-func (w lockedBuilder) Write(data []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.b.Write(data)
-}
-
-func (p *Processor) stderrString() string {
-	p.stderrMu.Lock()
-	defer p.stderrMu.Unlock()
-	return p.stderr.String()
+	return removeErr
 }
 
 func fullHash(data []byte) string {

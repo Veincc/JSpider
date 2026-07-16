@@ -4,35 +4,43 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/Veincc/JSpider/internal/urlutil"
 )
 
 const (
-	DefaultMaxDepth  = 10
-	DefaultMaxSizeMB = 0
+	DefaultMaxDepth                    = 10
+	DefaultMaxSizeMB                   = 0
+	DefaultProcessTimeoutSeconds       = 30
+	DefaultHeadlessBodyMB              = 8
+	maxByteLimitMB               int64 = math.MaxInt64 / (1024 * 1024)
 )
 
 type Config struct {
-	URL                string
-	URLList            string
-	OutDir             string
-	Headless           bool // enable headless browser JS discovery
-	APIDiscovery       bool // enable static/runtime API discovery; implies headless
-	MaxJS              int
-	MaxDepth           int
-	MaxSizeMB          int
-	Workers            int
-	SameOrigin         bool
-	AllowCDN           []string
-	Timeout            int
-	UserAgent          string
-	Cookies            string
-	Headers            map[string]string
-	Verbose            bool
-	InsecureSkipVerify bool
-	Proxy              string
+	URL                   string
+	URLList               string
+	OutDir                string
+	Headless              bool // enable headless browser JS discovery
+	APIDiscovery          bool // enable static/runtime API discovery; implies headless
+	MaxJS                 int
+	MaxDepth              int
+	MaxSizeMB             int
+	Workers               int
+	SameOrigin            bool
+	AllowCDN              []string
+	Timeout               int
+	ProcessTimeoutSeconds int
+	HeadlessBodyMB        int
+	UserAgent             string
+	Cookies               string
+	Headers               map[string]string
+	Verbose               bool
+	InsecureSkipVerify    bool
+	Proxy                 string
 }
 
 func Parse() *Config {
@@ -55,19 +63,36 @@ func Parse() *Config {
 		fmt.Fprintf(os.Stderr, "  -o <dir>              Output directory (default: output)\n")
 		fmt.Fprintf(os.Stderr, "  --headless            Enable headless browser JS discovery (requires Chrome/Chromium)\n")
 		fmt.Fprintf(os.Stderr, "  --api-discovery       Extract static APIs and use Chrome to click safe elements and observe XHR/fetch/EventSource requests (requires CGO and Chrome/Chromium; implies --headless)\n")
-		fmt.Fprintf(os.Stderr, "  -n <count>            Max JS files to analyze (0=unlimited)\n")
-		fmt.Fprintf(os.Stderr, "  -d <depth>            Max recursion depth (default: 10)\n")
+		fmt.Fprintf(os.Stderr, "  -n <count>            Max JS fetch attempts per canonical origin, including failures (0=unlimited)\n")
+		fmt.Fprintf(os.Stderr, "  -d <depth>            Max recursion depth (0=no recursion, default: 10)\n")
 		fmt.Fprintf(os.Stderr, "  -s <mb>               Max download size per resource in MB (0=unlimited, default: unlimited)\n")
 		fmt.Fprintf(os.Stderr, "  -w <workers>          Concurrent download workers (default: 5)\n")
 		fmt.Fprintf(os.Stderr, "  --same-origin         Only analyze same-origin JS (default: true)\n")
 		fmt.Fprintf(os.Stderr, "  -c <domains>          Allowed CDN domains, comma-separated\n")
 		fmt.Fprintf(os.Stderr, "  --proxy <url>         HTTP, HTTPS, or SOCKS5 proxy used by requests and headless Chrome\n")
 		fmt.Fprintf(os.Stderr, "  -t <seconds>          HTTP timeout in seconds (default: 15)\n")
+		fmt.Fprintf(os.Stderr, "  --process-timeout <seconds>  Per-bundle JavaScript processing timeout (default: 30)\n")
+		fmt.Fprintf(os.Stderr, "  --headless-body-mb <mb>      Per-response Headless text/JSON body cap (default: 8)\n")
 		fmt.Fprintf(os.Stderr, "  -a <ua>               Custom User-Agent\n")
 		fmt.Fprintf(os.Stderr, "  -k <cookie>           Optional cookie string\n")
 		fmt.Fprintf(os.Stderr, "  -H <headers>          Extra headers (Header1=Value1;Header2=Value2)\n")
 		fmt.Fprintf(os.Stderr, "  -v                    Print verbose logs\n")
 		fmt.Fprintf(os.Stderr, "  --insecure            Skip TLS certificate verification for requests and headless Chrome\n")
+		fmt.Fprintf(os.Stderr, "\nBehavior and limits:\n")
+		fmt.Fprintf(os.Stderr, "  -d 0 fetches entry-discovered JavaScript but does not recurse; -n limits fetch attempts per canonical origin; failures count, entry HTML does not.\n")
+		fmt.Fprintf(os.Stderr, "  --process-timeout starts before source-map scanning and propagates caller cancellation; adjacent .map probing has a 3-second sub-deadline.\n")
+		fmt.Fprintf(os.Stderr, "  Decoded source-map input is capped at 128 MiB; recovered output remains capped at 512 files and 64 MiB.\n")
+		fmt.Fprintf(os.Stderr, "  API Discovery may refetch a shared script once per entry; every attempt counts against the canonical-origin -n budget.\n")
+		fmt.Fprintf(os.Stderr, "  API request-body capture admits 4 active and 4 queued CDP reads; parsing is capped at 1 MiB per body.\n")
+		fmt.Fprintf(os.Stderr, "  Headless -t phases use absolute deadlines: navigation 50%%, scrolling 70%%, click/DOM 95%%, body drain 100%%.\n")
+		fmt.Fprintf(os.Stderr, "  Chrome/CDP may fully materialize a response before the cap is applied by --headless-body-mb.\n")
+		fmt.Fprintf(os.Stderr, "  Canonical-origin output names include non-default ports; default ports normalize away, and collisions add an eight-hex-character SHA-256 suffix.\n")
+		fmt.Fprintf(os.Stderr, "  Non-fatal entry failures continue but produce an aggregate nonzero exit; fatal process-wide failures may skip remaining entries.\n")
+		fmt.Fprintf(os.Stderr, "  Complete source-map recovery analyzes recovered sources only; incomplete or capped recovery analyzes the original bundle only.\n")
+		fmt.Fprintf(os.Stderr, "\nSensitive data warning:\n")
+		fmt.Fprintf(os.Stderr, "  Cookie/header flags can appear in shell history and process listings. Raw URLs, queries,\n")
+		fmt.Fprintf(os.Stderr, "  headers, bodies, and samples may remain in memory or verbose logs; endpoints.txt keeps\n")
+		fmt.Fprintf(os.Stderr, "  full query strings. Protect logs and output as sensitive data.\n")
 	}
 
 	flag.StringVar(&cfg.URL, "u", "", "Start URL")
@@ -75,14 +100,16 @@ func Parse() *Config {
 	flag.StringVar(&cfg.OutDir, "o", "output", "Output directory")
 	flag.BoolVar(&cfg.Headless, "headless", false, "Enable headless browser JS discovery (requires Chrome/Chromium)")
 	flag.BoolVar(&cfg.APIDiscovery, "api-discovery", false, "Extract static APIs and observe browser API requests (requires CGO and Chrome/Chromium; implies --headless)")
-	flag.IntVar(&cfg.MaxJS, "n", 0, "Max JS files to analyze (0=unlimited)")
-	flag.IntVar(&cfg.MaxDepth, "d", DefaultMaxDepth, "Max recursion depth")
+	flag.IntVar(&cfg.MaxJS, "n", 0, "Max JS fetch attempts per canonical origin, including failures (0=unlimited)")
+	flag.IntVar(&cfg.MaxDepth, "d", DefaultMaxDepth, "Max recursion depth (0=no recursion)")
 	flag.IntVar(&cfg.MaxSizeMB, "s", DefaultMaxSizeMB, "Max download size per resource in MB (0=unlimited)")
 	flag.IntVar(&cfg.Workers, "w", 5, "Concurrent download workers")
 	flag.BoolVar(&cfg.SameOrigin, "same-origin", true, "Only analyze same-origin JS")
 	flag.StringVar(&allowCDNStr, "c", "", "Allowed CDN domains (comma-separated)")
 	flag.StringVar(&cfg.Proxy, "proxy", "", "HTTP, HTTPS, or SOCKS5 proxy URL")
 	flag.IntVar(&cfg.Timeout, "t", 15, "HTTP timeout in seconds")
+	flag.IntVar(&cfg.ProcessTimeoutSeconds, "process-timeout", DefaultProcessTimeoutSeconds, "Per-bundle JavaScript processing timeout in seconds")
+	flag.IntVar(&cfg.HeadlessBodyMB, "headless-body-mb", DefaultHeadlessBodyMB, "Per-response Headless text/JSON body cap in MB")
 	flag.StringVar(&cfg.UserAgent, "a", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Custom User-Agent")
 	flag.StringVar(&cfg.Cookies, "k", "", "Optional cookie string")
 	flag.StringVar(&headersStr, "H", "", "Extra headers (Header1=Value1;Header2=Value2)")
@@ -96,12 +123,6 @@ func Parse() *Config {
 		cfg.InsecureSkipVerify = true
 		fmt.Fprintln(os.Stderr, "Warning: --insecure-skip-verify is deprecated; use --insecure")
 	}
-	if cfg.URL == "" && cfg.URLList == "" {
-		fmt.Fprintln(os.Stderr, "Error: provide at least one of -u or -l")
-		flag.Usage()
-		os.Exit(1)
-	}
-
 	if allowCDNStr != "" {
 		for _, d := range strings.Split(allowCDNStr, ",") {
 			d = strings.TrimSpace(d)
@@ -128,6 +149,47 @@ func ApplyModeImplications(cfg *Config) {
 	if cfg.APIDiscovery {
 		cfg.Headless = true
 	}
+}
+
+// Validate rejects configuration values that cannot produce a valid run.
+func (c *Config) Validate() error {
+	if strings.TrimSpace(c.URL) == "" && strings.TrimSpace(c.URLList) == "" {
+		return fmt.Errorf("provide at least one URL with -u or -l")
+	}
+	if strings.TrimSpace(c.OutDir) == "" {
+		return fmt.Errorf("output directory must not be empty")
+	}
+	if c.Workers <= 0 {
+		return fmt.Errorf("workers must be greater than zero")
+	}
+	if c.MaxDepth < 0 {
+		return fmt.Errorf("maximum depth must not be negative")
+	}
+	if c.MaxJS < 0 {
+		return fmt.Errorf("maximum JavaScript count must not be negative")
+	}
+	if c.MaxSizeMB < 0 {
+		return fmt.Errorf("maximum download size must not be negative")
+	}
+	if int64(c.MaxSizeMB) > maxByteLimitMB {
+		return fmt.Errorf("maximum download size is too large")
+	}
+	if c.Timeout <= 0 {
+		return fmt.Errorf("HTTP timeout must be greater than zero")
+	}
+	if c.ProcessTimeoutSeconds <= 0 {
+		return fmt.Errorf("process timeout must be greater than zero")
+	}
+	if c.HeadlessBodyMB <= 0 {
+		return fmt.Errorf("headless body limit must be greater than zero")
+	}
+	if int64(c.HeadlessBodyMB) > maxByteLimitMB {
+		return fmt.Errorf("headless body limit is too large")
+	}
+	if _, err := NormalizeProxy(c.Proxy); err != nil {
+		return fmt.Errorf("proxy configuration: %w", err)
+	}
+	return nil
 }
 
 // NormalizeProxy validates a proxy value and adds an HTTP scheme when omitted.
@@ -163,13 +225,16 @@ func NormalizeProxy(raw string) (string, error) {
 	return proxyURL.String(), nil
 }
 
-// URLs returns the list of URLs to analyze (merges -u and -l)
-func (c *Config) URLs() []string {
+// URLs returns the list of URLs to analyze (merges -u and -l).
+func (c *Config) URLs() ([]string, error) {
 	var urls []string
 	seen := make(map[string]bool)
 
 	if c.URL != "" {
-		u := normalizeURL(strings.TrimSpace(c.URL))
+		u, err := normalizeURL(strings.TrimSpace(c.URL))
+		if err != nil {
+			return nil, fmt.Errorf("parse entry URL %q: %w", c.URL, err)
+		}
 		if u != "" && !seen[u] {
 			seen[u] = true
 			urls = append(urls, u)
@@ -177,8 +242,15 @@ func (c *Config) URLs() []string {
 	}
 
 	if c.URLList != "" {
-		for _, u := range readURLList(c.URLList) {
-			u = normalizeURL(u)
+		rawURLs, err := readURLList(c.URLList)
+		if err != nil {
+			return nil, err
+		}
+		for _, raw := range rawURLs {
+			u, err := normalizeURL(raw)
+			if err != nil {
+				return nil, fmt.Errorf("parse URL %q from %s: %w", raw, c.URLList, err)
+			}
 			if u != "" && !seen[u] {
 				seen[u] = true
 				urls = append(urls, u)
@@ -186,43 +258,63 @@ func (c *Config) URLs() []string {
 		}
 	}
 
-	return urls
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("no HTTP(S) URLs to analyze")
+	}
+	return urls, nil
 }
 
 // normalizeURL adds a scheme prefix; URLs without http:// or https:// default to https://.
 // - //cdn.example.com/lib.js  → ignored
 // - mailto:, file:, data: and other non-HTTP(S) schemes → ignored
 // - example.com/path  → https://example.com/path
-func normalizeURL(u string) string {
+func normalizeURL(u string) (string, error) {
 	if u == "" {
-		return u
-	}
-	// Already http/https, return as-is
-	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-		return u
+		return u, nil
 	}
 	// Protocol-relative URLs (e.g. //cdn.example.com/lib.js) are not used as entry URLs
 	if strings.HasPrefix(u, "//") {
-		return ""
+		return "", nil
 	}
+
+	candidate := "https://" + u
 	// For this tool, non-HTTP(S) entry URLs are ignored.
 	if idx := strings.Index(u, ":"); idx > 0 {
 		if idx+1 < len(u) && u[idx+1] >= '0' && u[idx+1] <= '9' {
-			return "https://" + u
-		}
-		isScheme := true
-		for i := 0; i < idx; i++ {
-			c := u[i]
-			if c == '.' || !isSchemeChar(c) {
-				isScheme = false
-				break
+			candidate = "https://" + u
+		} else {
+			isScheme := true
+			for i := 0; i < idx; i++ {
+				c := u[i]
+				if c == '.' || !isSchemeChar(c) {
+					isScheme = false
+					break
+				}
+			}
+			if isScheme && isAlpha(u[0]) {
+				parsed, err := url.Parse(u)
+				if err != nil {
+					return "", err
+				}
+				if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+					return "", nil
+				}
+				candidate = u
 			}
 		}
-		if isScheme && idx > 0 && isAlpha(u[0]) {
-			return ""
-		}
 	}
-	return "https://" + u
+
+	parsed, err := url.Parse(candidate)
+	if err != nil {
+		return "", err
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https") {
+		return "", nil
+	}
+	if _, err := urlutil.CanonicalOrigin(candidate); err != nil {
+		return "", err
+	}
+	return candidate, nil
 }
 
 // isAlpha checks whether a byte is an ASCII letter
@@ -236,11 +328,10 @@ func isSchemeChar(c byte) bool {
 		(c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
 }
 
-func readURLList(path string) []string {
+func readURLList(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read URL list file: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("read URL list file %s: %w", path, err)
 	}
 	defer f.Close()
 
@@ -254,8 +345,7 @@ func readURLList(path string) []string {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to read URL list file: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("scan URL list file %s: %w", path, err)
 	}
-	return urls
+	return urls, nil
 }

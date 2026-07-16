@@ -47,12 +47,25 @@ func preferredEndpointCandidates(endpoint Endpoint, entryURLs []string) []string
 	if raw == "" || strings.HasPrefix(raw, "?") || strings.HasPrefix(raw, "#") {
 		return nil
 	}
-	reference, err := url.Parse(raw)
-	if err != nil {
+	reference, sourceRelative, ok := parseStaticReference(StaticEndpoint{
+		RawURL:         raw,
+		SourceIdentity: endpoint.SourceIdentity,
+	})
+	if !ok {
+		return nil
+	}
+	if isUnprovenProtocolRelative(reference, sourceRelative, endpoint.SourceIdentity) {
 		return nil
 	}
 	if reference.Scheme != "" {
-		return []string{raw}
+		return []string{reference.String()}
+	}
+	if endpoint.SourceIdentity.EntryURL != "" {
+		base, err := url.Parse(endpoint.SourceIdentity.EntryURL)
+		if err == nil && base.Scheme != "" && base.Host != "" {
+			return []string{base.ResolveReference(reference).String()}
+		}
+		return nil
 	}
 	var candidates []string
 	for _, entryURL := range entryURLs {
@@ -75,7 +88,7 @@ func normalizeEndpointURL(raw string) (string, bool) {
 	default:
 		return "", false
 	}
-	if strings.Contains(parsed.Path, "EXPR") {
+	if hasExpressionSegment(normalizePath(parsed.EscapedPath())) {
 		return "", false
 	}
 	parsed.Fragment = ""
@@ -111,7 +124,7 @@ func deduplicateStrings(values []string) []string {
 func WriteArtifacts(siteDir string, report Report) error {
 	runtimeDir := filepath.Join(siteDir, "runtime")
 	analysisDir := filepath.Join(siteDir, "analysis")
-	// API artifacts can contain sanitized-but-sensitive structure, so keep
+	// API artifacts can contain sensitive request data, so keep
 	// output directories private even when the parent site directory is shared.
 	if err := ensurePrivateDir(runtimeDir); err != nil {
 		return fmt.Errorf("create runtime output directory: %w", err)

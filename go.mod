@@ -8,6 +8,8 @@ require (
 	github.com/chromedp/cdproto v0.0.0-20260321001828-e3e3800016bc
 	github.com/chromedp/chromedp v0.15.1
 	github.com/tdewolff/parse/v2 v2.7.15
+	github.com/vektah/gqlparser/v2 v2.5.36
+	golang.org/x/net v0.15.0
 )
 
 require (
@@ -21,6 +23,6 @@ require (
 	github.com/gobwas/ws v1.4.0 // indirect
 	github.com/smacker/go-tree-sitter v0.0.0-20230720070738-0d0a9f78d8f8 // indirect
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
-	golang.org/x/net v0.15.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/text v0.13.0 // indirect
 )

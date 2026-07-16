@@ -20,12 +20,10 @@ func TestEndpointURLsUsesPriorityAndResolvesRelativeRawURLs(t *testing.T) {
 		{RawURL: "/api/users"},
 		{RawURL: "./api/orders"},
 		{RawURL: "../api/admin"},
-		{RawURL: "//api.example.net/users"},
 	}}
 	got := EndpointURLs(report, []string{"https://example.com/base/page"})
 	want := []string{
 		"https://api.example.com/matched",
-		"https://api.example.net/users",
 		"https://example.com/absolute?q=1",
 		"https://example.com/api/admin",
 		"https://example.com/api/users",
@@ -34,6 +32,32 @@ func TestEndpointURLsUsesPriorityAndResolvesRelativeRawURLs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("EndpointURLs() = %v, want %v", got, want)
+	}
+}
+
+func TestEndpointURLsDoesNotGuessEntriesForUnprovenProtocolRelativeStatic(t *testing.T) {
+	report := BuildReport([]StaticEndpoint{{
+		RawURL: "//api.example/api/users", Method: "GET",
+	}}, nil)
+	if len(report.Endpoints) != 1 || report.Endpoints[0].Kind != EndpointStaticOnly || len(report.Endpoints[0].ResolvedCandidates) != 0 {
+		t.Fatalf("endpoints = %+v, want unresolved static-only evidence", report.Endpoints)
+	}
+	entries := []string{"http://first.example/app/", "https://second.example/root/"}
+	if got := EndpointURLs(report, entries); len(got) != 0 {
+		t.Fatalf("EndpointURLs() = %v, want no guessed scheme or entry", got)
+	}
+
+	legacy := Report{Endpoints: []Endpoint{
+		{RawURL: "/api/relative"},
+		{RawURL: "https://api.example/absolute"},
+	}}
+	want := []string{
+		"http://first.example/api/relative",
+		"https://api.example/absolute",
+		"https://second.example/api/relative",
+	}
+	if got := EndpointURLs(legacy, entries); !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy relative/absolute EndpointURLs() = %v, want %v", got, want)
 	}
 }
 
@@ -50,6 +74,97 @@ func TestEndpointURLsFiltersInvalidAndDeduplicatesAcrossEntries(t *testing.T) {
 	want := []string{"https://example.com/fallback", "https://example.com/shared"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("EndpointURLs() = %v, want %v", got, want)
+	}
+}
+
+func TestEndpointURLsFiltersOnlyWholeEXPRPathSegments(t *testing.T) {
+	report := Report{Endpoints: []Endpoint{
+		{Kind: EndpointStaticOnly, ResolvedCandidates: []string{"https://example.com/api/preEXPRpost/users"}},
+		{Kind: EndpointRuntimeOnly, ResolvedURL: "https://example.com/runtime/preEXPRpost/orders"},
+		{Kind: EndpointStaticOnly, ResolvedCandidates: []string{"https://example.com/api/EXPR/users"}},
+	}}
+	want := []string{
+		"https://example.com/api/preEXPRpost/users",
+		"https://example.com/runtime/preEXPRpost/orders",
+	}
+	got := EndpointURLs(report, nil)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs() = %v, want concrete EXPR substrings retained as %v", got, want)
+	}
+
+	dir := t.TempDir()
+	if err := WriteEndpointURLs(dir, got); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "endpoints.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFile := strings.Join(want, "\n") + "\n"
+	if string(data) != wantFile {
+		t.Fatalf("endpoints.txt = %q, want %q", data, wantFile)
+	}
+}
+
+func TestEndpointURLsResolvesRelativeStaticOnlyWithinOwnSourceEntry(t *testing.T) {
+	firstEntry := "https://first.example/app/page"
+	secondEntry := "https://second.example/root/page"
+	session := NewSession()
+	session.AddStatic([]StaticEndpoint{
+		{RawURL: "./api/first", Method: "GET", SourceIdentity: SourceIdentity{EntryURL: firstEntry}},
+		{RawURL: "./api/second", Method: "GET", SourceIdentity: SourceIdentity{EntryURL: secondEntry}},
+	})
+	got := EndpointURLs(session.Report(), []string{firstEntry, secondEntry})
+	want := []string{
+		"https://first.example/app/api/first",
+		"https://second.example/root/api/second",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs() = %v, want provenance-isolated %v", got, want)
+	}
+}
+
+func TestEndpointURLsUsesOwnEntrySchemeForProtocolRelativeStatic(t *testing.T) {
+	entry := "http://first.example/app/"
+	session := NewSession()
+	session.AddStatic([]StaticEndpoint{{
+		RawURL: "//api.example/users", Method: "GET",
+		SourceIdentity: SourceIdentity{EntryURL: entry},
+	}})
+	got := EndpointURLs(session.Report(), []string{entry, "https://second.example/"})
+	want := []string{"http://api.example/users"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("EndpointURLs() = %v, want own-entry scheme %v", got, want)
+	}
+}
+
+func TestReportAndEndpointFilePreserveRawFullQueryValues(t *testing.T) {
+	longValue := strings.Repeat("x", MaxParameterValueBytes+73)
+	rawURL := "https://example.com/api/users?access_token=top-secret&query=" + longValue
+	report := BuildReport(nil, []RuntimeRequest{{
+		RequestID: "runtime", URL: rawURL, Method: "GET", ResourceType: "Fetch",
+		QueryParams: []Parameter{
+			{Name: "access_token", Value: "top-secret"},
+			{Name: "query", Value: longValue},
+		},
+	}})
+	if report.RuntimeRequests[0].URL != rawURL || report.Endpoints[0].ResolvedURL != rawURL {
+		t.Fatalf("report URLs = %q / %q, want %q", report.RuntimeRequests[0].URL, report.Endpoints[0].ResolvedURL, rawURL)
+	}
+	if valueFor(report.RuntimeRequests[0].QueryParams, "query") != longValue {
+		t.Fatalf("report query params = %+v, want full value", report.RuntimeRequests[0].QueryParams)
+	}
+	urls := EndpointURLs(report, nil)
+	if !reflect.DeepEqual(urls, []string{rawURL}) {
+		t.Fatalf("EndpointURLs() = %v, want raw URL", urls)
+	}
+	dir := t.TempDir()
+	if err := WriteEndpointURLs(dir, urls); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "endpoints.txt"))
+	if err != nil || string(data) != rawURL+"\n" {
+		t.Fatalf("endpoints.txt = %q, error = %v", data, err)
 	}
 }
 

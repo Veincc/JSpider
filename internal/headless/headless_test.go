@@ -2,7 +2,9 @@ package headless
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -15,8 +17,11 @@ import (
 
 func TestInitializeBrowserAllocatesBeforeUsingSetupTimeout(t *testing.T) {
 	type contextKey struct{}
-	browserCtx := context.WithValue(context.Background(), contextKey{}, "browser")
+	baseCtx := context.WithValue(context.Background(), contextKey{}, "browser")
+	browserCtx, browserCancel := context.WithCancel(baseCtx)
+	defer browserCancel()
 	action := chromedp.ActionFunc(func(context.Context) error { return nil })
+	cutoff := time.Now().Add(time.Second)
 
 	var calls []context.Context
 	runner := func(ctx context.Context, actions ...chromedp.Action) error {
@@ -33,8 +38,12 @@ func TestInitializeBrowserAllocatesBeforeUsingSetupTimeout(t *testing.T) {
 			if ctx == browserCtx {
 				t.Fatal("domain setup did not use a bounded child context")
 			}
-			if _, ok := ctx.Deadline(); !ok {
+			deadline, ok := ctx.Deadline()
+			if !ok {
 				t.Fatal("domain setup context has no deadline")
+			}
+			if !deadline.Equal(cutoff) {
+				t.Fatalf("domain setup deadline = %s, want absolute cutoff %s", deadline, cutoff)
 			}
 			if len(actions) != 1 {
 				t.Fatalf("domain setup actions = %d, want 1", len(actions))
@@ -43,11 +52,111 @@ func TestInitializeBrowserAllocatesBeforeUsingSetupTimeout(t *testing.T) {
 		return nil
 	}
 
-	if err := initializeBrowser(browserCtx, time.Second, []chromedp.Action{action}, runner); err != nil {
+	if err := initializeBrowser(browserCtx, browserCancel, cutoff, []chromedp.Action{action}, runner); err != nil {
 		t.Fatalf("initializeBrowser() error = %v", err)
 	}
 	if len(calls) != 2 {
 		t.Fatalf("runner calls = %d, want 2", len(calls))
+	}
+}
+
+func TestHeadlessExternalAndClickablePolicyUsesCanonicalOrigin(t *testing.T) {
+	cfg := &Config{EntryURL: "https://example.com/start", SameOrigin: true}
+	canonicalURL := "HTTPS://EXAMPLE.com:443/app.js"
+	nonDefaultURL := "https://example.com:444/app.js"
+
+	if !isAllowedByPolicy(canonicalURL, cfg) {
+		t.Fatal("canonical same-origin JavaScript classified as external")
+	}
+	if isAllowedByPolicy(nonDefaultURL, cfg) {
+		t.Fatal("non-default-port JavaScript classified as same-origin")
+	}
+	if shouldSkipClickableHref(canonicalURL, cfg.EntryURL) {
+		t.Fatal("canonical same-origin link was skipped")
+	}
+	if !shouldSkipClickableHref(nonDefaultURL, cfg.EntryURL) {
+		t.Fatal("non-default-port link was treated as internal")
+	}
+	if shouldSkipClickableHref("//EXAMPLE.com:443/next", "HTTPS://example.com/start") {
+		t.Fatal("protocol-relative canonical link with uppercase entry scheme was skipped")
+	}
+
+	cdnCfg := &Config{
+		EntryURL: "https://example.com/start", SameOrigin: true, AllowCDN: []string{"cdn.example"},
+	}
+	if isAllowedByPolicy("ftp://cdn.example/app.js", cdnCfg) {
+		t.Fatal("non-HTTP CDN JavaScript was allowed")
+	}
+	if isAllowedByPolicy("https://cdn.example:/app.js", cdnCfg) {
+		t.Fatal("invalid-port CDN JavaScript was allowed")
+	}
+}
+
+func TestHeadlessMappedIPv6DoesNotCollapseToIPv4Origin(t *testing.T) {
+	ipv4Cfg := &Config{EntryURL: "https://192.0.2.1/start", SameOrigin: true}
+	mappedURL := "https://[::ffff:192.0.2.1]/app.js"
+	if isAllowedByPolicy(mappedURL, ipv4Cfg) {
+		t.Fatal("IPv4-mapped IPv6 JavaScript was allowed for IPv4 entry origin")
+	}
+	if !shouldSkipClickableHref(mappedURL, ipv4Cfg.EntryURL) {
+		t.Fatal("IPv4-mapped IPv6 link was treated as an IPv4-origin link")
+	}
+
+	mappedCfg := &Config{EntryURL: "https://[::ffff:192.0.2.1]/start", SameOrigin: true}
+	equivalentURL := "https://[::ffff:c000:201]/app.js"
+	if !isAllowedByPolicy(equivalentURL, mappedCfg) {
+		t.Fatal("equivalent IPv4-mapped IPv6 JavaScript was classified as external")
+	}
+	if shouldSkipClickableHref(equivalentURL, mappedCfg.EntryURL) {
+		t.Fatal("equivalent IPv4-mapped IPv6 link was skipped")
+	}
+}
+
+func TestInitializeBrowserCancelsLaunchAtAbsoluteCutoff(t *testing.T) {
+	browserCtx, browserCancel := context.WithCancel(context.Background())
+	defer browserCancel()
+	cutoff := time.Now().Add(20 * time.Millisecond)
+	runnerDone := make(chan struct{})
+	runner := func(ctx context.Context, _ ...chromedp.Action) error {
+		defer close(runnerDone)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	started := time.Now()
+	err := initializeBrowser(browserCtx, browserCancel, cutoff, nil, runner)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("initializeBrowser() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("browser launch exceeded bounded cutoff: %s", elapsed)
+	}
+	select {
+	case <-runnerDone:
+	case <-time.After(time.Second):
+		t.Fatal("browser runner remained blocked after launch cutoff")
+	}
+}
+
+func TestPhaseContextUsesAbsoluteDeadline(t *testing.T) {
+	cutoff := time.Now().Add(time.Second)
+	ctx, cancel := phaseContext(context.Background(), cutoff)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok || !deadline.Equal(cutoff) {
+		t.Fatalf("phase context deadline = %s, %v; want %s", deadline, ok, cutoff)
+	}
+}
+
+func TestContextSleepStopsAtDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if err := sleepContext(ctx, time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("sleepContext() error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("context sleep ignored deadline: %s", elapsed)
 	}
 }
 
@@ -61,6 +170,89 @@ func TestCheckBrowserAvailable_NoBrowser(t *testing.T) {
 	if !contains(msg, "Chrome/Chromium") {
 		t.Errorf("Error message should mention Chrome/Chromium: %s", msg)
 	}
+}
+
+func TestFindBrowserPrefersDefaultDiscoveryBeforeSystemPaths(t *testing.T) {
+	calls := make([]string, 0)
+	lookup := func(candidate string) (string, error) {
+		calls = append(calls, candidate)
+		switch candidate {
+		case "default-chrome":
+			return "/path/default-chrome", nil
+		case "/system/chrome":
+			return "/system/chrome", nil
+		default:
+			return "", exec.ErrNotFound
+		}
+	}
+
+	got, err := findBrowserIn([]string{"missing", "default-chrome"}, []string{"/system/chrome"}, lookup)
+	if err != nil || got != "/path/default-chrome" {
+		t.Fatalf("findBrowserIn() = %q, %v", got, err)
+	}
+	if strings.Join(calls, ",") != "missing,default-chrome" {
+		t.Fatalf("lookup order = %v, want default discovery before system paths", calls)
+	}
+}
+
+func TestSystemBrowserCandidatesCoverSupportedChromeAndChromiumPaths(t *testing.T) {
+	tests := []struct {
+		goos string
+		home string
+		want []string
+	}{
+		{goos: "darwin", want: []string{
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+		}},
+		{goos: "linux", want: []string{"/usr/bin/google-chrome", "/usr/bin/chromium", "/snap/bin/chromium"}},
+		{goos: "windows", home: `C:\Users\alice`, want: []string{
+			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+			`C:\Users\alice\AppData\Local\Chromium\Application\chrome.exe`,
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.goos, func(t *testing.T) {
+			got := systemBrowserCandidates(tt.goos, tt.home)
+			for _, want := range tt.want {
+				if !containsString(got, want) {
+					t.Fatalf("systemBrowserCandidates(%q) = %v, missing %q", tt.goos, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildAssetsSortsURLsDeterministically(t *testing.T) {
+	capture := newNetworkCapture()
+	capture.scriptURLs["https://example.com/z.js"] = true
+	capture.jsCTURLs["https://example.com/a.js"] = true
+	capture.xhrURLs["https://example.com/m.js"] = true
+	cfg := &Config{EntryURL: "https://example.com/", SameOrigin: true}
+
+	assets := buildAssets(capture, "", cfg, nil)
+	want := []string{
+		"https://example.com/a.js",
+		"https://example.com/m.js",
+		"https://example.com/z.js",
+	}
+	if len(assets) != len(want) {
+		t.Fatalf("assets = %+v", assets)
+	}
+	for i := range want {
+		if assets[i].URL != want[i] {
+			t.Fatalf("assets[%d].URL = %q, want %q", i, assets[i].URL, want[i])
+		}
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestExtractScriptSrcs(t *testing.T) {
@@ -206,52 +398,21 @@ func TestExtractFromDOM_DoesNotTreatDataSrcAsScriptSrc(t *testing.T) {
 	}
 }
 
-func TestNetworkCaptureWaitForResponseBodies(t *testing.T) {
-	capture := newNetworkCapture()
-	capture.beginResponseBody()
+func TestPhaseCutoffsShareOneAbsoluteOrigin(t *testing.T) {
+	origin := time.Unix(123, 456)
+	cutoffs := newPhaseCutoffs(origin, 20*time.Second)
 
-	done := make(chan struct{})
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		capture.endResponseBody()
-		close(done)
-	}()
-
-	if !capture.waitForResponseBodies(200 * time.Millisecond) {
-		t.Fatal("waitForResponseBodies timed out before pending body completed")
+	if got, want := cutoffs.navigate, origin.Add(10*time.Second); !got.Equal(want) {
+		t.Fatalf("navigate cutoff = %s, want %s", got, want)
 	}
-	<-done
-
-	capture.beginResponseBody()
-	if capture.waitForResponseBodies(1 * time.Millisecond) {
-		t.Fatal("waitForResponseBodies returned true while body was still pending")
+	if got, want := cutoffs.scroll, origin.Add(14*time.Second); !got.Equal(want) {
+		t.Fatalf("scroll cutoff = %s, want %s", got, want)
 	}
-	capture.endResponseBody()
-}
-
-func TestPhaseBudgetReservesFinalResponseBodyDrain(t *testing.T) {
-	deadline := time.Now().Add(5 * time.Second)
-	budget := phaseBudget(deadline, 2*time.Second)
-	if budget <= 0 {
-		t.Fatalf("phaseBudget() = %s, want positive budget", budget)
+	if got, want := cutoffs.click, origin.Add(19*time.Second); !got.Equal(want) {
+		t.Fatalf("click cutoff = %s, want %s", got, want)
 	}
-	if budget > 3*time.Second {
-		t.Fatalf("phaseBudget() = %s, want final drain reserve preserved", budget)
-	}
-	if got := phaseBudget(time.Now().Add(time.Second), 2*time.Second); got != 0 {
-		t.Fatalf("phaseBudget() with only reserve remaining = %s, want 0", got)
-	}
-}
-
-func TestFinalDrainBudgetAllowsShortDrainAfterOperationDeadline(t *testing.T) {
-	if got := finalDrainBudget(context.Background(), time.Now().Add(-time.Second), 2*time.Second); got != 2*time.Second {
-		t.Fatalf("finalDrainBudget() after operation deadline = %s, want 2s", got)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if got := finalDrainBudget(ctx, time.Now().Add(time.Second), 2*time.Second); got != 0 {
-		t.Fatalf("finalDrainBudget() after parent cancellation = %s, want 0", got)
+	if got, want := cutoffs.drain, origin.Add(20*time.Second); !got.Equal(want) {
+		t.Fatalf("drain cutoff = %s, want %s", got, want)
 	}
 }
 
@@ -269,8 +430,13 @@ func TestClickIdleTimeoutIsNonFatalUnlessContextDone(t *testing.T) {
 
 func TestDiscoverWithRuntimeDoesNotMutateCallerConfigDefaults(t *testing.T) {
 	originalCandidates := browserCandidates
+	originalSystemPaths := systemBrowserPaths
 	browserCandidates = []string{"definitely-not-a-real-browser-for-jspider-test"}
-	t.Cleanup(func() { browserCandidates = originalCandidates })
+	systemBrowserPaths = nil
+	t.Cleanup(func() {
+		browserCandidates = originalCandidates
+		systemBrowserPaths = originalSystemPaths
+	})
 
 	log := logging.New(false, t.TempDir())
 	defer log.Close()
@@ -888,19 +1054,20 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 		want   string
 		wantOK bool
 	}{
-		// The original vite.dev bug: bare "assets/chunks/..." resolved against a JS in /assets/chunks/
+		// Bare references use standard directory-relative resolution, including
+		// repeated path segments.
 		{
-			name:   "bare assets/chunks path from within assets/chunks",
+			name:   "bare assets chunks path preserves repeated prefix",
 			base:   "https://vite.dev/assets/chunks/theme.js",
 			raw:    "assets/chunks/client.BFYbw6Gq.js",
-			want:   "https://vite.dev/assets/chunks/client.BFYbw6Gq.js",
+			want:   "https://vite.dev/assets/chunks/assets/chunks/client.BFYbw6Gq.js",
 			wantOK: true,
 		},
 		{
-			name:   "bare chunks/ path from within assets/chunks",
+			name:   "bare chunks path preserves repeated segment",
 			base:   "https://vite.dev/assets/chunks/theme.js",
 			raw:    "chunks/client.BFYbw6Gq.js",
-			want:   "https://vite.dev/assets/chunks/client.BFYbw6Gq.js",
+			want:   "https://vite.dev/assets/chunks/chunks/client.BFYbw6Gq.js",
 			wantOK: true,
 		},
 		{
@@ -949,12 +1116,12 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 			want:   "https://cdn.example.com/lib.js",
 			wantOK: true,
 		},
-		// Deduplication: double assets/chunks
+		// Repeated asset prefixes are not globally rewritten.
 		{
-			name:   "dedup double assets/chunks",
+			name:   "preserve double assets chunks",
 			base:   "https://vite.dev/assets/chunks/theme.js",
 			raw:    "assets/chunks/plugin-vue_export-helper.BDNMzG2s.js",
-			want:   "https://vite.dev/assets/chunks/plugin-vue_export-helper.BDNMzG2s.js",
+			want:   "https://vite.dev/assets/chunks/assets/chunks/plugin-vue_export-helper.BDNMzG2s.js",
 			wantOK: true,
 		},
 		// _nuxt prefix
@@ -962,7 +1129,7 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 			name:   "bare _nuxt path",
 			base:   "https://example.com/_nuxt/entry.js",
 			raw:    "_nuxt/chunks/app.js",
-			want:   "https://example.com/_nuxt/chunks/app.js",
+			want:   "https://example.com/_nuxt/_nuxt/chunks/app.js",
 			wantOK: true,
 		},
 		// _next/static prefix
@@ -970,7 +1137,7 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 			name:   "bare _next/static path",
 			base:   "https://example.com/_next/static/chunks/app.js",
 			raw:    "_next/static/chunks/pages/index.js",
-			want:   "https://example.com/_next/static/chunks/pages/index.js",
+			want:   "https://example.com/_next/static/chunks/_next/static/chunks/pages/index.js",
 			wantOK: true,
 		},
 		// Empty
@@ -995,15 +1162,15 @@ func TestResolveDiscoveredJSURL(t *testing.T) {
 	}
 }
 
-func TestDeduplicatePathSegments(t *testing.T) {
+func TestDeduplicatePathSegmentsPreservesLegalPaths(t *testing.T) {
 	tests := []struct {
 		input string
 		want  string
 	}{
-		{"https://vite.dev/assets/chunks/assets/chunks/client.js", "https://vite.dev/assets/chunks/client.js"},
-		{"https://example.com/a/b/a/b/c.js", "https://example.com/a/b/c.js"},
+		{"https://vite.dev/assets/chunks/assets/chunks/client.js", "https://vite.dev/assets/chunks/assets/chunks/client.js"},
+		{"https://example.com/a/b/a/b/c.js", "https://example.com/a/b/a/b/c.js"},
 		{"https://example.com/assets/main.js", "https://example.com/assets/main.js"}, // no dup
-		{"https://example.com/a/a/b/b/c.js", "https://example.com/a/b/c.js"},         // consecutive dups collapsed
+		{"https://example.com/a/a/b/b/c.js", "https://example.com/a/a/b/b/c.js"},     // repeated segments are legal
 		{"https://example.com/a/b/c.js", "https://example.com/a/b/c.js"},             // short path
 	}
 	for _, tt := range tests {
@@ -1025,16 +1192,16 @@ func TestCleanDiscoveredJSURL_BuildPrefix(t *testing.T) {
 		want string
 	}{
 		{
-			name: "bare assets/chunks from within assets/chunks",
+			name: "bare assets chunks from within assets chunks",
 			raw:  "assets/chunks/client.js",
 			base: "https://vite.dev/assets/chunks/theme.js",
-			want: "https://vite.dev/assets/chunks/client.js",
+			want: "https://vite.dev/assets/chunks/assets/chunks/client.js",
 		},
 		{
-			name: "bare chunks/ from within assets/chunks",
+			name: "bare chunks from within assets chunks",
 			raw:  "chunks/client.js",
 			base: "https://vite.dev/assets/chunks/theme.js",
-			want: "https://vite.dev/assets/chunks/client.js",
+			want: "https://vite.dev/assets/chunks/chunks/client.js",
 		},
 	}
 	for _, tt := range tests {

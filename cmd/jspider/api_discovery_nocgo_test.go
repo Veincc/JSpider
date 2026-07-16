@@ -11,8 +11,8 @@ func TestRunAPIDiscoveryRequiresCGOBuild(t *testing.T) {
 	cfg := testConfig("https://example.com/", t.TempDir()+"/not-created")
 	cfg.APIDiscovery = true
 
-	err := run(cfg)
+	err := runTest(cfg)
 	if err == nil || !strings.Contains(err.Error(), "CGO-enabled build") {
-		t.Fatalf("run() error = %v", err)
+		t.Fatalf("runTest() error = %v", err)
 	}
 }

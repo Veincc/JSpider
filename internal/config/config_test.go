@@ -1,9 +1,13 @@
 package config
 
 import (
+	"flag"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -28,10 +32,15 @@ func TestNormalizeURL(t *testing.T) {
 		{"127.0.0.1 without port adds https", "127.0.0.1", "https://127.0.0.1"},
 		{"127.0.0.1 with port adds https", "127.0.0.1:8080", "https://127.0.0.1:8080"},
 		{"192.168.1.1 with port adds https", "192.168.1.1:8080/path", "https://192.168.1.1:8080/path"},
+		{"IPv6 with port adds https", "[2001:db8::1]:8080/path", "https://[2001:db8::1]:8080/path"},
+		{"colon in path adds https", "example.com/path:segment", "https://example.com/path:segment"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeURL(tt.input)
+			got, err := normalizeURL(tt.input)
+			if err != nil {
+				t.Fatalf("normalizeURL(%q) error = %v", tt.input, err)
+			}
 			if got != tt.want {
 				t.Errorf("normalizeURL(%q) = %q, want %q", tt.input, got, tt.want)
 			}
@@ -44,7 +53,10 @@ func TestURLs_Dedup(t *testing.T) {
 		URL: "example.com",
 	}
 	// example.com normalizes to https://example.com
-	urls := cfg.URLs()
+	urls, err := cfg.URLs()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(urls) != 1 {
 		t.Fatalf("expected 1 URL, got %d: %v", len(urls), urls)
 	}
@@ -66,7 +78,10 @@ func TestURLs_DedupAcrossSources(t *testing.T) {
 		URL:     "example.com", // After normalization == https://example.com
 		URLList: listFile,
 	}
-	urls := cfg.URLs()
+	urls, err := cfg.URLs()
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Expected: https://example.com (deduplicated), https://other.com
 	expected := []string{"https://example.com", "https://other.com"}
 	if !reflect.DeepEqual(urls, expected) {
@@ -90,7 +105,10 @@ mailto:x@y.com
 		t.Fatal(err)
 	}
 
-	raw := readURLList(listFile)
+	raw, err := readURLList(listFile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// readURLList only filters blank lines/comments, does not normalize schemes
 	expected := []string{
 		"https://a.com",
@@ -151,6 +169,223 @@ func TestDefaultLimits(t *testing.T) {
 	}
 	if DefaultMaxSizeMB != 0 {
 		t.Fatalf("DefaultMaxSizeMB = %d, want 0", DefaultMaxSizeMB)
+	}
+	if DefaultProcessTimeoutSeconds != 30 {
+		t.Fatalf("DefaultProcessTimeoutSeconds = %d, want 30", DefaultProcessTimeoutSeconds)
+	}
+	if DefaultHeadlessBodyMB != 8 {
+		t.Fatalf("DefaultHeadlessBodyMB = %d, want 8", DefaultHeadlessBodyMB)
+	}
+}
+
+func TestParseProcessAndHeadlessBodyDefaults(t *testing.T) {
+	originalFlags, originalArgs := flag.CommandLine, os.Args
+	flag.CommandLine = flag.NewFlagSet("jspider-test", flag.ContinueOnError)
+	os.Args = []string{"jspider", "-u", "https://example.com"}
+	t.Cleanup(func() {
+		flag.CommandLine = originalFlags
+		os.Args = originalArgs
+	})
+
+	cfg := Parse()
+	if cfg.ProcessTimeoutSeconds != 30 {
+		t.Fatalf("ProcessTimeoutSeconds = %d, want 30", cfg.ProcessTimeoutSeconds)
+	}
+	if cfg.HeadlessBodyMB != 8 {
+		t.Fatalf("HeadlessBodyMB = %d, want 8", cfg.HeadlessBodyMB)
+	}
+}
+
+func TestParseProcessAndHeadlessBodyOverrides(t *testing.T) {
+	originalFlags, originalArgs := flag.CommandLine, os.Args
+	flag.CommandLine = flag.NewFlagSet("jspider-test", flag.ContinueOnError)
+	os.Args = []string{"jspider", "-u", "https://example.com", "--process-timeout", "45", "--headless-body-mb", "12"}
+	t.Cleanup(func() {
+		flag.CommandLine = originalFlags
+		os.Args = originalArgs
+	})
+
+	cfg := Parse()
+	if cfg.ProcessTimeoutSeconds != 45 || cfg.HeadlessBodyMB != 12 {
+		t.Fatalf("parsed limits = process %d, headless body %d", cfg.ProcessTimeoutSeconds, cfg.HeadlessBodyMB)
+	}
+}
+
+func TestDepthFlagDocumentsZeroAsNoRecursion(t *testing.T) {
+	originalFlags, originalArgs := flag.CommandLine, os.Args
+	flag.CommandLine = flag.NewFlagSet("jspider-test", flag.ContinueOnError)
+	os.Args = []string{"jspider", "-u", "https://example.com"}
+	t.Cleanup(func() {
+		flag.CommandLine = originalFlags
+		os.Args = originalArgs
+	})
+
+	_ = Parse()
+	depthFlag := flag.Lookup("d")
+	if depthFlag == nil || !strings.Contains(depthFlag.Usage, "0=no recursion") {
+		t.Fatalf("-d usage = %v, want 0=no recursion", depthFlag)
+	}
+}
+
+func TestUsageDocumentsBehaviorAndLimits(t *testing.T) {
+	originalFlags, originalArgs, originalStderr := flag.CommandLine, os.Args, os.Stderr
+	flag.CommandLine = flag.NewFlagSet("jspider-test", flag.ContinueOnError)
+	os.Args = []string{"jspider", "-u", "https://example.com"}
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	os.Stderr = writePipe
+	t.Cleanup(func() {
+		flag.CommandLine = originalFlags
+		os.Args = originalArgs
+		os.Stderr = originalStderr
+		_ = readPipe.Close()
+		_ = writePipe.Close()
+	})
+
+	_ = Parse()
+	flag.Usage()
+	if err := writePipe.Close(); err != nil {
+		t.Fatalf("close usage writer: %v", err)
+	}
+	usageBytes, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatalf("read usage: %v", err)
+	}
+	usage := string(usageBytes)
+
+	for name, want := range map[string]string{
+		"depth zero":              "-d 0 fetches entry-discovered JavaScript but does not recurse",
+		"fetch attempts":          "-n limits fetch attempts per canonical origin; failures count, entry HTML does not",
+		"API entry attempts":      "API Discovery may refetch a shared script once per entry; every attempt counts against the canonical-origin -n budget",
+		"API request body bound":  "API request-body capture admits 4 active and 4 queued CDP reads; parsing is capped at 1 MiB per body",
+		"processing cancellation": "starts before source-map scanning and propagates caller cancellation",
+		"source map timeout":      "adjacent .map probing has a 3-second sub-deadline",
+		"source map input cap":    "Decoded source-map input is capped at 128 MiB",
+		"source recovery caps":    "recovered output remains capped at 512 files and 64 MiB",
+		"absolute deadlines":      "absolute deadlines: navigation 50%, scrolling 70%, click/DOM 95%, body drain 100%",
+		"CDP allocation":          "Chrome/CDP may fully materialize a response before the cap is applied",
+		"origin output names":     "Canonical-origin output names include non-default ports",
+		"name collisions":         "collisions add an eight-hex-character SHA-256 suffix",
+		"partial failures":        "continue but produce an aggregate nonzero exit",
+		"source map complete":     "Complete source-map recovery analyzes recovered sources only",
+		"source map fallback":     "incomplete or capped recovery analyzes the original bundle only",
+	} {
+		if !strings.Contains(usage, want) {
+			t.Errorf("usage missing %s contract %q\nusage:\n%s", name, want, usage)
+		}
+	}
+}
+
+func TestValidateRejectsImpossibleValues(t *testing.T) {
+	valid := Config{
+		URL:                   "https://example.com",
+		OutDir:                "output",
+		MaxJS:                 0,
+		MaxDepth:              0,
+		MaxSizeMB:             0,
+		Workers:               1,
+		Timeout:               1,
+		ProcessTimeoutSeconds: 1,
+		HeadlessBodyMB:        1,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{name: "missing URL input", mutate: func(c *Config) { c.URL = "" }, want: "URL"},
+		{name: "empty output directory", mutate: func(c *Config) { c.OutDir = "" }, want: "output"},
+		{name: "zero workers", mutate: func(c *Config) { c.Workers = 0 }, want: "workers"},
+		{name: "negative workers", mutate: func(c *Config) { c.Workers = -1 }, want: "workers"},
+		{name: "negative depth", mutate: func(c *Config) { c.MaxDepth = -1 }, want: "depth"},
+		{name: "negative JavaScript limit", mutate: func(c *Config) { c.MaxJS = -1 }, want: "JavaScript"},
+		{name: "negative size limit", mutate: func(c *Config) { c.MaxSizeMB = -1 }, want: "size"},
+		{name: "zero HTTP timeout", mutate: func(c *Config) { c.Timeout = 0 }, want: "HTTP timeout"},
+		{name: "zero process timeout", mutate: func(c *Config) { c.ProcessTimeoutSeconds = 0 }, want: "process timeout"},
+		{name: "zero headless body limit", mutate: func(c *Config) { c.HeadlessBodyMB = 0 }, want: "headless body"},
+		{name: "invalid proxy", mutate: func(c *Config) { c.Proxy = "ftp://proxy.example" }, want: "proxy"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tt.want)) {
+				t.Fatalf("Validate() error = %v, want containing %q", err, tt.want)
+			}
+		})
+	}
+
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid Config rejected: %v", err)
+	}
+}
+
+func TestValidateRejectsMiBToByteOverflow(t *testing.T) {
+	tooLarge := int64(math.MaxInt64/(1024*1024)) + 1
+	if tooLarge > int64(math.MaxInt) {
+		t.Skip("platform int cannot represent an overflowing MiB value")
+	}
+	valid := Config{
+		URL: "https://example.com", OutDir: "output", Workers: 1, Timeout: 1,
+		ProcessTimeoutSeconds: 1, HeadlessBodyMB: 1,
+	}
+	for _, field := range []string{"download", "headless"} {
+		cfg := valid
+		if field == "download" {
+			cfg.MaxSizeMB = int(tooLarge)
+		} else {
+			cfg.HeadlessBodyMB = int(tooLarge)
+		}
+		if err := cfg.Validate(); err == nil || !strings.Contains(strings.ToLower(err.Error()), "too large") {
+			t.Fatalf("%s MiB overflow validation error = %v, want too large", field, err)
+		}
+	}
+}
+
+func TestURLsReturnsFileAndScannerErrors(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		cfg := &Config{URLList: filepath.Join(t.TempDir(), "missing.txt")}
+		if _, err := cfg.URLs(); err == nil {
+			t.Fatal("URLs() returned no error for a missing file")
+		}
+	})
+
+	t.Run("scanner limit", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "too-long.txt")
+		if err := os.WriteFile(path, []byte(strings.Repeat("a", 1024*1024+1)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg := &Config{URLList: path}
+		if _, err := cfg.URLs(); err == nil {
+			t.Fatal("URLs() returned no scanner error for an oversized line")
+		}
+	})
+}
+
+func TestURLsReturnsHTTPParseErrors(t *testing.T) {
+	for _, raw := range []string{
+		"http://",
+		"https://example.com:invalid",
+		"https://\u200d.example",
+		"https://\u00ad",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			cfg := &Config{URL: raw}
+			if _, err := cfg.URLs(); err == nil {
+				t.Fatalf("URLs() returned no error for %q", raw)
+			}
+		})
+	}
+}
+
+func TestURLsRejectsAnInputSetWithNoHTTPEntries(t *testing.T) {
+	cfg := &Config{URL: "mailto:test@example.com"}
+	if _, err := cfg.URLs(); err == nil {
+		t.Fatal("URLs() returned no error after filtering every input")
 	}
 }
 

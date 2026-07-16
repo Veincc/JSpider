@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: Test and build (CGO=${{ matrix.cgo }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cgo: ["0", "1"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: go test -count=1 ./...
+      - name: Build
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+        run: go build ./...
+
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        env:
+          CGO_ENABLED: "1"
+        run: go vet ./...
+      - name: Race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./...
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: HTML parser
+        run: go test ./internal/html -run '^$' -fuzz '^FuzzExtractEntryJS$' -fuzztime=250000x
+      - name: URL resolution and canonicalization
+        run: go test ./internal/urlutil -run '^$' -fuzz '^FuzzResolveAndCanonicalOrigin$' -fuzztime=250000x
+      - name: Source-map parser
+        run: go test ./internal/preprocess -run '^$' -fuzz '^FuzzParseApplicationSourceMap$' -fuzztime=250000x
+      - name: API request parser
+        env:
+          CGO_ENABLED: "1"
+        run: go test ./internal/apidiscovery -run '^$' -fuzz '^FuzzParseRequestData$' -fuzztime=250000x

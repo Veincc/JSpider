@@ -12,6 +12,8 @@ import (
 var (
 	// import("...") / import('...') / import(`...`)
 	dynamicImportRe = regexp.MustCompile(`import\s*\(\s*(?:"([^"]+)"|'([^']+)'|` + "`" + `([^` + "`" + `]+)` + "`" + `)\s*\)`)
+	staticImportRe  = regexp.MustCompile(`(?m)\bimport\s+(?:[^;"']*?\s+from\s*)?["']([^"']+)["']`)
+	staticExportRe  = regexp.MustCompile(`(?m)\bexport\s+(?:\*(?:\s+as\s+[$\w]+)?|\{[^}]*\})\s+from\s*["']([^"']+)["']`)
 
 	// sourceMappingURL
 	sourceMappingURLRe = regexp.MustCompile(`(?m)(?://|/\*)[#@]\s*sourceMappingURL\s*=\s*(\S+?)(?:\s*\*/)?$`)
@@ -123,6 +125,31 @@ func (r *RegexAnalyzer) ExtractDynamicImports(jsContent string, fromJS string, f
 		imports = append(imports, imp)
 	}
 
+	return imports
+}
+
+// ExtractStaticImports is a conservative fallback for import declarations and
+// re-exports when the JavaScript parser cannot build an AST.
+func (r *RegexAnalyzer) ExtractStaticImports(jsContent string, fromJS string, framework string) []DynamicImport {
+	var imports []DynamicImport
+	for _, pattern := range []*regexp.Regexp{staticImportRe, staticExportRe} {
+		for _, match := range pattern.FindAllStringSubmatch(jsContent, -1) {
+			raw := match[1]
+			resolvedURL := resolveImportURL(raw, fromJS)
+			confidence := ConfHigh
+			if resolvedURL == "" {
+				confidence = ConfMedium
+			}
+			imports = append(imports, DynamicImport{
+				FromJS:      fromJS,
+				Raw:         raw,
+				ResolvedURL: resolvedURL,
+				Framework:   framework,
+				Source:      SourceImportExpr,
+				Confidence:  confidence,
+			})
+		}
+	}
 	return imports
 }
 

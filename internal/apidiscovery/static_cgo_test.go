@@ -36,8 +36,8 @@ func TestAnalyzeJavaScriptWithJsluice(t *testing.T) {
 	if post.SourceJSURL != "https://example.com/assets/app.js" || post.Type != "$.post" || post.Source == "" {
 		t.Fatalf("POST metadata = %+v", post)
 	}
-	if containsSecret(post.Source) || strings.Contains(post.Source, "api-secret") {
-		t.Fatalf("POST source leaked a sensitive value: %q", post.Source)
+	if !containsSecret(post.Source) || !strings.Contains(post.Source, "api-secret") {
+		t.Fatalf("POST source did not preserve original values: %q", post.Source)
 	}
 }
 

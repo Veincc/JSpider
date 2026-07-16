@@ -63,6 +63,30 @@ func TestIsSameOrigin(t *testing.T) {
 	}
 }
 
+func TestIsSameOriginUsesCanonicalHTTPOrigin(t *testing.T) {
+	tests := []struct {
+		left  string
+		right string
+		want  bool
+	}{
+		{"https://EXAMPLE.com:443/a", "https://example.com/b", true},
+		{"http://example.com:80/a", "http://example.com/b", true},
+		{"https://bücher.example/a", "https://xn--bcher-kva.example/b", true},
+		{"http://[2001:0db8::1]:80/a", "http://[2001:db8::1]/b", true},
+		{"http://[::ffff:192.0.2.1]/a", "http://[::ffff:c000:201]/b", true},
+		{"http://[::ffff:192.0.2.1]/a", "http://192.0.2.1/b", false},
+		{"https://example.com:444/a", "https://example.com/b", false},
+		{"http://example.com/a", "https://example.com/a", false},
+		{"ftp://example.com/a", "ftp://example.com/b", false},
+		{"%zz", "https://example.com/b", false},
+	}
+	for _, test := range tests {
+		if got := IsSameOrigin(test.left, test.right); got != test.want {
+			t.Errorf("IsSameOrigin(%q, %q) = %v, want %v", test.left, test.right, got, test.want)
+		}
+	}
+}
+
 func TestGetOriginRequiresSchemeAndHost(t *testing.T) {
 	tests := []struct {
 		raw  string
@@ -70,6 +94,13 @@ func TestGetOriginRequiresSchemeAndHost(t *testing.T) {
 	}{
 		{"https://example.com/path", "https://example.com"},
 		{"http://example.com:8080/path", "http://example.com:8080"},
+		{"https://EXAMPLE.com:443/path", "https://example.com"},
+		{"http://EXAMPLE.com:80/path", "http://example.com"},
+		{"https://bücher.example/path", "https://xn--bcher-kva.example"},
+		{"http://[2001:0db8::1]:80/path", "http://[2001:db8::1]"},
+		{"http://[::ffff:192.0.2.1]/path", "http://[::ffff:192.0.2.1]"},
+		{"ftp://example.com/path", ""},
+		{"%zz", ""},
 		{"/relative/path", ""},
 		{"", ""},
 	}
@@ -107,8 +138,17 @@ func TestIsAllowedDomain(t *testing.T) {
 	}{
 		{"https://example.com/a.js", "https://example.com/", nil, true},
 		{"https://cdn.example.com/a.js", "https://example.com/", []string{"cdn.example.com"}, true},
+		{"https://cdn.example.com/a.js", "https://example.com/", []string{"cdn.example.com:8443"}, true},
 		{"https://other.com/a.js", "https://example.com/", nil, false},
 		{"https://sub.cdn.com/a.js", "https://example.com/", []string{"cdn.com"}, true},
+		{"https://bücher.example/a.js", "https://example.com/", []string{"bücher.example"}, true},
+		{"https://xn--bcher-kva.example/a.js", "https://example.com/", []string{"bücher.example"}, true},
+		{"https://assets.bücher.example/a.js", "https://example.com/", []string{"bücher.example"}, true},
+		{"https://assets.xn--bcher-kva.example/a.js", "https://example.com/", []string{"https://BÜCHER.example:8443/"}, true},
+		{"https://[::ffff:192.0.2.1]/a.js", "https://example.com/", []string{"https://[::ffff:c000:201]:8443/"}, true},
+		{"https://[::ffff:192.0.2.1]/a.js", "https://example.com/", []string{"192.0.2.1"}, false},
+		{"ftp://cdn.example.com/a.js", "https://example.com/", []string{"cdn.example.com"}, false},
+		{"https://cdn.example.com:/a.js", "https://example.com/", []string{"cdn.example.com"}, false},
 	}
 	for _, tt := range tests {
 		got := IsAllowedDomain(tt.url, tt.allowed, tt.sameOrigin)
@@ -186,12 +226,12 @@ func TestResolveJS(t *testing.T) {
 		raw  string
 		want string
 	}{
-		// The Vite bug: bare "assets/chunks/..." resolved from within /assets/chunks/
+		// Bare paths use ordinary directory-relative URL semantics.
 		{
-			name: "bare assets/chunks from within assets/chunks",
+			name: "bare assets/chunks from within assets/chunks preserves both prefixes",
 			base: "https://vite.dev/assets/chunks/theme.js",
 			raw:  "assets/chunks/client.BFYbw6Gq.js",
-			want: "https://vite.dev/assets/chunks/client.BFYbw6Gq.js",
+			want: "https://vite.dev/assets/chunks/assets/chunks/client.BFYbw6Gq.js",
 		},
 		// Bare "chunks/..." from /assets/app.js
 		{
@@ -200,12 +240,12 @@ func TestResolveJS(t *testing.T) {
 			raw:  "chunks/client.js",
 			want: "https://vite.dev/assets/chunks/client.js",
 		},
-		// Bare "chunks/..." from /assets/chunks/theme.js — should NOT double
+		// Repeated segments are legal and must not be collapsed.
 		{
-			name: "bare chunks/ from assets/chunks/ — no double",
+			name: "bare chunks from assets chunks preserves repeat",
 			base: "https://vite.dev/assets/chunks/theme.js",
 			raw:  "chunks/client.js",
-			want: "https://vite.dev/assets/chunks/client.js",
+			want: "https://vite.dev/assets/chunks/chunks/client.js",
 		},
 		// Absolute path — resolve from origin
 		{
@@ -242,26 +282,26 @@ func TestResolveJS(t *testing.T) {
 			raw:  "//cdn.example.com/lib.js",
 			want: "https://cdn.example.com/lib.js",
 		},
-		// Dedup: double assets/chunks in already-resolved URL
+		// Explicit relative references also preserve repeated prefixes.
 		{
-			name: "dedup double assets/chunks in resolved URL",
+			name: "preserve double assets chunks in resolved URL",
 			base: "https://vite.dev/assets/chunks/theme.js",
 			raw:  "./assets/chunks/client.js",
-			want: "https://vite.dev/assets/chunks/client.js",
+			want: "https://vite.dev/assets/chunks/assets/chunks/client.js",
 		},
 		// _nuxt prefix
 		{
 			name: "bare _nuxt path",
 			base: "https://example.com/_nuxt/entry.js",
 			raw:  "_nuxt/chunks/app.js",
-			want: "https://example.com/_nuxt/chunks/app.js",
+			want: "https://example.com/_nuxt/_nuxt/chunks/app.js",
 		},
 		// _next/static prefix
 		{
 			name: "bare _next/static path",
 			base: "https://example.com/_next/static/chunks/app.js",
 			raw:  "_next/static/chunks/pages/index.js",
-			want: "https://example.com/_next/static/chunks/pages/index.js",
+			want: "https://example.com/_next/static/chunks/_next/static/chunks/pages/index.js",
 		},
 		// Empty
 		{
@@ -285,19 +325,33 @@ func TestResolveJS(t *testing.T) {
 	}
 }
 
-func TestDeduplicatePathSegments(t *testing.T) {
+func TestResolveJSPreservesLegalAdjacentPathSegments(t *testing.T) {
+	got, err := ResolveJS(
+		"https://example.com/releases/releases/main.js",
+		"./chunks/chunks/app.js",
+	)
+	if err != nil {
+		t.Fatalf("ResolveJS() error = %v", err)
+	}
+	want := "https://example.com/releases/releases/chunks/chunks/app.js"
+	if got != want {
+		t.Fatalf("ResolveJS() = %q, want legal path %q", got, want)
+	}
+}
+
+func TestDeduplicatePathSegmentsPreservesInput(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
 		want  string
 	}{
-		{"double assets/chunks", "https://vite.dev/assets/chunks/assets/chunks/client.js", "https://vite.dev/assets/chunks/client.js"},
-		{"triple chunk", "https://example.com/a/b/a/b/a/b/c.js", "https://example.com/a/b/c.js"},
+		{"double assets/chunks", "https://vite.dev/assets/chunks/assets/chunks/client.js", "https://vite.dev/assets/chunks/assets/chunks/client.js"},
+		{"triple chunk", "https://example.com/a/b/a/b/a/b/c.js", "https://example.com/a/b/a/b/a/b/c.js"},
 		{"no dup", "https://example.com/assets/main.js", "https://example.com/assets/main.js"},
-		{"adjacent dup", "https://example.com/a/a/b/b/c.js", "https://example.com/a/b/c.js"},
+		{"adjacent dup", "https://example.com/a/a/b/b/c.js", "https://example.com/a/a/b/b/c.js"},
 		{"short path", "https://example.com/a/b/c.js", "https://example.com/a/b/c.js"},
-		{"_next/static dup", "https://example.com/_next/static/_next/static/chunks/a.js", "https://example.com/_next/static/chunks/a.js"},
-		{"chunks/chunks", "https://vite.dev/assets/chunks/chunks/client.js", "https://vite.dev/assets/chunks/client.js"},
+		{"_next/static dup", "https://example.com/_next/static/_next/static/chunks/a.js", "https://example.com/_next/static/_next/static/chunks/a.js"},
+		{"chunks/chunks", "https://vite.dev/assets/chunks/chunks/client.js", "https://vite.dev/assets/chunks/chunks/client.js"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

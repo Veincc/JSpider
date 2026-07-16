@@ -2,14 +2,19 @@ package fetcher
 
 import (
 	"compress/gzip"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Veincc/JSpider/internal/config"
 	"github.com/Veincc/JSpider/internal/logging"
@@ -32,7 +37,214 @@ func newTestFetcher(t *testing.T, ts *httptest.Server) *Fetcher {
 	return f
 }
 
-func TestFetch_CacheHit(t *testing.T) {
+func TestShouldSendCookiesUsesCanonicalOrigin(t *testing.T) {
+	if !shouldSendCookies("https://EXAMPLE.com:443/app.js", "https://example.com/") {
+		t.Fatal("canonical same-origin request lost cookies")
+	}
+	if shouldSendCookies("https://example.com:444/app.js", "https://example.com/") {
+		t.Fatal("non-default port received same-origin cookies")
+	}
+	if shouldSendCookies("https://[::ffff:192.0.2.1]/app.js", "https://192.0.2.1/") {
+		t.Fatal("IPv4-mapped IPv6 request received IPv4-origin cookies")
+	}
+	if !shouldSendCookies("https://[::ffff:c000:201]/app.js", "https://[::ffff:192.0.2.1]/") {
+		t.Fatal("equivalent IPv4-mapped IPv6 request lost cookies")
+	}
+}
+
+func TestRedirectPolicyUsesCanonicalOrigin(t *testing.T) {
+	checker := redirectChecker(&config.Config{SameOrigin: true})
+	entryURL := "https://example.com/start"
+
+	canonicalTarget, err := http.NewRequestWithContext(
+		context.WithValue(context.Background(), redirectPolicyKey{}, entryURL),
+		http.MethodGet,
+		"https://EXAMPLE.com:443/next",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(canonicalTarget, nil); err != nil {
+		t.Fatalf("canonical same-origin redirect rejected: %v", err)
+	}
+
+	nonDefaultTarget, err := http.NewRequestWithContext(
+		context.WithValue(context.Background(), redirectPolicyKey{}, entryURL),
+		http.MethodGet,
+		"https://example.com:444/next",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(nonDefaultTarget, nil); err == nil {
+		t.Fatal("non-default-port redirect accepted as same-origin")
+	}
+
+	mappedTarget, err := http.NewRequestWithContext(
+		context.WithValue(context.Background(), redirectPolicyKey{}, "https://192.0.2.1/start"),
+		http.MethodGet,
+		"https://[::ffff:192.0.2.1]/next",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(mappedTarget, nil); err == nil {
+		t.Fatal("IPv4-mapped IPv6 redirect accepted for IPv4 entry origin")
+	}
+
+	equivalentMappedTarget, err := http.NewRequestWithContext(
+		context.WithValue(context.Background(), redirectPolicyKey{}, "https://[::ffff:192.0.2.1]/start"),
+		http.MethodGet,
+		"https://[::ffff:c000:201]/next",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(equivalentMappedTarget, nil); err != nil {
+		t.Fatalf("equivalent IPv4-mapped IPv6 redirect rejected: %v", err)
+	}
+}
+
+func TestRedirectCanonicalPolicyRejectsInvalidAllowedCDNOrigin(t *testing.T) {
+	checker := redirectChecker(&config.Config{SameOrigin: true, AllowCDN: []string{"cdn.example"}})
+	entryContext := context.WithValue(context.Background(), redirectPolicyKey{}, "https://example.com/start")
+
+	ftpTarget, err := http.NewRequestWithContext(entryContext, http.MethodGet, "ftp://cdn.example/next", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checker(ftpTarget, nil); err == nil {
+		t.Fatal("non-HTTP CDN redirect accepted")
+	}
+
+	invalidPortTarget := (&http.Request{
+		Method: http.MethodGet,
+		URL:    &url.URL{Scheme: "https", Host: "cdn.example:", Path: "/next"},
+	}).WithContext(entryContext)
+	if err := checker(invalidPortTarget, nil); err == nil {
+		t.Fatal("invalid-port CDN redirect accepted")
+	}
+}
+
+func TestFetchRecordsRequestedAndRedirectFinalURLs(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/requested/app.js":
+			http.Redirect(w, r, "/final/nested/app.js", http.StatusFound)
+		case "/final/nested/app.js":
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = io.WriteString(w, `import("./chunk.js");`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	requested := ts.URL + "/requested/app.js"
+	result := f.Fetch(requested)
+
+	if result.Err != nil {
+		t.Fatalf("Fetch() error = %v", result.Err)
+	}
+	if result.RequestedURL != requested {
+		t.Fatalf("RequestedURL = %q, want %q", result.RequestedURL, requested)
+	}
+	if want := ts.URL + "/final/nested/app.js"; result.FinalURL != want {
+		t.Fatalf("FinalURL = %q, want %q", result.FinalURL, want)
+	}
+}
+
+func TestFetchForEntryContextCancelsRequest(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	result := f.FetchForEntryContext(ctx, ts.URL+"/map", ts.URL+"/")
+	if !errors.Is(result.Err, context.DeadlineExceeded) {
+		t.Fatalf("FetchForEntryContext() error = %v", result.Err)
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP request context was not canceled")
+	}
+}
+
+func TestShortSingleflightCallerDoesNotCancelLongCaller(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	requestCanceled := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		select {
+		case <-releaseRequest:
+			_, _ = w.Write([]byte("ok"))
+		case <-r.Context().Done():
+			requestCanceled <- struct{}{}
+		}
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer shortCancel()
+	shortResult := make(chan *Result, 1)
+	go func() {
+		shortResult <- f.FetchForEntryContext(shortCtx, ts.URL+"/map", ts.URL+"/")
+	}()
+	<-requestStarted
+
+	longCtx, longCancel := context.WithTimeout(context.Background(), time.Second)
+	defer longCancel()
+	longResult := make(chan *Result, 1)
+	go func() {
+		longResult <- f.FetchForEntryContext(longCtx, ts.URL+"/map", ts.URL+"/")
+	}()
+
+	short := <-shortResult
+	if !errors.Is(short.Err, context.DeadlineExceeded) {
+		t.Fatalf("short caller error = %v", short.Err)
+	}
+	close(releaseRequest)
+	long := <-longResult
+	if long.Err != nil || string(long.Body) != "ok" {
+		t.Fatalf("long caller result = %+v", long)
+	}
+	select {
+	case <-requestCanceled:
+		t.Fatal("short caller canceled the shared HTTP request")
+	default:
+	}
+}
+
+func TestFetchRecordsRequestedURLWhenRequestCannotBeBuilt(t *testing.T) {
+	f := newTestFetcher(t, nil)
+	const requested = "://invalid"
+	result := f.Fetch(requested)
+
+	if result.Err == nil {
+		t.Fatal("Fetch() error = nil, want malformed URL error")
+	}
+	if result.RequestedURL != requested {
+		t.Fatalf("RequestedURL = %q, want %q", result.RequestedURL, requested)
+	}
+	if result.FinalURL != "" {
+		t.Fatalf("FinalURL = %q, want empty without an HTTP request", result.FinalURL)
+	}
+}
+
+func TestFetch_DoesNotCacheCompletedBodies(t *testing.T) {
 	var count int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&count, 1)
@@ -51,8 +263,8 @@ func TestFetch_CacheHit(t *testing.T) {
 	if r2.Err != nil {
 		t.Fatalf("Fetch 2 error: %v", r2.Err)
 	}
-	if atomic.LoadInt32(&count) != 1 {
-		t.Errorf("Expected 1 HTTP request, got %d", count)
+	if atomic.LoadInt32(&count) != 2 {
+		t.Errorf("HTTP requests = %d, want 2 after the first request completed", count)
 	}
 	if string(r1.Body) != "hello" {
 		t.Errorf("Body: got %q, want %q", r1.Body, "hello")
@@ -60,31 +272,78 @@ func TestFetch_CacheHit(t *testing.T) {
 }
 
 func TestFetch_Singleflight(t *testing.T) {
+	const callers = 10
+
 	var httpCount int32
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	var startedOnce sync.Once
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseRequest) })
+	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&httpCount, 1)
-		w.Write([]byte("data"))
+		startedOnce.Do(func() { close(requestStarted) })
+		<-releaseRequest
+		_, _ = w.Write([]byte("data"))
 	}))
-	defer ts.Close()
+	t.Cleanup(func() {
+		release()
+		ts.Close()
+	})
 
 	f := newTestFetcher(t, ts)
+	rawURL := ts.URL + "/same"
 
-	// Launch 10 concurrent fetches for the same URL
+	start := make(chan struct{})
+	var ready sync.WaitGroup
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	ready.Add(callers)
+	for i := 0; i < callers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := f.Fetch(ts.URL + "/same")
+			ready.Done()
+			<-start
+			r := f.Fetch(rawURL)
 			if r == nil {
 				t.Error("Got nil result")
 			}
 		}()
 	}
+	ready.Wait()
+	close(start)
+
+	select {
+	case <-requestStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("HTTP request did not start")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		f.mu.Lock()
+		waiters := 0
+		if inf := f.pending[rawURL]; inf != nil {
+			waiters = inf.waiters
+		}
+		f.mu.Unlock()
+		if waiters == callers {
+			break
+		}
+		if time.Now().After(deadline) {
+			release()
+			wg.Wait()
+			t.Fatalf("in-flight waiters = %d, want %d", waiters, callers)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	release()
 	wg.Wait()
 
-	// Only 1 HTTP request should have been made (singleflight)
 	if c := atomic.LoadInt32(&httpCount); c != 1 {
 		t.Errorf("Expected 1 HTTP request, got %d", c)
 	}
@@ -219,7 +478,21 @@ func TestFetch_Non200Status(t *testing.T) {
 	}
 }
 
-func TestFetch_PlainTextLikeJS(t *testing.T) {
+func TestFetchJS_AcceptsAnyTwoHundredStatus(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, `const partial = true;`)
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	if result := f.FetchJS(ts.URL + "/partial.js"); result.Err != nil {
+		t.Fatalf("FetchJS() rejected 206 response: %v", result.Err)
+	}
+}
+
+func TestFetchJS_RejectsExplicitNonJavaScriptContentType(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("function hello() { return 'world'; }"))
@@ -229,11 +502,95 @@ func TestFetch_PlainTextLikeJS(t *testing.T) {
 	f := newTestFetcher(t, ts)
 
 	r := f.FetchJS(ts.URL + "/script")
-	if r.Err != nil {
-		t.Fatalf("FetchJS error: %v", r.Err)
+	if r.Err == nil {
+		t.Fatal("FetchJS() accepted explicit text/plain content")
 	}
-	if !r.IsJS {
-		t.Error("Expected IsJS=true for content that looks like JS")
+}
+
+func TestFetchJS_RejectsHTMLAtJavaScriptPath(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, `<script>const looksLikeJavaScript = true;</script>`)
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	result := f.FetchJS(ts.URL + "/app.js")
+
+	if result.Err == nil {
+		t.Fatal("FetchJS() accepted HTML because the URL ended in .js")
+	}
+}
+
+func TestFetchJS_RejectsJSONWhoseParameterMentionsJavaScript(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", `application/json; profile="javascript"`)
+		_, _ = io.WriteString(w, `{"const value":"looks like source"}`)
+	}))
+	defer ts.Close()
+
+	f := newTestFetcher(t, ts)
+	if result := f.FetchJS(ts.URL + "/data.js"); result.Err == nil {
+		t.Fatal("FetchJS() accepted application/json because a parameter mentioned javascript")
+	}
+}
+
+func TestFetchJSWithoutContentTypeAcceptsStaticESM(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "static import", body: `import "./dep.js";`},
+		{name: "compact re-export", body: `export{value}from"./dep.js";`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header()["Content-Type"] = nil
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer ts.Close()
+
+			result := newTestFetcher(t, ts).FetchJS(ts.URL + "/module")
+			if result.ContentType != "" {
+				t.Fatalf("response Content-Type = %q, want absent", result.ContentType)
+			}
+			if result.Err != nil || !result.IsJS {
+				t.Fatalf("FetchJS() rejected static ESM without Content-Type: %+v", result)
+			}
+		})
+	}
+}
+
+func TestFetchJSWithoutContentTypeRejectsHTMLJSONAndBinary(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "HTML", body: []byte(`<!doctype html><script>const value = true;</script>`)},
+		{name: "JSON", body: []byte(`{"source":"const value = true;"}`)},
+		{name: "binary", body: append([]byte("\x89PNG\r\n\x1a\n"), []byte("const value = true;")...)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header()["Content-Type"] = nil
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(tt.body)
+			}))
+			defer ts.Close()
+
+			result := newTestFetcher(t, ts).FetchJS(ts.URL + "/app.js")
+			if result.ContentType != "" {
+				t.Fatalf("response Content-Type = %q, want absent", result.ContentType)
+			}
+			if result.Err == nil {
+				t.Fatalf("FetchJS fallback accepted %s without Content-Type", tt.name)
+			}
+		})
 	}
 }
 
@@ -373,5 +730,11 @@ func TestNewRejectsInvalidProxy(t *testing.T) {
 
 	if _, err := New(cfg, log); err == nil {
 		t.Fatal("New() returned no error for an unsupported proxy scheme")
+	}
+}
+
+func TestMaxSizeBytesNeverWrapsToUnlimited(t *testing.T) {
+	if got := maxSizeBytes(math.MaxInt); got <= 0 {
+		t.Fatalf("maxSizeBytes(math.MaxInt) = %d, want a positive bounded value", got)
 	}
 }
